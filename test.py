@@ -1,27 +1,29 @@
 # testing script for Hyperion
-from typing import List, Tuple
 import unittest
 from subprocess import run, PIPE
 
-DATABASE_RAW_COMMAND = "./hyperion"
+import tempfile
+import os
+
+DATABASE_COMMAND = ["python3", "hyperion.py"]
 
 
 def get_commands_from_array(command_array):
-    # takes an array of commands, formats them in the input
-    # format for the binary to accept, and runs them
     return "\n".join([str(x) for x in command_array]) + "\n"
 
 
 def decompose_output_from_program(output_string):
-    # takes the STDOUT from the binary and returns the array of commands
     return [str(x) for x in output_string.split("\n")]
 
 
 def run_test_commands(commands):
-    # takes the string of commands, runs them all and returns
-    # stdout
-    output = run([DATABASE_RAW_COMMAND], stdout=PIPE, input=commands, encoding="ascii")
-    return (output.returncode, output.stdout)
+    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+        db_path = f.name
+    try:
+        output = run(DATABASE_COMMAND + [db_path], stdout=PIPE, input=commands, encoding="ascii")
+        return (output.returncode, output.stdout)
+    finally:
+        os.unlink(db_path)
 
 
 def validate_test(command_list, target_output_list):
@@ -53,9 +55,9 @@ class QueryTest(unittest.TestCase):
             validate_test(
                 ["insert 1 A abc@amail.com", "select", ".exit"],
                 [
-                    "H > Executed",
+                    "H > Executed.",
                     "H > (1, A, abc@amail.com)",
-                    "Executed",
+                    "Executed.",
                     "H > ",
                 ],
             )
