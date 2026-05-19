@@ -1,0 +1,179 @@
+import struct
+from pathlib import Path
+from typing import Any, Callable
+
+from .constants import PAGE_SIZE
+from .btree import BTree
+from .catalog import Catalog, TableMeta, IndexMeta
+from .pager import Pager
+from .encoding import _IDX_KEY_SZ
+from .constraints import ConstraintsMixin
+from .ddl import DDLMixin
+from .dml import DMLMixin
+from .query import QueryMixin
+
+_CAT_HDR   = 8
+_CAT_CHUNK = PAGE_SIZE - _CAT_HDR
+
+
+class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
+    def __init__(self, path: Path):
+        self._pager          = Pager(path)
+        self._catalog, self._catalog_extra = self._load_catalog()
+        self._txn_depth      = 0
+
+    # ── Transaction control ────────────────────────────────────────────────────
+
+    @property
+    def in_transaction(self) -> bool:
+        return self._txn_depth > 0
+
+    def begin(self) -> None:
+        if self._txn_depth > 0:
+            raise RuntimeError("Transaction already active")
+        self._pager.begin()
+        self._txn_depth = 1
+
+    def commit(self) -> None:
+        if self._txn_depth == 0:
+            raise RuntimeError("No active transaction")
+        self._flush_catalog()
+        self._pager.commit()
+        self._txn_depth = 0
+
+    def rollback(self) -> None:
+        if self._txn_depth == 0:
+            raise RuntimeError("No active transaction")
+        self._pager.rollback()
+        self._reload_catalog()
+        self._txn_depth = 0
+
+    def _load_catalog(self) -> tuple["Catalog", list[int]]:
+        data   = b""
+        extras: list[int] = []
+        pn     = Catalog.CATALOG_PAGE
+        while True:
+            page      = self._pager.get_page(pn)
+            next_pn   = struct.unpack_from("I", page, 0)[0]
+            chunk_len = struct.unpack_from("I", page, 4)[0]
+            if chunk_len:
+                data += bytes(page[_CAT_HDR: _CAT_HDR + chunk_len])
+            if next_pn == 0:
+                break
+            extras.append(next_pn)
+            pn = next_pn
+        return Catalog.from_bytes(data), extras
+
+    def _reload_catalog(self) -> None:
+        self._catalog, self._catalog_extra = self._load_catalog()
+
+    def _flush_catalog(self) -> None:
+        for _ in range(4):
+            payload  = self._catalog.to_bytes()
+            n_needed = max(1, (len(payload) + _CAT_CHUNK - 1) // _CAT_CHUNK)
+            n_have   = 1 + len(self._catalog_extra)
+            if n_needed == n_have:
+                break
+            if n_needed > n_have:
+                for _ in range(n_needed - n_have):
+                    self._catalog_extra.append(self._alloc_page())
+            else:
+                freed = self._catalog_extra[n_needed - 1:]
+                self._catalog_extra = self._catalog_extra[:n_needed - 1]
+                for pn in freed:
+                    self._free_page(pn)
+        payload  = self._catalog.to_bytes()
+        all_pns  = [Catalog.CATALOG_PAGE] + self._catalog_extra
+        chunks   = [payload[i: i + _CAT_CHUNK]
+                    for i in range(0, len(payload), _CAT_CHUNK)]
+        while len(chunks) < len(all_pns):
+            chunks.append(b"")
+        for i, (pn, chunk) in enumerate(zip(all_pns, chunks)):
+            page    = self._pager.get_page(pn)
+            next_pn = all_pns[i + 1] if i + 1 < len(all_pns) else 0
+            struct.pack_into("I", page, 0, next_pn)
+            struct.pack_into("I", page, 4, len(chunk))
+            page[_CAT_HDR: _CAT_HDR + len(chunk)] = chunk
+            page[_CAT_HDR + len(chunk):]           = bytearray(PAGE_SIZE - _CAT_HDR - len(chunk))
+            self._pager.flush(pn)
+
+    # ── Internal helpers (used by all mixins via self) ─────────────────────────
+
+    def _meta(self, name: str) -> TableMeta:
+        if name not in self._catalog.tables:
+            raise RuntimeError(f"No such table: '{name}'")
+        return self._catalog.tables[name]
+
+    def _alloc_page(self) -> int:
+        if self._catalog.free_pages:
+            return self._catalog.free_pages.pop()
+        pn = self._catalog.next_free_page
+        self._catalog.next_free_page += 1
+        return pn
+
+    def _free_page(self, pn: int) -> None:
+        self._catalog.free_pages.append(pn)
+
+    def _collect_tree_pages(self, root: int, *, key_sz: int = 8) -> list[int]:
+        int_cell = key_sz + BTree.CHILD_SZ
+        pages: list[int] = []
+        visited: set[int] = set()
+        stack = [root]
+        while stack:
+            pn = stack.pop()
+            if pn == 0 or pn in visited:
+                continue
+            visited.add(pn)
+            pages.append(pn)
+            page = self._pager.get_page(pn)
+            n_cells = struct.unpack_from("I", page, 6)[0]
+            sibling  = struct.unpack_from("I", page, 10)[0]
+            if page[0] == BTree.NODE_INTERNAL:
+                stack.append(sibling)
+                for i in range(n_cells):
+                    rc = struct.unpack_from("I", page,
+                                           BTree.HDR + i * int_cell + key_sz)[0]
+                    stack.append(rc)
+            else:
+                if sibling:
+                    stack.append(sibling)
+        return pages
+
+    def _table_btree(self, meta: TableMeta) -> BTree:
+        return BTree(self._pager, meta.root_page, meta.schema.row_size,
+                     self._make_alloc(meta))
+
+    def _index_btree(self, idx: IndexMeta) -> BTree:
+        return BTree(self._pager, idx.root_page, 8, self._make_idx_alloc(idx),
+                     key_sz=_IDX_KEY_SZ)
+
+    def _make_alloc(self, meta: TableMeta) -> Callable[[], int]:
+        def alloc() -> int:
+            pn = self._catalog.next_free_page
+            self._catalog.next_free_page += 1
+            meta.next_page = pn + 1
+            return pn
+        return alloc
+
+    def _make_idx_alloc(self, idx: IndexMeta) -> Callable[[], int]:
+        def alloc() -> int:
+            pn = self._catalog.next_free_page
+            self._catalog.next_free_page += 1
+            idx.next_page = pn + 1
+            return pn
+        return alloc
+
+    def _indexes_for(self, table: str) -> list[IndexMeta]:
+        return [m for m in self._catalog.indexes.values()
+                if m.table_name == table]
+
+    @property
+    def tables(self) -> dict[str, TableMeta]:
+        return self._catalog.tables
+
+    @property
+    def indexes(self) -> dict[str, IndexMeta]:
+        return self._catalog.indexes
+
+    def close(self) -> None:
+        self._pager.close()
