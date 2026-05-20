@@ -32,6 +32,8 @@
 - [ ] String concatenation operator — `SELECT first || ' ' || last`
 - [ ] Expression evaluation in SELECT list — currently only bare column names are supported; functions and arithmetic resolve to nothing
 - [ ] Fix `NOT IN` NULL semantics — `x NOT IN (1, NULL)` should be `UNKNOWN` per SQL standard
+- [ ] `GLOB` operator — case-sensitive wildcard matching (`*` = any string, `?` = any char); SQLite built-in alongside LIKE
+- [ ] `LIKE ... ESCAPE 'char'` — custom escape character for LIKE patterns; `LIKE '50\%' ESCAPE '\'` to match a literal percent
 
 ## Missing SQL — Queries
 
@@ -62,6 +64,9 @@
 - [ ] `UPSERT` — `INSERT OR REPLACE` / `INSERT OR IGNORE` / `ON CONFLICT`
 - [ ] `TRUNCATE TABLE t`
 - [ ] `ON DELETE CASCADE` / `ON DELETE SET NULL` for foreign keys
+- [ ] `ON UPDATE CASCADE` / `ON UPDATE SET NULL` for foreign keys — today only ON DELETE is planned; ON UPDATE is equally common
+- [ ] Composite `PRIMARY KEY (col1, col2)` — table-level multi-column primary key constraint; existing item only covers single-column `id INTEGER PRIMARY KEY`
+- [ ] `LIMIT` in `UPDATE` / `DELETE` — `DELETE FROM t WHERE x = 1 LIMIT 10`; SQLite supports this; useful for batched deletes
 - [ ] `RETURNING` clause — `INSERT INTO t VALUES (...) RETURNING id`
 - [ ] Views — `CREATE VIEW v AS SELECT ...` / `DROP VIEW`
 - [ ] `SAVEPOINT` / `RELEASE SAVEPOINT` / `ROLLBACK TO SAVEPOINT`
@@ -120,6 +125,7 @@
 
 - [ ] System catalog table — queryable `_hyperion_master` (equiv. of `sqlite_master`) exposing table/index/view definitions as rows; ORMs and tools depend on this
 - [ ] `PRAGMA integrity_check` — verify B-tree structure and page consistency
+- [ ] `EXPLAIN` / `EXPLAIN QUERY PLAN` — show the query execution plan; critical for debugging performance and verifying index usage
 
 ## Code Quality
 
