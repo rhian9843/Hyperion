@@ -17,6 +17,23 @@ def _parse_agg(col: str) -> tuple[str, str] | None:
     return (m.group(1).upper(), m.group(2).strip()) if m else None
 
 
+def _project_row(row: dict, columns: list[str]) -> dict:
+    """Project a row to the requested columns, resolving table-qualified names (t.col → col)."""
+    result = {}
+    for col in columns:
+        if col in row:
+            result[col] = row[col]
+        elif "." in col:
+            bare = col.split(".", 1)[1]
+            if bare in row:
+                result[col] = row[bare]
+            else:
+                raise RuntimeError(f"Unknown column: '{col}'")
+        else:
+            raise RuntimeError(f"Unknown column: '{col}'")
+    return result
+
+
 class QueryMixin:
     """SELECT and JOIN methods mixed into Database."""
 
@@ -28,11 +45,12 @@ class QueryMixin:
                limit: int | None = None,
                group_by: list[str] | None = None,
                having: "WhereClause | None" = None,
-               distinct: bool = False) -> list[dict[str, Any]]:
+               distinct: bool = False,
+               offset: int | None = None) -> list[dict[str, Any]]:
         meta = self._meta(table)
         if group_by:
             return self._group_by_select(meta, columns, where, group_by, having,
-                                         order_by, limit)
+                                         order_by, limit, offset)
         if columns and any(_parse_agg(c) is not None for c in columns):
             return self._aggregate_select(meta, columns, where)
         if where and not order_by and limit is None and not distinct:
@@ -49,14 +67,14 @@ class QueryMixin:
             row = deserialize_row(schema, raw)
             if where and not where.evaluate(row, self):
                 continue
-            projected = {k: row[k] for k in columns} if columns else row
+            projected = _project_row(row, columns) if columns else row
             if distinct:
                 key = tuple(projected.get(k) for k in (columns or list(row.keys())))
                 if key in seen:
                     continue
                 seen.add(key)
             results.append(projected)
-        return _apply_order_limit(results, order_by, limit)
+        return _apply_order_limit(results, order_by, limit, offset)
 
     def _compute_aggregates(self, bucket_rows: list[dict],
                             columns: list[str]) -> dict[str, Any]:
@@ -99,7 +117,8 @@ class QueryMixin:
                          where: "WhereClause | None", group_by: list[str],
                          having: "WhereClause | None",
                          order_by: list[dict] | None,
-                         limit: int | None) -> list[dict[str, Any]]:
+                         limit: int | None,
+                         offset: int | None = None) -> list[dict[str, Any]]:
         schema = meta.schema
         all_rows: list[dict] = []
         for _, raw in self._table_btree(meta).scan():
@@ -124,7 +143,7 @@ class QueryMixin:
                 continue
             results.append({c: result[c] for c in select_cols if c in result}
                            if columns else result)
-        return _apply_order_limit(results, order_by, limit)
+        return _apply_order_limit(results, order_by, limit, offset)
 
     def join(self, left_table: str, right_table: str,
              on_left: str | None, on_right: str | None,
@@ -134,7 +153,8 @@ class QueryMixin:
              limit: int | None = None,
              join_type: str = "INNER",
              left_alias: str | None = None,
-             right_alias: str | None = None) -> list[dict[str, Any]]:
+             right_alias: str | None = None,
+             offset: int | None = None) -> list[dict[str, Any]]:
         lmeta, rmeta = self._meta(left_table), self._meta(right_table)
         left_rows  = [deserialize_row(lmeta.schema, r)
                       for _, r in self._table_btree(lmeta).scan()]
@@ -168,7 +188,7 @@ class QueryMixin:
                     row = _emit(_merge(lr, rr))
                     if row is not None:
                         results.append(row)
-            return _apply_order_limit(results, order_by, limit)
+            return _apply_order_limit(results, order_by, limit, offset)
 
         if join_type == "NATURAL":
             lcols  = {c.name for c in lmeta.schema.columns}
@@ -263,7 +283,7 @@ class QueryMixin:
                     except (ValueError, TypeError):
                         match = False; break
             if match:
-                results.append({k: row[k] for k in columns} if columns else row)
+                results.append(_project_row(row, columns) if columns else row)
         return results
 
     def _find_index_for_where(self, table: str,

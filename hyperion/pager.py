@@ -15,15 +15,24 @@ class Pager:
         self._dirty: set[int] = set()
         self._wal:   WAL | None = None
 
-    def get_page(self, num: int) -> bytearray:
+    def _load(self, num: int) -> bytearray:
         if num not in self._cache:
             page = bytearray(PAGE_SIZE)
             self._file.seek(num * PAGE_SIZE)
             chunk = self._file.read(PAGE_SIZE)
             page[: len(chunk)] = chunk
             self._cache[num] = page
-        self._dirty.add(num)
         return self._cache[num]
+
+    def read_page(self, num: int) -> bytearray:
+        """Return a cached page without marking it dirty (read-only path)."""
+        return self._load(num)
+
+    def get_page(self, num: int) -> bytearray:
+        """Return a cached page and mark it dirty (write path)."""
+        page = self._load(num)
+        self._dirty.add(num)
+        return page
 
     def flush(self, num: int) -> None:
         self._dirty.add(num)

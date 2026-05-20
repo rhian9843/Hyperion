@@ -179,6 +179,90 @@ class TestErrorHandling(unittest.TestCase):
             rc, _ = db_run(cmds, db)
         self.assertEqual(rc, 0)
 
+    def test_integer_overflow_raises_error(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                "CREATE TABLE t (id INTEGER, val INTEGER)",
+                "INSERT INTO t VALUES (1, 99999999999999999999)",
+                ".exit",
+            ], db)
+        self.assertTrue(any("Error" in l or "error" in l for l in lines))
+
+
+class TestMultiRowInsert(unittest.TestCase):
+    def test_two_rows_in_one_statement(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com), (2, bob, b@x.com)",
+                "SELECT * FROM users",
+                ".exit",
+            ], db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+
+    def test_three_rows_in_one_statement(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com), (2, bob, b@x.com), (3, carol, c@x.com)",
+                "SELECT COUNT(*) FROM users",
+                ".exit",
+            ], db)
+        self.assertTrue(any("3" in l for l in lines))
+
+    def test_multi_row_insert_count_message(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com), (2, bob, b@x.com)",
+                ".exit",
+            ], db)
+        self.assertTrue(any("2 rows" in l for l in lines))
+
+
+class TestVarcharTruncation(unittest.TestCase):
+    def test_value_too_long_raises_error(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                "CREATE TABLE t (id INTEGER, name VARCHAR(5))",
+                "INSERT INTO t VALUES (1, toolongvalue)",
+                ".exit",
+            ], db)
+        self.assertTrue(any("Error" in l or "error" in l for l in lines))
+
+    def test_value_exact_length_allowed(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                "CREATE TABLE t (id INTEGER, name VARCHAR(5))",
+                "INSERT INTO t VALUES (1, hello)",
+                "SELECT * FROM t",
+                ".exit",
+            ], db)
+        self.assertTrue(any("hello" in l for l in lines))
+
+
+class TestEscapedQuotes(unittest.TestCase):
+    def test_single_quote_in_string(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                "CREATE TABLE t (id INTEGER, val VARCHAR(32))",
+                "INSERT INTO t VALUES (1, 'it''s fine')",
+                "SELECT * FROM t",
+                ".exit",
+            ], db)
+        self.assertTrue(any("it's fine" in l for l in lines))
+
+    def test_plain_string_still_works(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                "CREATE TABLE t (id INTEGER, val VARCHAR(32))",
+                "INSERT INTO t VALUES (1, 'hello')",
+                "SELECT * FROM t",
+                ".exit",
+            ], db)
+        self.assertTrue(any("hello" in l for l in lines))
+
 
 if __name__ == "__main__":
     unittest.main()

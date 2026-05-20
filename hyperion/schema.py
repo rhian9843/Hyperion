@@ -95,8 +95,18 @@ def serialize_row(schema: Schema, row: dict[str, Any]) -> bytes:
         else:
             if col.type == INTEGER:   packed.append(int(val))
             elif col.type == REAL:    packed.append(float(val))
-            else:                     packed.append(str(val).encode())
-    return bytes(bitmap) + struct.pack(schema.row_format, *packed)
+            else:
+                encoded = str(val).encode()
+                if len(encoded) > col.size:
+                    raise RuntimeError(
+                        f"Value for '{col.name}' is {len(encoded)} bytes, "
+                        f"exceeds VARCHAR({col.size})"
+                    )
+                packed.append(encoded)
+    try:
+        return bytes(bitmap) + struct.pack(schema.row_format, *packed)
+    except struct.error as e:
+        raise RuntimeError(str(e)) from e
 
 
 def deserialize_row(schema: Schema, data: bytes) -> dict[str, Any]:

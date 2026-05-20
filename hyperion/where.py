@@ -1,5 +1,5 @@
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 from .encoding import _apply_set_op
@@ -13,6 +13,9 @@ class WhereClause:
     and_clause:   "WhereClause | None" = None
     or_clause:    "WhereClause | None" = None
     subquery_ast: "dict | None"        = None
+    group_clause: "WhereClause | None" = None  # set when op == "GROUP"
+    _subq_cache:  dict = field(default_factory=dict, init=False,
+                               repr=False, compare=False)
 
     # ── Public entry point ─────────────────────────────────────────────────────
     def evaluate(self, row: dict[str, Any], db: Any = None) -> bool:
@@ -28,15 +31,22 @@ class WhereClause:
         return self.and_clause._eval_and_chain(row, db) if self.and_clause else True
 
     def _eval_atom(self, row: dict[str, Any], db: Any = None) -> bool:
+        # Parenthesized group — evaluate the inner expression as a unit
+        if self.op == "GROUP":
+            return self.group_clause.evaluate(row, db)  # type: ignore[union-attr]
+
         # EXISTS / NOT EXISTS — re-executed per outer row (supports correlation)
         if self.op in ("EXISTS", "NOT EXISTS"):
             sub_rows = _exec_correlated_subquery(self.subquery_ast, db, row)
             return bool(sub_rows) if self.op == "EXISTS" else not bool(sub_rows)
 
         # col lookup — strip table/alias prefix when exact key absent
-        cell = row.get(self.col)
-        if cell is None and "." in self.col:
-            cell = row.get(self.col.split(".", 1)[1])
+        if self.col in row:
+            cell = row[self.col]
+        elif "." in self.col and self.col.split(".", 1)[1] in row:
+            cell = row[self.col.split(".", 1)[1]]
+        else:
+            raise RuntimeError(f"Unknown column: '{self.col}'")
 
         if self.op == "IS NULL":     return cell is None
         if self.op == "IS NOT NULL": return cell is not None
@@ -44,7 +54,13 @@ class WhereClause:
 
         if self.op in ("IN", "NOT IN"):
             if self.subquery_ast is not None:
-                sub_rows = _exec_correlated_subquery(self.subquery_ast, db, row)
+                inst_where = _instantiate_correlated(
+                    self.subquery_ast.get("where"), row)
+                cache_key = _where_cache_key(inst_where)
+                if cache_key not in self._subq_cache:
+                    inst_stmt = {**self.subquery_ast, "where": inst_where}
+                    self._subq_cache[cache_key] = _exec_subquery(inst_stmt, db)
+                sub_rows = self._subq_cache[cache_key]
                 fk = next(iter(sub_rows[0])) if sub_rows else None
                 in_vals: list = [r[fk] for r in sub_rows] if fk else []
                 result = cell in in_vals
@@ -110,22 +126,70 @@ def _try_resolve_outer_ref(val: str, outer_row: dict) -> tuple[bool, Any]:
     return False, None
 
 
+_FLIP_OP: dict[str, str] = {
+    "<": ">", ">": "<", "<=": ">=", ">=": "<=", "=": "=", "!=": "!=",
+}
+
+
 def _instantiate_correlated(where: "WhereClause | None",
                              outer_row: dict) -> "WhereClause | None":
     """Return a copy of the WhereClause tree with outer column references substituted."""
     if where is None:
         return None
-    new_val = where.val
-    if where.val and where.subquery_ast is None:
-        found, resolved = _try_resolve_outer_ref(where.val, outer_row)
-        if found:
-            new_val = str(resolved) if resolved is not None else "NULL"
+    new_col, new_val, new_op = where.col, where.val, where.op
+    if where.subquery_ast is None:
+        if where.val:
+            found_r, resolved_r = _try_resolve_outer_ref(where.val, outer_row)
+            if found_r:
+                new_val = str(resolved_r) if resolved_r is not None else "NULL"
+            elif "." in where.col and where.col in outer_row:
+                # outer ref is on the left side with full qualified name: swap and flip
+                new_col = where.val
+                new_val = str(outer_row[where.col]) if outer_row[where.col] is not None else "NULL"
+                new_op  = _FLIP_OP.get(where.op, where.op)
     return WhereClause(
-        col=where.col, op=where.op, val=new_val,
+        col=new_col, op=new_op, val=new_val,
         subquery_ast=where.subquery_ast,
+        group_clause=_instantiate_correlated(where.group_clause, outer_row),
         and_clause=_instantiate_correlated(where.and_clause, outer_row),
         or_clause=_instantiate_correlated(where.or_clause, outer_row),
     )
+
+
+def _where_cache_key(where: "WhereClause | None") -> tuple:
+    """Convert a WhereClause tree to a hashable tuple for use as a cache key."""
+    if where is None:
+        return ()
+    return (where.col, where.op, where.val,
+            _where_cache_key(where.group_clause),
+            _where_cache_key(where.and_clause),
+            _where_cache_key(where.or_clause))
+
+
+def _exec_subquery(stmt: "dict | None", db: Any) -> list[dict]:
+    """Execute an already-instantiated subquery AST (no correlated substitution)."""
+    if stmt is None or db is None:
+        return []
+    op = stmt["op"]
+    where = stmt.get("where")
+    if op == "SELECT":
+        return db.select(stmt["table"], stmt["columns"], where,
+                         stmt.get("order_by"), stmt.get("limit"),
+                         stmt.get("group_by"), stmt.get("having"),
+                         stmt.get("distinct", False), stmt.get("offset"))
+    if op == "JOIN":
+        return db.join(stmt["left_table"], stmt["right_table"],
+                       stmt["on_left"], stmt["on_right"],
+                       stmt["columns"], where,
+                       stmt.get("order_by"), stmt.get("limit"),
+                       stmt.get("join_type", "INNER"),
+                       stmt.get("left_alias"), stmt.get("right_alias"),
+                       stmt.get("offset"))
+    if op == "SET_OP":
+        left  = _exec_subquery(stmt["left"],  db)
+        right = _exec_subquery(stmt["right"], db)
+        return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
+    raise RuntimeError(f"Expected SELECT/JOIN/SET_OP in subquery, got '{op}'")
 
 
 def _exec_correlated_subquery(stmt: "dict | None", db: Any,
@@ -142,14 +206,15 @@ def _exec_correlated_subquery(stmt: "dict | None", db: Any,
         return db.select(stmt["table"], stmt["columns"], inst_where,
                          stmt.get("order_by"), stmt.get("limit"),
                          stmt.get("group_by"), stmt.get("having"),
-                         stmt.get("distinct", False))
+                         stmt.get("distinct", False), stmt.get("offset"))
     if op == "JOIN":
         return db.join(stmt["left_table"], stmt["right_table"],
                        stmt["on_left"], stmt["on_right"],
                        stmt["columns"], inst_where,
                        stmt.get("order_by"), stmt.get("limit"),
                        stmt.get("join_type", "INNER"),
-                       stmt.get("left_alias"), stmt.get("right_alias"))
+                       stmt.get("left_alias"), stmt.get("right_alias"),
+                       stmt.get("offset"))
     if op == "SET_OP":
         left  = _exec_correlated_subquery(stmt["left"],  db, outer_row)
         right = _exec_correlated_subquery(stmt["right"], db, outer_row)

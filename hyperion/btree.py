@@ -32,7 +32,7 @@ class BTree:
 
     def lookup(self, key: int) -> bytes | None:
         """O(log n) point lookup by key. Returns raw value bytes or None."""
-        page = self._p.get_page(self._find_leaf(key))
+        page = self._p.read_page(self._find_leaf(key))
         for i in range(self._num_cells(page)):
             k = self._leaf_key(page, i)
             if k == key:
@@ -45,7 +45,7 @@ class BTree:
         """Yield (key, value) in key order via the leaf chain."""
         pn = self._leftmost_leaf()
         while pn:
-            page = self._p.get_page(pn)
+            page = self._p.read_page(pn)
             for i in range(self._num_cells(page)):
                 yield self._leaf_key(page, i), self._leaf_val(page, i)
             pn = self._sibling(page)
@@ -54,7 +54,7 @@ class BTree:
         """Yield (key, value) for all entries with lo <= key <= hi."""
         pn = self._find_leaf(lo)
         while pn:
-            page = self._p.get_page(pn)
+            page = self._p.read_page(pn)
             for i in range(self._num_cells(page)):
                 k = self._leaf_key(page, i)
                 if k > hi:
@@ -118,7 +118,7 @@ class BTree:
     def _find_leaf(self, key: int) -> int:
         pn = self.root_page
         while True:
-            page = self._p.get_page(pn)
+            page = self._p.read_page(pn)
             if page[0] == self.NODE_LEAF:
                 return pn
             pn = self._sibling(page)   # start at leftmost child
@@ -131,7 +131,7 @@ class BTree:
     def _leftmost_leaf(self) -> int:
         pn = self.root_page
         while True:
-            page = self._p.get_page(pn)
+            page = self._p.read_page(pn)
             if page[0] == self.NODE_LEAF:
                 return pn
             pn = self._sibling(page)

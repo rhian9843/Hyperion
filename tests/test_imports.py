@@ -78,7 +78,7 @@ public_names = [
     "_instantiate_correlated", "_try_resolve_outer_ref",
     # parser
     "ParseError", "parse", "_tokenize", "_parse_tokens",
-    "_parse_one_condition", "_parse_where",
+    "_parse_one_condition", "_parse_atom", "_parse_where_expr", "_parse_where",
     # executor
     "execute", "_execute_inner", "_rows_for_stmt", "_format_rows",
     # repl

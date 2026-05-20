@@ -29,8 +29,8 @@ from .parser import (
     _tokenize, _parse_col_type,
     _parse_table_alias, _parse_agg,
     _extract_paren_tokens,
-    _parse_one_condition, _parse_and_group,
-    _parse_where, _parse_group_having, _parse_order_limit,
+    _parse_one_condition, _parse_atom, _parse_and_group,
+    _parse_where_expr, _parse_where, _parse_group_having, _parse_order_limit,
     parse, _parse_tokens,
 )
 from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows

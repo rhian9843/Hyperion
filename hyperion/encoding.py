@@ -63,8 +63,9 @@ def _split_index_key(composite: int) -> tuple[int, int]:
 
 
 def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
-                       limit: int | None) -> list[dict]:
-    """Sort rows by ORDER BY clauses (NULLs last), then apply LIMIT."""
+                       limit: int | None,
+                       offset: int | None = None) -> list[dict]:
+    """Sort rows by ORDER BY clauses (NULLs last), then apply OFFSET and LIMIT."""
     if order_by:
         # Stable multi-key sort: apply keys in reverse order so the first
         # key ends up as the primary sort (Python sort is stable).
@@ -77,6 +78,8 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
             except TypeError:
                 non_null.sort(key=lambda r, c=col: str(r[c]), reverse=desc)
             rows = non_null + null_rows   # NULLs always last
+    if offset is not None:
+        rows = rows[offset:]
     if limit is not None:
         rows = rows[:limit]
     return rows

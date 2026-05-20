@@ -1,8 +1,10 @@
 import re
+import struct
 from typing import Any
 
 from .schema import Schema, ForeignKey, deserialize_row
 from .constants import INTEGER, REAL
+from .encoding import _encode_composite_key, _make_index_key
 
 
 class ConstraintsMixin:
@@ -63,6 +65,35 @@ class ConstraintsMixin:
                     result.append(fk)
         return result
 
+    def _fk_index_lookup(self, parent_meta, ref_cols: list[str],
+                          vals: list) -> bool | None:
+        """Return True/False if a suitable index exists, None if no index found."""
+        parent_schema = parent_meta.schema
+        idx_meta = None
+        for m in self._catalog.indexes.values():
+            if (m.table_name == parent_schema.name
+                    and m.columns == list(ref_cols)):
+                idx_meta = m
+                break
+        if idx_meta is None:
+            return None
+        col_types = []
+        for col_name in idx_meta.columns:
+            col_obj = next((c for c in parent_schema.columns
+                            if c.name == col_name), None)
+            if col_obj is None:
+                return None
+            col_types.append(col_obj.type)
+        try:
+            val_key = _encode_composite_key(vals, col_types)
+        except (ValueError, TypeError):
+            return None
+        lo = _make_index_key(val_key, 0)
+        hi = _make_index_key(val_key, 0xFFFFFFFFFFFFFFFF)
+        for _ in self._index_btree(idx_meta).scan_range(lo, hi):
+            return True
+        return False
+
     def _check_fk_child(self, schema: Schema, row: dict[str, Any]) -> None:
         """Raise if any FK column values are not present in the referenced parent table."""
         for fk in schema.foreign_keys:
@@ -84,13 +115,15 @@ class ConstraintsMixin:
                 )
             parent_meta = self._meta(fk.ref_table)
             parent_schema = parent_meta.schema
-            found = False
-            for _, raw in self._table_btree(parent_meta).scan():
-                parent_row = deserialize_row(parent_schema, raw)
-                if all(parent_row.get(rc) == v
-                       for rc, v in zip(fk.ref_columns, vals)):
-                    found = True
-                    break
+            found = self._fk_index_lookup(parent_meta, fk.ref_columns, vals)
+            if found is None:  # no usable index — fall back to full scan
+                found = False
+                for _, raw in self._table_btree(parent_meta).scan():
+                    parent_row = deserialize_row(parent_schema, raw)
+                    if all(parent_row.get(rc) == v
+                           for rc, v in zip(fk.ref_columns, vals)):
+                        found = True
+                        break
             if not found:
                 raise RuntimeError(
                     f"FOREIGN KEY constraint failed: "

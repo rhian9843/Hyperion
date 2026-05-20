@@ -266,5 +266,35 @@ class TestFreePageReclamation(unittest.TestCase):
         self.assertLessEqual(size2, size1 + 4096)
 
 
+class TestDropIndexIfExists(unittest.TestCase):
+    def test_drop_index_if_exists_no_error_when_missing(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "DROP INDEX IF EXISTS idx_ghost",
+                ".exit",
+            ], db)
+        self.assertFalse(any("Error" in l for l in lines))
+
+    def test_drop_index_if_exists_drops_when_present(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "CREATE INDEX idx_name ON users(name)",
+                "DROP INDEX IF EXISTS idx_name",
+                ".exit",
+            ], db)
+        self.assertFalse(any("Error" in l for l in lines))
+
+    def test_drop_index_without_if_exists_errors_when_missing(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "DROP INDEX idx_ghost",
+                ".exit",
+            ], db)
+        self.assertTrue(any("Error" in l for l in lines))
+
+
 if __name__ == "__main__":
     unittest.main()

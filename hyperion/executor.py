@@ -12,14 +12,15 @@ def _rows_for_stmt(stmt: dict, db: "Database") -> list[dict]:
         return db.select(stmt["table"], stmt["columns"], stmt["where"],
                          stmt.get("order_by"), stmt.get("limit"),
                          stmt.get("group_by"), stmt.get("having"),
-                         stmt.get("distinct", False))
+                         stmt.get("distinct", False), stmt.get("offset"))
     if op == "JOIN":
         return db.join(stmt["left_table"], stmt["right_table"],
                        stmt["on_left"], stmt["on_right"],
                        stmt["columns"], stmt["where"],
                        stmt.get("order_by"), stmt.get("limit"),
                        stmt.get("join_type", "INNER"),
-                       stmt.get("left_alias"), stmt.get("right_alias"))
+                       stmt.get("left_alias"), stmt.get("right_alias"),
+                       stmt.get("offset"))
     if op == "SET_OP":
         left  = _rows_for_stmt(stmt["left"],  db)
         right = _rows_for_stmt(stmt["right"], db)
@@ -91,33 +92,39 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return f"Index '{stmt['idx_name']}' created on {stmt['table']}({cols_str})."
 
     if op == "DROP_INDEX":
-        db.drop_index(stmt["idx_name"])
+        try:
+            db.drop_index(stmt["idx_name"])
+        except RuntimeError:
+            if not stmt.get("if_exists"):
+                raise
         return f"Index '{stmt['idx_name']}' dropped."
 
     if op == "INSERT":
         meta      = db._meta(stmt["table"])
         col_names = stmt["col_names"] or [c.name for c in meta.schema.columns]
-        values    = stmt["values"]
-        if len(col_names) != len(values):
-            raise RuntimeError(
-                f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
-            )
-        parsed: dict[str, Any] = {}
-        for name, val in zip(col_names, values):
-            parsed[name] = None if val.upper() == "NULL" else val
-        # Fill any omitted columns from DEFAULT, or NULL
-        for col in meta.schema.columns:
-            if col.name not in parsed:
-                parsed[col.name] = col.default  # None if no DEFAULT
-        db.insert(stmt["table"], parsed)
-        return "1 row inserted."
+        for values in stmt["rows"]:
+            if len(col_names) != len(values):
+                raise RuntimeError(
+                    f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
+                )
+            parsed: dict[str, Any] = {}
+            for name, val in zip(col_names, values):
+                parsed[name] = None if val.upper() == "NULL" else val
+            # Fill any omitted columns from DEFAULT, or NULL
+            for col in meta.schema.columns:
+                if col.name not in parsed:
+                    parsed[col.name] = col.default  # None if no DEFAULT
+            db.insert(stmt["table"], parsed)
+        n = len(stmt["rows"])
+        return f"{n} row{'s' if n != 1 else ''} inserted."
 
     if op == "SELECT":
         rows = db.select(stmt["table"], stmt["columns"], stmt["where"],
                          stmt.get("order_by"), stmt.get("limit"),
                          stmt.get("group_by"), stmt.get("having"),
-                         stmt.get("distinct", False))
-        return _format_rows(rows, stmt["columns"])
+                         stmt.get("distinct", False), stmt.get("offset"))
+        rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
+        return _format_rows(rows, cols)
 
     if op == "JOIN":
         rows = db.join(stmt["left_table"], stmt["right_table"],
@@ -125,8 +132,10 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                        stmt["columns"], stmt["where"],
                        stmt.get("order_by"), stmt.get("limit"),
                        stmt.get("join_type", "INNER"),
-                       stmt.get("left_alias"), stmt.get("right_alias"))
-        return _format_rows(rows, stmt["columns"])
+                       stmt.get("left_alias"), stmt.get("right_alias"),
+                       stmt.get("offset"))
+        rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
+        return _format_rows(rows, cols)
 
     if op == "SET_OP":
         rows = _rows_for_stmt(stmt, db)
@@ -142,6 +151,18 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return f"{n} row{'s' if n != 1 else ''} deleted."
 
     raise RuntimeError(f"Unknown op: {op}")
+
+
+def _apply_aliases(rows: list[dict], cols: list[str] | None,
+                   aliases: dict[str, str] | None
+                   ) -> tuple[list[dict], list[str] | None]:
+    """Rename row keys and column list according to AS aliases."""
+    if not aliases:
+        return rows, cols
+    rows = [{aliases.get(k, k): v for k, v in r.items()} for r in rows]
+    if cols:
+        cols = [aliases.get(c, c) for c in cols]
+    return rows, cols
 
 
 def _cell_str(v: Any) -> str:

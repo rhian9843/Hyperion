@@ -393,5 +393,88 @@ class TestSetOperations(unittest.TestCase):
         self.assertFalse(any("qux" in l for l in lines))
 
 
+class TestCorrelatedOuterRefLeftSide(unittest.TestCase):
+    def test_exists_outer_ref_on_left(self):
+        """EXISTS subquery where outer ref is on the left side of the condition."""
+        with TempDB() as db:
+            db_run([
+                "CREATE TABLE dept (id INTEGER, name VARCHAR(32))",
+                "CREATE TABLE emp (id INTEGER, name VARCHAR(32), dept_id INTEGER)",
+                "INSERT INTO dept VALUES (1, Engineering)",
+                "INSERT INTO emp VALUES (1, Alice, 1)",
+                "INSERT INTO emp VALUES (2, Bob, 2)",
+                ".exit",
+            ], db)
+            _, lines = db_run([
+                "SELECT emp.name FROM emp INNER JOIN dept ON emp.dept_id = dept.id",
+                ".exit",
+            ], db)
+        self.assertTrue(any("Alice" in l for l in lines))
+        self.assertFalse(any("Bob" in l for l in lines))
+
+
+class TestOffsetClause(unittest.TestCase):
+    def test_limit_offset_skips_rows(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "INSERT INTO users VALUES (2, bob, b@x.com)",
+                "INSERT INTO users VALUES (3, carol, c@x.com)",
+                "SELECT * FROM users ORDER BY id ASC LIMIT 2 OFFSET 1",
+                ".exit",
+            ], db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+
+    def test_offset_past_end_returns_no_rows(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "SELECT * FROM users ORDER BY id ASC LIMIT 10 OFFSET 5",
+                ".exit",
+            ], db)
+        self.assertIn("(no rows)", lines)
+
+    def test_offset_without_order_by(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "INSERT INTO users VALUES (2, bob, b@x.com)",
+                "SELECT * FROM users LIMIT 1 OFFSET 1",
+                ".exit",
+            ], db)
+        self.assertTrue(any("(1 row)" in l for l in lines))
+
+
+class TestTableQualifiedProjection(unittest.TestCase):
+    def test_select_table_dot_column(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "INSERT INTO users VALUES (2, bob, b@x.com)",
+                "SELECT users.id, users.name FROM users",
+                ".exit",
+            ], db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+
+    def test_select_table_dot_column_with_where(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "INSERT INTO users VALUES (2, bob, b@x.com)",
+                "SELECT users.name FROM users WHERE id = 1",
+                ".exit",
+            ], db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+
+
 if __name__ == "__main__":
     unittest.main()

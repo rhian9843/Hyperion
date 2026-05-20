@@ -2,26 +2,26 @@
 
 ## Bugs (silent wrong behaviour)
 
-- [ ] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
-- [ ] Fix multi-row INSERT silently dropping extra rows — `VALUES (1,'a'), (2,'b')` only inserts the first tuple with no warning
-- [ ] Fix `struct.error` leaking on integer overflow — wrap as user-facing `RuntimeError`
-- [ ] Fix correlated subquery outer ref on left side — `outer.col = inner.col` fails; only the right side resolves today
-- [ ] Fix `LIMIT x OFFSET y` — OFFSET is parsed but silently ignored; rows are not skipped
-- [ ] Fix table-qualified column in SELECT projection — `SELECT t.id FROM t` raises a `KeyError`
-- [ ] Fix escaped single quotes in string literals — `'it''s fine'` tokenizes to `['it', 's fine']` because `_TOKEN_RE` uses `'[^']*'` which stops at the first `'`
-- [ ] Fix `SELECT id AS uid FROM t` — the column parser treats `AS` and `uid` as additional column names instead of recognising the alias; columns list becomes `['id', 'AS', 'uid']`
-- [ ] Fix `DROP INDEX IF EXISTS idx_name` — parser puts `IF` as the index name instead of skipping the `IF EXISTS` guard
-- [ ] Fix VARCHAR(n) silent truncation — inserting a value longer than the column size silently truncates instead of raising an error
+- [x] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
+- [x] Fix multi-row INSERT silently dropping extra rows — `VALUES (1,'a'), (2,'b')` only inserts the first tuple with no warning
+- [x] Fix `struct.error` leaking on integer overflow — wrap as user-facing `RuntimeError`
+- [x] Fix correlated subquery outer ref on left side — `outer.col = inner.col` fails; only the right side resolves today
+- [x] Fix `LIMIT x OFFSET y` — OFFSET is parsed but silently ignored; rows are not skipped
+- [x] Fix table-qualified column in SELECT projection — `SELECT t.id FROM t` raises a `KeyError`
+- [x] Fix escaped single quotes in string literals — `'it''s fine'` tokenizes to `['it', 's fine']` because `_TOKEN_RE` uses `'[^']*'` which stops at the first `'`
+- [x] Fix `SELECT id AS uid FROM t` — the column parser treats `AS` and `uid` as additional column names instead of recognising the alias; columns list becomes `['id', 'AS', 'uid']`
+- [x] Fix `DROP INDEX IF EXISTS idx_name` — parser puts `IF` as the index name instead of skipping the `IF EXISTS` guard
+- [x] Fix VARCHAR(n) silent truncation — inserting a value longer than the column size silently truncates instead of raising an error
 
 ## Performance
 
-- [ ] Fix `_check_fk_child` always doing a full parent scan — use index lookup when one exists on the referenced column
-- [ ] Fix `get_page` marking every read as dirty — split into read path / write path to avoid flushing unchanged pages on every commit
-- [ ] Cache non-correlated subquery results — `WHERE id IN (SELECT ...)` re-runs the inner query once per outer row even when the result never changes
+- [x] Fix `_check_fk_child` always doing a full parent scan — use index lookup when one exists on the referenced column
+- [x] Fix `get_page` marking every read as dirty — split into read path / write path to avoid flushing unchanged pages on every commit
+- [x] Cache non-correlated subquery results — `WHERE id IN (SELECT ...)` re-runs the inner query once per outer row even when the result never changes
 
 ## Missing SQL — WHERE / Expressions
 
-- [ ] Parenthesized WHERE groups — `WHERE (a = 1 OR b = 2) AND c = 3` (parser has no `(` grouping in conditions)
+- [x] Parenthesized WHERE groups — `WHERE (a = 1 OR b = 2) AND c = 3` (parser has no `(` grouping in conditions)
 - [ ] `NOT` prefix operator — `WHERE NOT col = 1` (only NOT IN / NOT EXISTS work today)
 - [ ] `BETWEEN x AND y`
 - [ ] Column aliases — `SELECT id AS uid, name AS full_name FROM t` (alias must also flow into ORDER BY / GROUP BY / HAVING)
@@ -35,11 +35,11 @@
 
 ## Missing SQL — Queries
 
-- [ ] `OFFSET` (with LIMIT) — `SELECT ... LIMIT 10 OFFSET 20`
+- [x] `OFFSET` (with LIMIT) — `SELECT ... LIMIT 10 OFFSET 20`
 - [ ] Multiple JOINs — `FROM a JOIN b ON ... JOIN c ON ...` (parser exits after the first JOIN today)
 - [ ] Multi-table implicit FROM — `SELECT * FROM a, b WHERE a.id = b.id` (parser accepts only one table name)
 - [ ] `INSERT INTO ... SELECT ...` — bulk insert from a query result
-- [ ] Multi-row `INSERT` — `INSERT INTO t VALUES (1,'a'), (2,'b')`
+- [x] Multi-row `INSERT` — `INSERT INTO t VALUES (1,'a'), (2,'b')`
 - [ ] Subquery in `FROM` — `SELECT * FROM (SELECT ...) AS alias` (derived tables)
 - [ ] CTE — `WITH cte AS (SELECT ...) SELECT ... FROM cte`
 - [ ] Window functions — `ROW_NUMBER() OVER (...)`, `RANK()`, `LAG()`, etc.

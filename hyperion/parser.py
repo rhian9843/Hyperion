@@ -9,7 +9,7 @@ class ParseError(ValueError):
     pass
 
 
-_TOKEN_RE = re.compile(r"'[^']*'|\"[^\"]*\"|\w+\([^)]*\)|[(),;*]|[^\s(),;*]+")
+_TOKEN_RE = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|\w+\([^)]*\)|[(),;*]|[^\s(),;*]+")
 
 # Aggregate function detection
 _AGG_RE = re.compile(r"^(COUNT|MIN|MAX|SUM|AVG)\(([^)]*)\)$", re.IGNORECASE)
@@ -41,7 +41,15 @@ def _parse_agg(col: str) -> tuple[str, str] | None:
 
 
 def _tokenize(sql: str) -> list[str]:
-    return [t.strip("'\"") for t in _TOKEN_RE.findall(sql)]
+    tokens = []
+    for t in _TOKEN_RE.findall(sql):
+        if t.startswith("'") and t.endswith("'"):
+            tokens.append(t[1:-1].replace("''", "'"))
+        elif t.startswith('"') and t.endswith('"'):
+            tokens.append(t[1:-1])
+        else:
+            tokens.append(t)
+    return tokens
 
 
 def _parse_col_type(token: str) -> tuple[str, int]:
@@ -162,11 +170,21 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
     return WhereClause(col=col, op=op, val=val), pos + 3
 
 
+def _parse_atom(tokens: list[str], pos: int) -> tuple["WhereClause", int]:
+    """Parse a single condition or a parenthesized group `(expr)`."""
+    if pos < len(tokens) and tokens[pos] == "(":
+        inner, new_pos = _extract_paren_tokens(tokens, pos)
+        inner_clause, _ = _parse_where_expr(inner, 0)
+        return WhereClause(col="", op="GROUP", val="",
+                           group_clause=inner_clause), new_pos
+    return _parse_one_condition(tokens, pos)
+
+
 def _parse_and_group(tokens: list[str], pos: int) -> tuple["WhereClause", int]:
-    """Parse one AND-connected group of conditions."""
-    clause, pos = _parse_one_condition(tokens, pos)
+    """Parse one AND-connected group of atoms."""
+    clause, pos = _parse_atom(tokens, pos)
     while pos < len(tokens) and tokens[pos].upper() == "AND":
-        next_cond, pos = _parse_one_condition(tokens, pos + 1)
+        next_cond, pos = _parse_atom(tokens, pos + 1)
         tail = clause
         while tail.and_clause:
             tail = tail.and_clause
@@ -174,19 +192,26 @@ def _parse_and_group(tokens: list[str], pos: int) -> tuple["WhereClause", int]:
     return clause, pos
 
 
-def _parse_where(tokens: list[str], pos: int) -> tuple["WhereClause | None", int]:
-    """Parse WHERE (AND-group) [OR (AND-group) ...]. Returns (clause, next_pos).
-    AND binds tighter than OR (standard SQL precedence).
+def _parse_where_expr(tokens: list[str], pos: int) -> tuple["WhereClause", int]:
+    """Parse (AND-group) [OR (AND-group) ...] without the WHERE keyword.
+    Called recursively from _parse_atom to handle parenthesized groups.
     """
-    if pos >= len(tokens) or tokens[pos].upper() != "WHERE":
-        return None, pos
-    clause, pos = _parse_and_group(tokens, pos + 1)
+    clause, pos = _parse_and_group(tokens, pos)
     or_tail = clause
     while pos < len(tokens) and tokens[pos].upper() == "OR":
         next_group, pos = _parse_and_group(tokens, pos + 1)
         or_tail.or_clause = next_group
         or_tail = next_group
     return clause, pos
+
+
+def _parse_where(tokens: list[str], pos: int) -> tuple["WhereClause | None", int]:
+    """Parse WHERE expr. AND binds tighter than OR (standard SQL precedence).
+    Parenthesized groups override precedence: WHERE (a=1 OR b=2) AND c=3.
+    """
+    if pos >= len(tokens) or tokens[pos].upper() != "WHERE":
+        return None, pos
+    return _parse_where_expr(tokens, pos + 1)
 
 
 def _parse_group_having(tokens: list[str], pos: int
@@ -214,12 +239,13 @@ def _parse_group_having(tokens: list[str], pos: int
 
 
 def _parse_order_limit(tokens: list[str], pos: int
-                       ) -> tuple[list[dict], int | None]:
-    """Parse optional ORDER BY … LIMIT n starting at pos.
-    Returns (order_by_list, limit).  order_by items: {"col": str, "desc": bool}.
+                       ) -> tuple[list[dict], int | None, int | None]:
+    """Parse optional ORDER BY … LIMIT n OFFSET m starting at pos.
+    Returns (order_by_list, limit, offset).  order_by items: {"col": str, "desc": bool}.
     """
     order_by: list[dict] = []
-    limit: int | None = None
+    limit:  int | None = None
+    offset: int | None = None
 
     if pos < len(tokens) and tokens[pos].upper() == "ORDER":
         pos += 1
@@ -245,7 +271,16 @@ def _parse_order_limit(tokens: list[str], pos: int
         except ValueError:
             raise ParseError(f"Expected integer after LIMIT, got '{tokens[pos]}'")
 
-    return order_by, limit
+    if pos < len(tokens) and tokens[pos].upper() == "OFFSET":
+        pos += 1
+        if pos >= len(tokens):
+            raise ParseError("Expected integer after OFFSET")
+        try:
+            offset = int(tokens[pos]); pos += 1
+        except ValueError:
+            raise ParseError(f"Expected integer after OFFSET, got '{tokens[pos]}'")
+
+    return order_by, limit, offset
 
 
 def parse(sql: str) -> dict:
@@ -457,7 +492,16 @@ def _parse_tokens(t: list[str]) -> dict:
         if sub == "TABLE":
             return {"op": "DROP_TABLE", "name": t[2]}
         if sub == "INDEX":
-            return {"op": "DROP_INDEX", "idx_name": t[2]}
+            i = 2
+            if_exists = False
+            if i < len(t) and t[i].upper() == "IF":
+                if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                    if_exists = True; i += 2
+                else:
+                    raise ParseError("Expected EXISTS after IF")
+            if i >= len(t):
+                raise ParseError("Expected index name after DROP INDEX")
+            return {"op": "DROP_INDEX", "idx_name": t[i], "if_exists": if_exists}
         raise ParseError(f"Expected TABLE or INDEX, got '{t[1]}'")
 
     # INSERT INTO
@@ -476,13 +520,22 @@ def _parse_tokens(t: list[str]) -> dict:
             i += 1
         if i >= len(t) or t[i].upper() != "VALUES":
             raise ParseError("Expected VALUES")
-        i += 2
-        values: list[str] = []
-        while i < len(t) and t[i] != ")":
-            if t[i] != ",":
-                values.append(t[i])
+        i += 1
+        rows: list[list[str]] = []
+        while i < len(t) and t[i] == "(":
             i += 1
-        return {"op": "INSERT", "table": table, "col_names": col_names, "values": values}
+            row_vals: list[str] = []
+            while i < len(t) and t[i] != ")":
+                if t[i] != ",":
+                    row_vals.append(t[i])
+                i += 1
+            i += 1  # skip ")"
+            rows.append(row_vals)
+            if i < len(t) and t[i] == ",":
+                i += 1  # skip comma between row groups
+        if not rows:
+            raise ParseError("Expected at least one row of VALUES")
+        return {"op": "INSERT", "table": table, "col_names": col_names, "rows": rows}
 
     # SELECT (with optional INNER JOIN)
     if kw == "SELECT":
@@ -490,11 +543,18 @@ def _parse_tokens(t: list[str]) -> dict:
         distinct = i < len(t) and t[i].upper() == "DISTINCT"
         if distinct:
             i += 1
-        cols = []
+        cols: list[str] = []
+        col_aliases: dict[str, str] = {}
         while i < len(t) and t[i].upper() != "FROM":
-            if t[i] != ",":
-                cols.append(t[i])
-            i += 1
+            if t[i] == ",":
+                i += 1
+                continue
+            col = t[i]; i += 1
+            if i < len(t) and t[i].upper() == "AS":
+                i += 1
+                if i < len(t) and t[i].upper() != "FROM":
+                    col_aliases[col] = t[i]; i += 1
+            cols.append(col)
         if i >= len(t):
             raise ParseError("Expected FROM")
         i += 1
@@ -538,8 +598,8 @@ def _parse_tokens(t: list[str]) -> dict:
                     raise ParseError("Expected = in ON clause")
                 i += 1
                 on_right = t[i]; i += 1
-            where, i        = _parse_where(t, i)
-            order_by, limit = _parse_order_limit(t, i)
+            where, i               = _parse_where(t, i)
+            order_by, limit, offset = _parse_order_limit(t, i)
             return {
                 "op":           "JOIN",
                 "join_type":    join_type,
@@ -550,23 +610,27 @@ def _parse_tokens(t: list[str]) -> dict:
                 "on_left":      on_left,
                 "on_right":     on_right,
                 "columns":      None if cols == ["*"] else cols,
+                "col_aliases":  col_aliases,
                 "where":        where,
                 "order_by":     order_by,
                 "limit":        limit,
+                "offset":       offset,
             }
-        where, i              = _parse_where(t, i)
-        group_by, having, i   = _parse_group_having(t, i)
-        order_by, limit       = _parse_order_limit(t, i)
+        where, i                    = _parse_where(t, i)
+        group_by, having, i         = _parse_group_having(t, i)
+        order_by, limit, offset     = _parse_order_limit(t, i)
         return {
-            "op":       "SELECT",
-            "table":    table,
-            "columns":  None if cols == ["*"] else cols,
-            "where":    where,
-            "group_by": group_by or None,
-            "having":   having,
-            "order_by": order_by,
-            "limit":    limit,
-            "distinct": distinct,
+            "op":         "SELECT",
+            "table":      table,
+            "columns":    None if cols == ["*"] else cols,
+            "col_aliases": col_aliases,
+            "where":      where,
+            "group_by":   group_by or None,
+            "having":     having,
+            "order_by":   order_by,
+            "limit":      limit,
+            "offset":     offset,
+            "distinct":   distinct,
         }
 
     # UPDATE

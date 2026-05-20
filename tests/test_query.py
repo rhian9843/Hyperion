@@ -333,5 +333,115 @@ class TestDistinct(unittest.TestCase):
         self.assertEqual(len(row_lines), 2)
 
 
+class TestUnknownColumn(unittest.TestCase):
+    def test_where_unknown_column_raises_error(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, alice@example.com)",
+                "SELECT * FROM users WHERE nonexistent = 1",
+                ".exit",
+            ], db)
+        self.assertTrue(any("Error" in l or "error" in l for l in lines))
+
+    def test_where_valid_column_does_not_raise(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, alice@example.com)",
+                "SELECT * FROM users WHERE id = 1",
+                ".exit",
+            ], db)
+        self.assertTrue(any("alice" in l for l in lines))
+
+
+class TestColumnAlias(unittest.TestCase):
+    def test_select_as_renames_header(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "SELECT id AS user_id, name AS full_name FROM users",
+                ".exit",
+            ], db)
+        self.assertTrue(any("user_id" in l for l in lines))
+        self.assertTrue(any("full_name" in l for l in lines))
+        self.assertTrue(any("alice" in l for l in lines))
+
+    def test_select_as_does_not_include_as_keyword_in_output(self):
+        with TempDB() as db:
+            _, lines = db_run([
+                CREATE_USERS,
+                "INSERT INTO users VALUES (1, alice, a@x.com)",
+                "SELECT name AS n FROM users",
+                ".exit",
+            ], db)
+        self.assertFalse(any(l.strip() == "AS" for l in lines))
+        self.assertTrue(any("n" in l for l in lines))
+
+
+class TestParenthesizedWhere(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TempDB()
+        self.db = self._tmp.__enter__()
+        db_run([
+            CREATE_USERS,
+            "INSERT INTO users VALUES (1, alice, a@x.com)",
+            "INSERT INTO users VALUES (2, bob, b@x.com)",
+            "INSERT INTO users VALUES (3, carol, c@x.com)",
+            ".exit",
+        ], self.db)
+
+    def tearDown(self):
+        self._tmp.__exit__(None, None, None)
+
+    def test_paren_or_then_and(self):
+        """(a=1 OR a=2) AND name=alice  → only alice."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE (id = 1 OR id = 2) AND name = alice",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+
+    def test_without_parens_different_result(self):
+        """id=1 OR (id=2 AND name=alice) — without parens OR has lowest precedence."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE id = 1 OR id = 2 AND name = alice",
+            ".exit",
+        ], self.db)
+        # id=1 matches alice; id=2 AND name=alice matches nothing → just alice
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+
+    def test_paren_changes_precedence(self):
+        """(id=1 OR id=2) AND name=bob → only bob (id 2)."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE (id = 1 OR id = 2) AND name = bob",
+            ".exit",
+        ], self.db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+
+    def test_nested_parens(self):
+        """((id=1 OR id=2) OR id=3) → all three rows."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE ((id = 1 OR id = 2) OR id = 3)",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+
+    def test_paren_group_with_and_outside(self):
+        """(id=2 OR id=3) AND id != 3 → only bob."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE (id = 2 OR id = 3) AND id != 3",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertFalse(any("carol" in l for l in lines))
+
+
 if __name__ == "__main__":
     unittest.main()
