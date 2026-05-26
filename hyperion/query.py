@@ -8,6 +8,7 @@ from .encoding import (
     _encode_index_key, _encode_composite_key,
     _make_index_key, _apply_order_limit,
 )
+from .expr import eval_expr, is_expr
 
 
 def _parse_agg(col: str) -> tuple[str, str] | None:
@@ -18,7 +19,7 @@ def _parse_agg(col: str) -> tuple[str, str] | None:
 
 
 def _project_row(row: dict, columns: list[str]) -> dict:
-    """Project a row to the requested columns, resolving table-qualified names (t.col → col)."""
+    """Project a row to the requested columns, resolving qualified names and expressions."""
     result = {}
     for col in columns:
         if col in row:
@@ -27,8 +28,12 @@ def _project_row(row: dict, columns: list[str]) -> dict:
             bare = col.split(".", 1)[1]
             if bare in row:
                 result[col] = row[bare]
+            elif is_expr(col):
+                result[col] = eval_expr(col, row)
             else:
                 raise RuntimeError(f"Unknown column: '{col}'")
+        elif is_expr(col):
+            result[col] = eval_expr(col, row)
         else:
             raise RuntimeError(f"Unknown column: '{col}'")
     return result

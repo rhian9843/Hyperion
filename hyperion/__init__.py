@@ -16,6 +16,7 @@ from .encoding import (
     _apply_order_limit, _apply_set_op,
 )
 from .database import Database
+from .expr import eval_expr, is_expr
 from .where import (
     WhereClause,
     _OUTER_REF_RE,

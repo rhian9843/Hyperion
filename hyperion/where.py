@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .encoding import _apply_set_op
+from .expr import eval_expr, is_expr
 
 
 @dataclass
@@ -31,20 +32,24 @@ class WhereClause:
         return self.and_clause._eval_and_chain(row, db) if self.and_clause else True
 
     def _eval_atom(self, row: dict[str, Any], db: Any = None) -> bool:
-        # Parenthesized group — evaluate the inner expression as a unit
+        # Parenthesized group or prefix NOT — evaluate the inner expression as a unit
         if self.op == "GROUP":
             return self.group_clause.evaluate(row, db)  # type: ignore[union-attr]
+        if self.op == "NOT":
+            return not self.group_clause.evaluate(row, db)  # type: ignore[union-attr]
 
         # EXISTS / NOT EXISTS — re-executed per outer row (supports correlation)
         if self.op in ("EXISTS", "NOT EXISTS"):
             sub_rows = _exec_correlated_subquery(self.subquery_ast, db, row)
             return bool(sub_rows) if self.op == "EXISTS" else not bool(sub_rows)
 
-        # col lookup — strip table/alias prefix when exact key absent
+        # col lookup — strip table/alias prefix when exact key absent, or evaluate as expr
         if self.col in row:
             cell = row[self.col]
         elif "." in self.col and self.col.split(".", 1)[1] in row:
             cell = row[self.col.split(".", 1)[1]]
+        elif is_expr(self.col):
+            cell = eval_expr(self.col, row)
         else:
             raise RuntimeError(f"Unknown column: '{self.col}'")
 
@@ -64,17 +69,23 @@ class WhereClause:
                 fk = next(iter(sub_rows[0])) if sub_rows else None
                 in_vals: list = [r[fk] for r in sub_rows] if fk else []
                 result = cell in in_vals
+                return result if self.op == "IN" else not result
             else:
                 in_vals_str = [v.strip() for v in self.val.split(",")]
+                has_null = any(v.upper() == "NULL" for v in in_vals_str)
+                non_null = [v for v in in_vals_str if v.upper() != "NULL"]
                 if isinstance(cell, int):
-                    try:    result = any(cell == int(v) for v in in_vals_str)
+                    try:    result = any(cell == int(v) for v in non_null)
                     except ValueError: result = False
                 elif isinstance(cell, float):
-                    try:    result = any(cell == float(v) for v in in_vals_str)
+                    try:    result = any(cell == float(v) for v in non_null)
                     except ValueError: result = False
                 else:
-                    result = str(cell) in in_vals_str
-            return result if self.op == "IN" else not result
+                    result = str(cell) in non_null
+                if self.op == "IN":
+                    return result
+                # NOT IN: UNKNOWN (→ False) when list contains NULL and x doesn't match
+                return not result and not has_null
 
         val: Any = self.val
         if self.subquery_ast is not None:
@@ -83,6 +94,14 @@ class WhereClause:
                 return False
             fk = next(iter(sub_rows[0]))
             val = sub_rows[0][fk]
+        elif (isinstance(val, str) and "." in val
+              and self.op not in ("LIKE", "GLOB", "IN", "NOT IN")
+              and val in row):
+            # Qualified column reference (e.g. b.id) in a merged join row — resolve it
+            val = row[val]
+        elif (isinstance(val, str) and val not in ("", "__subquery__")
+              and self.op not in ("LIKE", "GLOB", "IN", "NOT IN") and is_expr(val)):
+            val = eval_expr(val, row)
 
         if not isinstance(val, (int, float)) and isinstance(cell, (int, float)):
             try:
@@ -97,11 +116,31 @@ class WhereClause:
             case "<=":   return cell <= val
             case ">=":   return cell >= val
             case "LIKE":
+                pattern_str = str(val)
+                escape_ch = None
+                if "\x00" in pattern_str:
+                    pattern_str, escape_ch = pattern_str.split("\x00", 1)
+                regex_parts: list[str] = []
+                i_p = 0
+                while i_p < len(pattern_str):
+                    ch = pattern_str[i_p]
+                    if escape_ch and ch == escape_ch and i_p + 1 < len(pattern_str):
+                        i_p += 1
+                        regex_parts.append(re.escape(pattern_str[i_p]))
+                    elif ch == "%":
+                        regex_parts.append(".*")
+                    elif ch == "_":
+                        regex_parts.append(".")
+                    else:
+                        regex_parts.append(re.escape(ch))
+                    i_p += 1
+                return bool(re.fullmatch("".join(regex_parts), str(cell), re.IGNORECASE))
+            case "GLOB":
                 regex = "".join(
-                    ".*" if ch == "%" else "." if ch == "_" else re.escape(ch)
+                    ".*" if ch == "*" else "." if ch == "?" else re.escape(ch)
                     for ch in str(val)
                 )
-                return bool(re.fullmatch(regex, str(cell), re.IGNORECASE))
+                return bool(re.fullmatch(regex, str(cell)))  # case-sensitive
         return False
 
 

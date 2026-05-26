@@ -2,7 +2,7 @@ import re
 import struct
 from typing import Any
 
-from .schema import Schema, ForeignKey, deserialize_row
+from .schema import Schema, ForeignKey, deserialize_row, serialize_row
 from .constants import INTEGER, REAL
 from .encoding import _encode_composite_key, _make_index_key
 
@@ -12,12 +12,13 @@ class ConstraintsMixin:
 
     def _check_unique(self, meta, row: dict[str, Any],
                       exclude_rowid: int | None = None) -> None:
-        """Raise if any UNIQUE column in row duplicates an existing value."""
+        """Raise if any UNIQUE column or multi-column unique constraint is violated."""
         schema      = meta.schema
         unique_cols = [c for c in schema.columns if c.unique]
-        if not unique_cols:
+        mc_unique   = schema.unique_constraints  # list[list[str]]
+        if not unique_cols and not mc_unique:
             return
-        # Coerce new-row values to their storage types for comparison
+        # Coerce single-column UNIQUE values to their storage types for comparison
         typed: dict[str, Any] = {}
         for col in unique_cols:
             v = row.get(col.name)
@@ -38,6 +39,27 @@ class ConstraintsMixin:
                 if v is not None and existing.get(col.name) == v:
                     raise RuntimeError(
                         f"UNIQUE constraint failed: {schema.name}.{col.name}"
+                    )
+            for uc_cols in mc_unique:
+                new_vals = []
+                for c in uc_cols:
+                    v = row.get(c)
+                    col_obj = next((col for col in schema.columns if col.name == c), None)
+                    if v is not None and col_obj:
+                        if col_obj.type == INTEGER:
+                            try: v = int(v)
+                            except (ValueError, TypeError): pass
+                        elif col_obj.type == REAL:
+                            try: v = float(v)
+                            except (ValueError, TypeError): pass
+                    new_vals.append(v)
+                if any(v is None for v in new_vals):
+                    continue  # NULL exempts from multi-col unique
+                ex_vals = [existing.get(c) for c in uc_cols]
+                if new_vals == ex_vals:
+                    raise RuntimeError(
+                        f"UNIQUE constraint failed: "
+                        f"{schema.name}({', '.join(uc_cols)})"
                     )
 
     def _check_constraints(self, schema: Schema, row: dict[str, Any]) -> None:
@@ -131,8 +153,14 @@ class ConstraintsMixin:
                     f"→ {fk.ref_table}({', '.join(fk.ref_columns)})"
                 )
 
-    def _check_fk_parent(self, table: str, old_row: dict[str, Any]) -> None:
-        """Raise (RESTRICT) if any child row references `old_row` via a FK."""
+    def _check_fk_parent(self, table: str, old_row: dict[str, Any],
+                          is_delete: bool = False,
+                          new_row: dict[str, Any] | None = None) -> None:
+        """Enforce FK constraints when a parent row is modified or deleted.
+
+        On DELETE: applies fk.on_delete (RESTRICT, CASCADE, SET NULL, NO ACTION).
+        On UPDATE: applies fk.on_update; for CASCADE, propagates new ref values to children.
+        """
         for tname, tmeta in self.tables.items():
             for fk in tmeta.schema.foreign_keys:
                 if fk.ref_table.lower() != table.lower():
@@ -141,11 +169,51 @@ class ConstraintsMixin:
                 if any(v is None for v in ref_vals):
                     continue
                 child_schema = tmeta.schema
-                for _, raw in self._table_btree(tmeta).scan():
+                matching: list[tuple[int, dict]] = []
+                for rowid, raw in self._table_btree(tmeta).scan():
                     child_row = deserialize_row(child_schema, raw)
                     if all(child_row.get(cc) == rv
                            for cc, rv in zip(fk.columns, ref_vals)):
-                        raise RuntimeError(
-                            f"FOREIGN KEY constraint failed: cannot modify '{table}' "
-                            f"— row is referenced by '{tname}'"
-                        )
+                        matching.append((rowid, child_row))
+                if not matching:
+                    continue
+                action = fk.on_delete if is_delete else fk.on_update
+                if action in ("RESTRICT", "NO ACTION"):
+                    raise RuntimeError(
+                        f"FOREIGN KEY constraint failed: cannot modify '{table}' "
+                        f"— row is referenced by '{tname}'"
+                    )
+                elif action == "CASCADE":
+                    if is_delete:
+                        victim_ids = {r for r, _ in matching}
+                        self._table_btree(tmeta).delete(victim_ids)
+                        for im in self._indexes_for(tname):
+                            col_types = [next(c.type for c in child_schema.columns
+                                             if c.name == n)
+                                         for n in im.columns]
+                            idx_keys: set[int] = set()
+                            for rowid, child_row in matching:
+                                vals = [child_row.get(n) for n in im.columns]
+                                if all(v is not None for v in vals):
+                                    idx_keys.add(_make_index_key(
+                                        _encode_composite_key(vals, col_types), rowid))
+                            self._index_btree(im).delete(idx_keys)
+                    else:
+                        # ON UPDATE CASCADE: propagate new ref column values to children
+                        if new_row is not None:
+                            new_ref_vals = [new_row.get(c) for c in fk.ref_columns]
+                            upd: dict[int, bytes] = {}
+                            for rowid, child_row in matching:
+                                updated = dict(child_row)
+                                for cc, nv in zip(fk.columns, new_ref_vals):
+                                    updated[cc] = nv
+                                upd[rowid] = serialize_row(child_schema, updated)
+                            self._table_btree(tmeta).update(upd)
+                elif action == "SET NULL":
+                    upd_null: dict[int, bytes] = {}
+                    for rowid, child_row in matching:
+                        updated = dict(child_row)
+                        for cc in fk.columns:
+                            updated[cc] = None
+                        upd_null[rowid] = serialize_row(child_schema, updated)
+                    self._table_btree(tmeta).update(upd_null)

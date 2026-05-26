@@ -21,6 +21,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._pager          = Pager(path)
         self._catalog, self._catalog_extra = self._load_catalog()
         self._txn_depth      = 0
+        # Each entry: (name, page_snapshots, dirty_set, catalog_bytes, catalog_extra)
+        self._savepoints: list[tuple] = []
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -44,9 +46,48 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def rollback(self) -> None:
         if self._txn_depth == 0:
             raise RuntimeError("No active transaction")
+        self._savepoints.clear()
         self._pager.rollback()
         self._reload_catalog()
         self._txn_depth = 0
+
+    # ── Savepoints ─────────────────────────────────────────────────────────────
+
+    def savepoint(self, name: str) -> None:
+        if self._txn_depth == 0:
+            self._pager.begin()
+            self._txn_depth = 1
+        pages_snap = {n: bytes(self._pager._cache[n])
+                      for n in self._pager._dirty if n in self._pager._cache}
+        dirty_snap = set(self._pager._dirty)
+        cat_bytes  = self._catalog.to_bytes()
+        cat_extra  = list(self._catalog_extra)
+        self._savepoints.append((name, pages_snap, dirty_snap, cat_bytes, cat_extra))
+
+    def release_savepoint(self, name: str) -> None:
+        idx = self._find_savepoint(name)
+        del self._savepoints[idx:]
+
+    def rollback_to_savepoint(self, name: str) -> None:
+        idx = self._find_savepoint(name)
+        _, pages_snap, dirty_snap, cat_bytes, cat_extra = self._savepoints[idx]
+        del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
+        # Evict pages added after the savepoint
+        for pn in set(self._pager._dirty) - dirty_snap:
+            self._pager._cache.pop(pn, None)
+        # Restore snapshotted page contents
+        for pn, content in pages_snap.items():
+            self._pager._cache[pn] = bytearray(content)
+        self._pager._dirty = set(dirty_snap)
+        # Restore catalog
+        self._catalog      = Catalog.from_bytes(cat_bytes)
+        self._catalog_extra = list(cat_extra)
+
+    def _find_savepoint(self, name: str) -> int:
+        for i in range(len(self._savepoints) - 1, -1, -1):
+            if self._savepoints[i][0] == name:
+                return i
+        raise RuntimeError(f"No such savepoint: '{name}'")
 
     def _load_catalog(self) -> tuple["Catalog", list[int]]:
         data   = b""
@@ -174,6 +215,29 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     @property
     def indexes(self) -> dict[str, IndexMeta]:
         return self._catalog.indexes
+
+    @property
+    def views(self) -> dict[str, str]:
+        return self._catalog.views
+
+    def create_view(self, name: str, sql: str,
+                    if_not_exists: bool = False,
+                    or_replace: bool = False) -> None:
+        if name in self._catalog.views:
+            if or_replace:
+                pass  # overwrite below
+            elif if_not_exists:
+                return
+            else:
+                raise RuntimeError(f"View '{name}' already exists")
+        self._catalog.views[name] = sql
+
+    def drop_view(self, name: str, if_exists: bool = False) -> None:
+        if name not in self._catalog.views:
+            if if_exists:
+                return
+            raise RuntimeError(f"No such view: '{name}'")
+        del self._catalog.views[name]
 
     def close(self) -> None:
         self._pager.close()

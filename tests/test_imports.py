@@ -73,6 +73,8 @@ public_names = [
     "_apply_order_limit", "_apply_set_op",
     # core
     "Database",
+    # expr
+    "eval_expr", "is_expr",
     # where
     "WhereClause", "_exec_correlated_subquery",
     "_instantiate_correlated", "_try_resolve_outer_ref",

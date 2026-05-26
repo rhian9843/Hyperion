@@ -443,5 +443,165 @@ class TestParenthesizedWhere(unittest.TestCase):
         self.assertFalse(any("carol" in l for l in lines))
 
 
+class TestNotOperator(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TempDB()
+        self.db = self._tmp.__enter__()
+        db_run([
+            CREATE_USERS,
+            "INSERT INTO users VALUES (1, alice, a@x.com)",
+            "INSERT INTO users VALUES (2, bob, b@x.com)",
+            "INSERT INTO users VALUES (3, carol, c@x.com)",
+            ".exit",
+        ], self.db)
+
+    def tearDown(self):
+        self._tmp.__exit__(None, None, None)
+
+    def test_not_simple(self):
+        """WHERE NOT id = 1 → bob and carol, not alice."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE NOT id = 1",
+            ".exit",
+        ], self.db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+
+    def test_not_with_and(self):
+        """WHERE NOT id = 1 AND NOT id = 2 → only carol."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE NOT id = 1 AND NOT id = 2",
+            ".exit",
+        ], self.db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+
+    def test_not_with_paren_group(self):
+        """WHERE NOT (id = 1 OR id = 2) → only carol."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE NOT (id = 1 OR id = 2)",
+            ".exit",
+        ], self.db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+
+
+class TestBetween(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TempDB()
+        self.db = self._tmp.__enter__()
+        db_run([
+            CREATE_USERS,
+            "INSERT INTO users VALUES (1, alice, a@x.com)",
+            "INSERT INTO users VALUES (2, bob, b@x.com)",
+            "INSERT INTO users VALUES (3, carol, c@x.com)",
+            "INSERT INTO users VALUES (4, dave, d@x.com)",
+            "INSERT INTO users VALUES (5, eve, e@x.com)",
+            ".exit",
+        ], self.db)
+
+    def tearDown(self):
+        self._tmp.__exit__(None, None, None)
+
+    def test_between_basic(self):
+        """WHERE id BETWEEN 2 AND 4 → bob, carol, dave."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE id BETWEEN 2 AND 4",
+            ".exit",
+        ], self.db)
+        self.assertFalse(any("alice" in l for l in lines))
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertTrue(any("carol" in l for l in lines))
+        self.assertTrue(any("dave" in l for l in lines))
+        self.assertFalse(any("eve" in l for l in lines))
+
+    def test_between_boundaries_inclusive(self):
+        """BETWEEN includes both endpoints."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE id BETWEEN 1 AND 5",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertTrue(any("eve" in l for l in lines))
+
+    def test_not_between(self):
+        """WHERE id NOT BETWEEN 2 AND 4 → alice and eve only."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE id NOT BETWEEN 2 AND 4",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("alice" in l for l in lines))
+        self.assertFalse(any("bob" in l for l in lines))
+        self.assertFalse(any("carol" in l for l in lines))
+        self.assertFalse(any("dave" in l for l in lines))
+        self.assertTrue(any("eve" in l for l in lines))
+
+    def test_between_with_and_clause(self):
+        """WHERE id BETWEEN 2 AND 4 AND name = bob → only bob."""
+        _, lines = db_run([
+            "SELECT name FROM users WHERE id BETWEEN 2 AND 4 AND name = bob",
+            ".exit",
+        ], self.db)
+        self.assertTrue(any("bob" in l for l in lines))
+        self.assertFalse(any("carol" in l for l in lines))
+        self.assertFalse(any("dave" in l for l in lines))
+
+
+class TestAliasFlowthrough(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TempDB()
+        self.db = self._tmp.__enter__()
+        db_run([
+            CREATE_USERS,
+            "INSERT INTO users VALUES (3, carol, c@x.com)",
+            "INSERT INTO users VALUES (1, alice, a@x.com)",
+            "INSERT INTO users VALUES (2, bob, b@x.com)",
+            ".exit",
+        ], self.db)
+
+    def tearDown(self):
+        self._tmp.__exit__(None, None, None)
+
+    def test_alias_in_order_by(self):
+        """SELECT id AS uid ORDER BY uid → rows sorted by id."""
+        _, lines = db_run([
+            "SELECT id AS uid, name FROM users ORDER BY uid",
+            ".exit",
+        ], self.db)
+        names = [l for l in lines if any(n in l for n in ("alice", "bob", "carol"))]
+        self.assertTrue(len(names) >= 3)
+        # alice (id=1) must come before bob (id=2) before carol (id=3)
+        alice_i = next(i for i, l in enumerate(names) if "alice" in l)
+        bob_i   = next(i for i, l in enumerate(names) if "bob"   in l)
+        carol_i = next(i for i, l in enumerate(names) if "carol" in l)
+        self.assertLess(alice_i, bob_i)
+        self.assertLess(bob_i, carol_i)
+
+    def test_alias_in_order_by_desc(self):
+        """SELECT id AS uid ORDER BY uid DESC → carol, bob, alice."""
+        _, lines = db_run([
+            "SELECT id AS uid, name FROM users ORDER BY uid DESC",
+            ".exit",
+        ], self.db)
+        names = [l for l in lines if any(n in l for n in ("alice", "bob", "carol"))]
+        carol_i = next(i for i, l in enumerate(names) if "carol" in l)
+        alice_i = next(i for i, l in enumerate(names) if "alice" in l)
+        self.assertLess(carol_i, alice_i)
+
+    def test_alias_column_name_in_output(self):
+        """Column header in output uses alias name, not raw name."""
+        _, lines = db_run([
+            "SELECT id AS uid, name AS full_name FROM users LIMIT 1",
+            ".exit",
+        ], self.db)
+        header = lines[0] if lines else ""
+        self.assertIn("uid", header)
+        self.assertIn("full_name", header)
+        self.assertNotIn("name |", header)  # raw 'name' col should not appear standalone
+
+
 if __name__ == "__main__":
     unittest.main()

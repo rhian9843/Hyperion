@@ -30,6 +30,7 @@ class IndexMeta:
 class Catalog:
     tables:         dict[str, TableMeta]  = field(default_factory=dict)
     indexes:        dict[str, IndexMeta]  = field(default_factory=dict)
+    views:          dict[str, str]        = field(default_factory=dict)
     next_free_page: int                   = 1   # page 0 = catalog
     free_pages:     list[int]             = field(default_factory=list)
 
@@ -50,6 +51,7 @@ class Catalog:
                     "root_page": m.root_page, "next_page": m.next_page}
                 for n, m in self.indexes.items()
             },
+            "views": self.views,
         }).encode()
 
     @classmethod
@@ -70,5 +72,6 @@ class Catalog:
             for n, i in d.get("indexes", {}).items()
         }
         return cls(tables=tables, indexes=indexes,
+                   views=d.get("views", {}),
                    next_free_page=d.get("next_free_page", 1),
                    free_pages=d.get("free_pages", []))

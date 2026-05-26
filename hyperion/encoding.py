@@ -71,13 +71,14 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
         # key ends up as the primary sort (Python sort is stable).
         for ob in reversed(order_by):
             col, desc = ob["col"], ob["desc"]
+            nulls_first = ob.get("nulls_first")
             non_null = [r for r in rows if r.get(col) is not None]
             null_rows = [r for r in rows if r.get(col) is None]
             try:
                 non_null.sort(key=lambda r, c=col: r[c], reverse=desc)
             except TypeError:
                 non_null.sort(key=lambda r, c=col: str(r[c]), reverse=desc)
-            rows = non_null + null_rows   # NULLs always last
+            rows = (null_rows + non_null) if nulls_first else (non_null + null_rows)
     if offset is not None:
         rows = rows[offset:]
     if limit is not None:
