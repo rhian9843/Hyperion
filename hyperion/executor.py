@@ -11,7 +11,7 @@ from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_in
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
 from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
-from .query import _project_row
+from .query import _project_row, _parse_agg as _q_parse_agg
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
 
@@ -1077,7 +1077,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         if s.get("subquery_from"):
             rows = _exec_derived_table(s, db, ctes)
         elif tbl in ctes:
-            if s.get("group_by") or any(re.match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b", c, re.IGNORECASE) for c in stmt_cols if c != "*"):
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
                 raw_rows = _exec_cte_select(raw_stmt, ctes[tbl], db, ctes)
                 rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
@@ -1086,7 +1086,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 rows = _exec_cte_select(s, ctes[tbl], db, ctes)
         elif tbl in db.views:
             view_ast = _parse_tokens(_tokenize(db.views[tbl]))
-            if s.get("group_by") or any(re.match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b", c, re.IGNORECASE) for c in stmt_cols if c != "*"):
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
                 raw_rows = _exec_cte_select(raw_stmt, view_ast, db, ctes)
                 rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
@@ -1129,9 +1129,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         rtbl = s.get("right_table", "")
         group_by = s.get("group_by")
         has_agg  = group_by or (s.get("having") is not None) or any(
-            __import__("re").match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b",
-                                   c, __import__("re").IGNORECASE)
-            for c in (s.get("columns") or []) if c != "*")
+            _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*")
         # Route through _rows_for_stmt when CTEs are involved or aggregation is needed
         if ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views or has_agg:
             # Fetch all rows without projection so aggregation sees every column

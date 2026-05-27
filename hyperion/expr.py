@@ -7,6 +7,12 @@ from typing import Any
 
 from .json_funcs import eval_json_func as _eval_json_func
 
+# ── Application-defined function registries ────────────────────────────────────
+# Populated by Database.create_function / create_aggregate.
+# Keys are always upper-cased function names.
+_USER_FUNCS: dict[str, tuple[int, Any]] = {}   # name → (n_args, callable)
+_USER_AGGS:  dict[str, tuple[int, Any]] = {}   # name → (n_args, aggregate_class)
+
 _ARITH_OPS = frozenset({"+", "-", "*", "/", "%", "||"})
 _COMP_OPS  = frozenset({"=", "!=", "<", ">", "<=", ">="})
 
@@ -366,6 +372,18 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
 
     if fname.upper().startswith("JSON"):
         return _eval_json_func(fname, args)
+
+    # ── Application-defined scalar functions ───────────────────────────────────
+
+    upper = fname.upper()
+    if upper in _USER_FUNCS:
+        n_expected, fn = _USER_FUNCS[upper]
+        if n_expected >= 0 and len(args) != n_expected:
+            raise RuntimeError(
+                f"wrong number of arguments to function {fname}(): "
+                f"expected {n_expected}, got {len(args)}"
+            )
+        return fn(*args)
 
     return None  # unknown function → NULL
 

@@ -8,7 +8,7 @@ from .encoding import (
     _encode_index_key, _encode_composite_key,
     _make_index_key, _apply_order_limit,
 )
-from .expr import eval_expr, is_expr
+from .expr import eval_expr, is_expr, _USER_AGGS
 from .optimizer import find_eq_index, probe_index as _probe_index
 
 
@@ -18,13 +18,21 @@ _AGG_RE = re.compile(
     re.IGNORECASE,
 )
 
+_USER_AGG_CALL_RE = re.compile(
+    r'^(\w+)\(\s*(DISTINCT\s+)?(.+?)\s*\)$', re.IGNORECASE
+)
+
 
 def _parse_agg(col: str) -> tuple[str, str, bool] | None:
     """If col is an aggregate call, return (FUNC_UPPER, arg, distinct). Else None."""
     m = _AGG_RE.match(col)
-    if not m:
-        return None
-    return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
+    if m:
+        return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
+    # Check application-defined aggregates
+    m2 = _USER_AGG_CALL_RE.match(col)
+    if m2 and m2.group(1).upper() in _USER_AGGS:
+        return (m2.group(1).upper(), m2.group(3).strip(), bool(m2.group(2)))
+    return None
 
 
 def _project_row(row: dict, columns: list[str]) -> dict:
@@ -135,6 +143,13 @@ class QueryMixin:
                 if distinct:
                     str_vals = list(dict.fromkeys(str_vals))
                 result[col] = sep.join(str_vals) if str_vals else None
+            elif func in _USER_AGGS:
+                _, agg_class = _USER_AGGS[func]
+                agg_obj = agg_class()
+                for r in bucket_rows:
+                    v = eval_expr(arg, r) if is_expr(arg) else r.get(arg)
+                    agg_obj.step(v)
+                result[col] = agg_obj.finalize()
             else:
                 vals = [r[arg] for r in bucket_rows
                         if r.get(arg) is not None and arg in r]

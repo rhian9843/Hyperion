@@ -87,6 +87,35 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._catalog      = Catalog.from_bytes(cat_bytes)
         self._catalog_extra = list(cat_extra)
 
+    # ── Application-defined functions ──────────────────────────────────────────
+
+    def create_function(self, name: str, n_args: int, fn) -> None:
+        """Register a custom scalar function callable from SQL.
+
+        Args:
+            name:   SQL function name (case-insensitive).
+            n_args: Number of expected arguments, or -1 for variadic.
+            fn:     Callable invoked with evaluated SQL arguments.
+        """
+        from .expr import _USER_FUNCS
+        _USER_FUNCS[name.upper()] = (n_args, fn)
+
+    def create_aggregate(self, name: str, n_args: int, aggregate_class) -> None:
+        """Register a custom aggregate function callable from SQL GROUP BY.
+
+        aggregate_class must implement:
+            __init__(self)      — called once per group
+            step(self, *args)   — called once per row in the group
+            finalize(self)      — called after all rows; returns the result
+
+        Args:
+            name:            SQL function name (case-insensitive).
+            n_args:          Number of per-row arguments, or -1 for variadic.
+            aggregate_class: Class implementing the aggregate protocol.
+        """
+        from .expr import _USER_AGGS
+        _USER_AGGS[name.upper()] = (n_args, aggregate_class)
+
     def _find_savepoint(self, name: str) -> int:
         for i in range(len(self._savepoints) - 1, -1, -1):
             if self._savepoints[i][0] == name:
