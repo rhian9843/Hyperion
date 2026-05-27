@@ -131,9 +131,9 @@
 
 ## Missing — Introspection
 
-- [ ] System catalog table — queryable `_hyperion_master` (equiv. of `sqlite_master`) exposing table/index/view definitions as rows; ORMs and tools depend on this
-- [ ] `PRAGMA integrity_check` — verify B-tree structure and page consistency
-- [ ] `EXPLAIN` / `EXPLAIN QUERY PLAN` — show the query execution plan; critical for debugging performance and verifying index usage
+- [x] System catalog table — queryable `_hyperion_master` (equiv. of `sqlite_master`) exposing table/index/view definitions as rows; ORMs and tools depend on this
+- [x] `PRAGMA integrity_check` — verify B-tree structure and page consistency
+- [x] `EXPLAIN` / `EXPLAIN QUERY PLAN` — show the query execution plan; critical for debugging performance and verifying index usage
 
 ## Python DB-API / Convenience Layer
 

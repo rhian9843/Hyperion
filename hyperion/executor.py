@@ -7,6 +7,9 @@ from .database import Database
 from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, _make_index_key
 from .expr import eval_expr, is_expr
 from .json_funcs import json_each_rows as _json_each_rows
+from .introspect import (hyperion_master_rows as _hyperion_master_rows,
+                         integrity_check as _integrity_check,
+                         explain_plan as _explain_plan)
 from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
@@ -540,6 +543,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         if stmt.get("subquery_from"):
             return _exec_derived_table(stmt, db, ctes)
         tbl = stmt.get("table") or ""
+        if tbl == "_hyperion_master":
+            return _exec_cte_select(stmt, {"op": "INLINE_ROWS",
+                                           "rows": _hyperion_master_rows(db)}, db, ctes)
         if tbl in ctes:
             return _exec_cte_select(stmt, ctes[tbl], db, ctes)
         if tbl in db.views:
@@ -657,6 +663,11 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
                 for i, col in enumerate(idx_meta.columns)]
         return _format_rows(rows, ["seqno", "cid", "name"])
 
+    if name == "integrity_check":
+        results = _integrity_check(db)
+        rows = [{"integrity_check": msg} for msg in results]
+        return _format_rows(rows, ["integrity_check"])
+
     raise RuntimeError(f"Unknown PRAGMA: '{name}'")
 
 
@@ -729,6 +740,11 @@ def execute(stmt: dict, db: Database) -> str:
 
     if op == "PRAGMA":
         return _handle_pragma(stmt, db)
+
+    if op == "EXPLAIN":
+        plan_rows = _explain_plan(stmt["stmt"], db)
+        cols = ["id", "parent", "notused", "detail"]
+        return _format_rows(plan_rows, cols)
 
     if op == "VACUUM":
         return db.vacuum()
@@ -1076,6 +1092,9 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         tbl = s.get("table") or ""
         if s.get("subquery_from"):
             rows = _exec_derived_table(s, db, ctes)
+        elif tbl == "_hyperion_master":
+            raw_rows = _hyperion_master_rows(db)
+            rows = _exec_cte_select(s, {"op": "INLINE_ROWS", "rows": raw_rows}, db, ctes)
         elif tbl in ctes:
             if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
