@@ -527,7 +527,11 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
 
 def _rows_for_stmt(stmt: dict, db: "Database",
                    ctes: dict | None = None) -> list[dict]:
-    """Execute any SELECT-like statement and return its rows."""
+    """Execute any SELECT-like statement and return its rows.
+
+    This is the single authoritative SELECT execution path.  _execute_inner
+    delegates all SELECT/JOIN/SET_OP ops here and just formats the result.
+    """
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     op = stmt["op"]
     if op == "INLINE_ROWS":
@@ -535,63 +539,115 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     if op == "RECURSIVE_CTE":
         return _exec_recursive_cte(stmt, db, ctes)
     if op == "SELECT_NOFROM":
-        row: dict = {}
         col_aliases = stmt.get("col_aliases") or {}
-        result = {col: eval_expr(col, row) for col in (stmt.get("columns") or [])}
+        result = {col: eval_expr(col, {}) for col in (stmt.get("columns") or [])}
         return [{col_aliases.get(k, k): v for k, v in result.items()}]
     if op == "SELECT":
-        if stmt.get("subquery_from"):
-            return _exec_derived_table(stmt, db, ctes)
-        tbl = stmt.get("table") or ""
-        if tbl == "_hyperion_master":
-            return _exec_cte_select(stmt, {"op": "INLINE_ROWS",
-                                           "rows": _hyperion_master_rows(db)}, db, ctes)
-        if tbl in ctes:
-            return _exec_cte_select(stmt, ctes[tbl], db, ctes)
-        if tbl in db.views:
+        s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+        stmt_cols = stmt.get("columns") or []
+        has_window    = any(_WINDOW_RE.search(c) for c in stmt_cols if c != "*")
+        has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
+        tbl = s.get("table") or ""
+        if s.get("subquery_from"):
+            rows = _exec_derived_table(s, db, ctes)
+        elif tbl == "_hyperion_master":
+            rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
+                                        "rows": _hyperion_master_rows(db)}, db, ctes)
+        elif tbl in ctes:
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_cte_select(raw_stmt, ctes[tbl], db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
+                                          s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_cte_select(s, ctes[tbl], db, ctes)
+        elif tbl in db.views:
             view_ast = _parse_tokens(_tokenize(db.views[tbl]))
-            return _exec_cte_select(stmt, view_ast, db, ctes)
-        if _JSON_EACH_RE.match(tbl):
-            return _exec_cte_select(stmt, {"op": "INLINE_ROWS", "rows": _materialize_table(tbl, db, ctes)}, db, ctes)
-        col_aliases = stmt.get("col_aliases") or {}
-        raw = db.select(stmt["table"], stmt["columns"], stmt["where"],
-                        stmt.get("order_by"), stmt.get("limit"),
-                        stmt.get("group_by"), stmt.get("having"),
-                        stmt.get("distinct", False), stmt.get("offset"))
-        if col_aliases:
-            raw = [{col_aliases.get(k, k): v for k, v in row.items()} for row in raw]
-        return raw
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_cte_select(raw_stmt, view_ast, db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
+                                          s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_cte_select(s, view_ast, db, ctes)
+        elif _JSON_EACH_RE.match(tbl):
+            rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
+                                        "rows": _materialize_table(tbl, db, ctes)}, db, ctes)
+        elif has_window or has_scalar_sq:
+            all_rows = db.select(s["table"], None, s["where"], None, None,
+                                 s.get("group_by"), s.get("having"),
+                                 s.get("distinct", False), None)
+            if has_scalar_sq:
+                sq_cols = [c for c in stmt_cols if _is_scalar_subquery_col(c)]
+                augmented = []
+                for row in all_rows:
+                    r = dict(row)
+                    for sc in sq_cols:
+                        r[sc] = _eval_scalar_subquery(sc, r, db, ctes)
+                    augmented.append(r)
+                all_rows = augmented
+            if has_window:
+                all_rows = _apply_window_functions(all_rows, stmt_cols)
+            rows = [_project_row(r, stmt_cols) for r in all_rows] if stmt_cols else all_rows
+            rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+        else:
+            col_aliases = stmt.get("col_aliases") or {}
+            raw = db.select(s["table"], s["columns"], s["where"],
+                            s.get("order_by"), s.get("limit"),
+                            s.get("group_by"), s.get("having"),
+                            s.get("distinct", False), s.get("offset"))
+            if col_aliases:
+                raw = [{col_aliases.get(k, k): v for k, v in row.items()} for row in raw]
+            return raw
+        rows, _ = _apply_aliases(rows, stmt.get("columns"), stmt.get("col_aliases"))
+        return rows
     if op == "JOIN":
-        # If either join table is a CTE, view, or table-valued function, use in-memory join
-        ltbl = stmt.get("left_table", "")
-        rtbl = stmt.get("right_table", "")
+        s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+        ltbl = s.get("left_table", "")
+        rtbl = s.get("right_table", "")
+        group_by = s.get("group_by")
+        has_agg  = (group_by or (s.get("having") is not None) or any(
+            _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*"))
         if (ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views
-                or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl)):
-            return _exec_in_memory_join(stmt, db, ctes)
-        stmt = optimize_join(stmt, db)      # cost-based join reordering
-        extra = stmt.get("extra_joins", [])
+                or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl) or has_agg):
+            raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+            raw_rows = _exec_in_memory_join(raw_stmt, db, ctes)
+            if has_agg:
+                raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
+                                              group_by, s.get("having"), db)
+            elif s.get("columns"):
+                raw_rows = [_project_row(_normalize_row(r), s["columns"]) for r in raw_rows]
+            rows = _apply_order_limit(raw_rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            rows, _ = _apply_aliases(rows, stmt.get("columns"), stmt.get("col_aliases"))
+            return rows
+        s = optimize_join(s, db)
+        extra = s.get("extra_joins", [])
         if extra:
-            rows = db.join(stmt["left_table"], stmt["right_table"],
-                           stmt["on_left"], stmt["on_right"],
+            rows = db.join(s["left_table"], s["right_table"],
+                           s["on_left"], s["on_right"],
                            None, None,
-                           join_type=stmt.get("join_type", "INNER"),
-                           left_alias=stmt.get("left_alias"),
-                           right_alias=stmt.get("right_alias"))
+                           join_type=s.get("join_type", "INNER"),
+                           left_alias=s.get("left_alias"),
+                           right_alias=s.get("right_alias"))
             for ej in extra:
                 rows = _exec_extra_join(rows, ej, db)
-            if stmt.get("where"):
-                rows = [r for r in rows if stmt["where"].evaluate(r, db)]
-            if stmt.get("columns"):
-                rows = [_project_row(r, stmt["columns"]) for r in rows]
-            return _apply_order_limit(rows, stmt.get("order_by"),
-                                      stmt.get("limit"), stmt.get("offset"))
-        return db.join(stmt["left_table"], stmt["right_table"],
-                       stmt["on_left"], stmt["on_right"],
-                       stmt["columns"], stmt["where"],
-                       stmt.get("order_by"), stmt.get("limit"),
-                       stmt.get("join_type", "INNER"),
-                       stmt.get("left_alias"), stmt.get("right_alias"),
-                       stmt.get("offset"))
+            if s.get("where"):
+                rows = [r for r in rows if s["where"].evaluate(r, db)]
+            if s.get("columns"):
+                rows = [_project_row(r, s["columns"]) for r in rows]
+            rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+        else:
+            rows = db.join(s["left_table"], s["right_table"],
+                           s["on_left"], s["on_right"],
+                           s["columns"], s["where"],
+                           s.get("order_by"), s.get("limit"),
+                           s.get("join_type", "INNER"),
+                           s.get("left_alias"), s.get("right_alias"),
+                           s.get("offset"))
+        rows, _ = _apply_aliases(rows, stmt.get("columns"), stmt.get("col_aliases"))
+        return rows
     if op == "SET_OP":
         left  = _rows_for_stmt(stmt["left"],  db, ctes)
         right = _rows_for_stmt(stmt["right"], db, ctes)
@@ -1082,124 +1138,9 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         n = len(src_rows)
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
-    if op == "SELECT_NOFROM":
-        row: dict[str, Any] = {}
-        result_row = {col: eval_expr(col, row) for col in (stmt.get("columns") or [])}
-        rows, out_cols = _apply_aliases([result_row], stmt.get("columns"),
-                                        stmt.get("col_aliases"))
-        return _format_rows(rows, out_cols)
-
-    if op == "SELECT":
-        ctes = stmt.get("ctes") or {}
-        s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
-        stmt_cols = stmt.get("columns") or []
-        has_window    = any(_WINDOW_RE.search(c) for c in stmt_cols if c != "*")
-        has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
-        tbl = s.get("table") or ""
-        if s.get("subquery_from"):
-            rows = _exec_derived_table(s, db, ctes)
-        elif tbl == "_hyperion_master":
-            raw_rows = _hyperion_master_rows(db)
-            rows = _exec_cte_select(s, {"op": "INLINE_ROWS", "rows": raw_rows}, db, ctes)
-        elif tbl in ctes:
-            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
-                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
-                raw_rows = _exec_cte_select(raw_stmt, ctes[tbl], db, ctes)
-                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
-                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
-            else:
-                rows = _exec_cte_select(s, ctes[tbl], db, ctes)
-        elif tbl in db.views:
-            view_ast = _parse_tokens(_tokenize(db.views[tbl]))
-            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
-                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
-                raw_rows = _exec_cte_select(raw_stmt, view_ast, db, ctes)
-                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
-                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
-            else:
-                rows = _exec_cte_select(s, view_ast, db, ctes)
-        elif has_window or has_scalar_sq:
-            # Fetch all columns so window/scalar-sq can reference any column for correlation
-            all_rows = db.select(s["table"], None, s["where"],
-                                 None, None,
-                                 s.get("group_by"), s.get("having"),
-                                 s.get("distinct", False), None)
-            if has_scalar_sq:
-                sq_cols = [c for c in stmt_cols if _is_scalar_subquery_col(c)]
-                augmented = []
-                for row in all_rows:
-                    r = dict(row)
-                    for sc in sq_cols:
-                        r[sc] = _eval_scalar_subquery(sc, r, db, ctes)
-                    augmented.append(r)
-                all_rows = augmented
-            if has_window:
-                all_rows = _apply_window_functions(all_rows, stmt_cols)
-            rows = ([_project_row(r, stmt_cols) for r in all_rows]
-                    if stmt_cols else all_rows)
-            rows = _apply_order_limit(rows, s.get("order_by"),
-                                      s.get("limit"), s.get("offset"))
-        else:
-            rows = db.select(s["table"], s["columns"], s["where"],
-                             s.get("order_by"), s.get("limit"),
-                             s.get("group_by"), s.get("having"),
-                             s.get("distinct", False), s.get("offset"))
-        rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
-        return _format_rows(rows, cols)
-
-    if op == "JOIN":
-        ctes = stmt.get("ctes") or {}
-        s    = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
-        ltbl = s.get("left_table", "")
-        rtbl = s.get("right_table", "")
-        group_by = s.get("group_by")
-        has_agg  = group_by or (s.get("having") is not None) or any(
-            _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*")
-        # Route through _rows_for_stmt when CTEs are involved or aggregation is needed
-        if ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views or has_agg:
-            # Fetch all rows without projection so aggregation sees every column
-            raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
-            raw_rows = _rows_for_stmt(raw_stmt, db, ctes)
-            if has_agg:
-                raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
-                                              group_by, s.get("having"), db)
-            elif s.get("columns"):
-                raw_rows = [_project_row(_normalize_row(r), s["columns"]) for r in raw_rows]
-            rows = _apply_order_limit(raw_rows, s.get("order_by"),
-                                      s.get("limit"), s.get("offset"))
-            rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
-            return _format_rows(rows, cols)
-        s    = optimize_join(s, db)
-        extra = s.get("extra_joins", [])
-        if extra:
-            rows = db.join(s["left_table"], s["right_table"],
-                           s["on_left"], s["on_right"],
-                           None, None,
-                           join_type=s.get("join_type", "INNER"),
-                           left_alias=s.get("left_alias"),
-                           right_alias=s.get("right_alias"))
-            for ej in extra:
-                rows = _exec_extra_join(rows, ej, db)
-            if s.get("where"):
-                rows = [r for r in rows if s["where"].evaluate(r, db)]
-            if s.get("columns"):
-                rows = [_project_row(r, s["columns"]) for r in rows]
-            rows = _apply_order_limit(rows, s.get("order_by"),
-                                      s.get("limit"), s.get("offset"))
-        else:
-            rows = db.join(s["left_table"], s["right_table"],
-                           s["on_left"], s["on_right"],
-                           s["columns"], s["where"],
-                           s.get("order_by"), s.get("limit"),
-                           s.get("join_type", "INNER"),
-                           s.get("left_alias"), s.get("right_alias"),
-                           s.get("offset"))
-        rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
-        return _format_rows(rows, cols)
-
-    if op == "SET_OP":
+    if op in ("SELECT", "SELECT_NOFROM", "JOIN", "SET_OP"):
         rows = _rows_for_stmt(stmt, db)
-        cols = stmt["left"].get("columns")
+        cols = list(rows[0].keys()) if rows else None
         return _format_rows(rows, cols)
 
     if op == "TRUNCATE":
