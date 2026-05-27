@@ -107,6 +107,10 @@
 - [x] `ANALYZE` — collect per-table/index statistics (row count, distinct values) that the query optimizer can use
 - [x] `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` — `_AGG_RE` today does not handle the DISTINCT modifier inside aggregate calls
 - [x] Expression indexes — `CREATE INDEX idx ON t(UPPER(col))` — index on a computed expression rather than a raw column
+- [x] Expressions in `INSERT INTO t VALUES (...)` — `VALUES (1 + 2, 'a' || 'b')` fails because the VALUES parser splits on commas before evaluating; operators are tokenized as separate values instead of expression parts
+- [x] JOIN + GROUP BY / aggregation broken at top level — `SELECT name, COUNT(*) FROM users JOIN orders ON ... GROUP BY name` returns all NULLs; the `op == "JOIN"` path in `_execute_inner` calls `db.join()` directly which bypasses GROUP BY handling
+- [x] CTE + JOIN column key conflict — `WITH j AS (SELECT u.name FROM users u JOIN orders o ON ...) SELECT name FROM j` fails because JOIN rows have table-qualified keys (`users.name`) but CTE projection expects bare names (`name`); alias stripping in `_exec_cte_select` doesn't strip table prefixes
+- [x] CTE tables not resolved in top-level JOIN handler — `SELECT ... FROM cte1 JOIN cte2 ON ...` fails when parsed as `op == "JOIN"` at the top level; the CTE check only exists in `_rows_for_stmt`, not in `_execute_inner`'s JOIN branch
 
 ## Missing — DDL / Schema
 
@@ -142,5 +146,6 @@
 
 ## Code Quality
 
-- [ ] Refactor `_parse_tokens` (349 lines) into per-statement parser functions
+- [ ] Refactor `_parse_tokens` (1,420 lines) into per-statement parser functions — the monolithic function makes it hard to isolate bugs and the expressions-in-VALUES bug is a direct consequence of it
+- [ ] Unify `_execute_inner` and `_rows_for_stmt` execution paths — JOIN+aggregation, CTE resolution, and GROUP BY fixes applied to one path must be manually mirrored to the other; the divergence is the root cause of the JOIN+GROUP BY and CTE+JOIN bugs
 - [ ] Update module docstring — currently missing joins, aggregates, transactions, constraints, set operations, subqueries

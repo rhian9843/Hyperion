@@ -5,7 +5,7 @@ from typing import Any
 
 from .database import Database
 from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, _make_index_key
-from .expr import eval_expr
+from .expr import eval_expr, is_expr
 from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
@@ -13,6 +13,22 @@ from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
 from .query import _project_row
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
+
+def _is_single_string_literal(val: str) -> bool:
+    """True iff val is exactly one single-quoted SQL string (not a concat expression)."""
+    if not (val.startswith("'") and val.endswith("'") and len(val) >= 2):
+        return False
+    i = 1
+    while i < len(val) - 1:
+        if val[i] == "'":
+            if i + 1 < len(val) - 1 and val[i + 1] == "'":
+                i += 2  # escaped ''
+            else:
+                return False  # quote closes before end → compound expression
+        else:
+            i += 1
+    return True
+
 
 # ── Window function helpers ────────────────────────────────────────────────────
 
@@ -260,6 +276,50 @@ def _exec_cte_select(outer: dict, cte_ast: dict, db: "Database",
     return rows
 
 
+def _normalize_row(row: dict) -> dict:
+    """Add bare-name aliases for table-qualified keys (users.name → also name)."""
+    result = dict(row)
+    for k, v in row.items():
+        if "." in k:
+            bare = k.split(".")[-1]
+            if bare not in result:
+                result[bare] = v
+    return result
+
+
+def _apply_groupby_agg(rows: list[dict], columns: list[str] | None,
+                       group_by: list[str] | None,
+                       having: Any,
+                       db: "Database") -> list[dict]:
+    """Apply GROUP BY + aggregation to an already-materialized row list."""
+    # Normalize rows so aggregation sees both qualified and bare keys
+    rows = [_normalize_row(r) for r in rows]
+    select_cols = columns or (group_by or [])
+
+    if not group_by:
+        result: dict = db._compute_aggregates(rows, select_cols)
+        return [result]
+
+    buckets: dict[tuple, list[dict]] = {}
+    for row in rows:
+        key = tuple(row.get(gc) for gc in group_by)
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(row)
+
+    results: list[dict] = []
+    for key, bucket_rows in buckets.items():
+        result = {}
+        for gc, kv in zip(group_by, key):
+            result[gc] = kv
+        result.update(db._compute_aggregates(bucket_rows, select_cols))
+        if having and not having.evaluate(result, db):
+            continue
+        results.append({c: result[c] for c in select_cols if c in result}
+                       if columns else result)
+    return results
+
+
 def _exec_extra_join(rows: list[dict], join_info: dict,
                      db: "Database") -> list[dict]:
     """Apply one additional JOIN step in-memory against an already-joined row set."""
@@ -333,7 +393,12 @@ def _materialize_table(tname: str, db: "Database", ctes: dict,
                         alias: str | None = None) -> list[dict]:
     """Return rows for a real table or CTE, with optional alias prefix."""
     if tname in ctes:
-        raw = _rows_for_stmt(ctes[tname], db, ctes)
+        cte_ast = ctes[tname]
+        raw = _rows_for_stmt(cte_ast, db, ctes)
+        # Apply the CTE's own column aliases so t.total resolves correctly
+        cte_aliases = cte_ast.get("col_aliases") if isinstance(cte_ast, dict) else None
+        if cte_aliases:
+            raw = [{cte_aliases.get(k, k): v for k, v in row.items()} for row in raw]
     elif tname in db.views:
         view_ast = _parse_tokens(_tokenize(db.views[tname]))
         raw = _rows_for_stmt(view_ast, db, ctes)
@@ -847,8 +912,19 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                     f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
                 )
             parsed: dict[str, Any] = {}
+            _CONST_EXPRS = frozenset({"TRUE", "FALSE", "CURRENT_TIMESTAMP",
+                                       "CURRENT_DATE", "CURRENT_TIME"})
             for name, val in zip(col_names, values):
-                parsed[name] = None if val.upper() == "NULL" else val
+                if val.upper() == "NULL":
+                    parsed[name] = None
+                elif _is_single_string_literal(val):
+                    # Quoted string literal — unquote (handle '' escape sequences)
+                    parsed[name] = val[1:-1].replace("''", "'")
+                elif " " in val or val.upper() in _CONST_EXPRS:
+                    # Multi-token expression (joined with spaces) or SQL constant
+                    parsed[name] = eval_expr(val, {})
+                else:
+                    parsed[name] = val
             for col in meta.schema.columns:
                 if col.name not in parsed:
                     parsed[col.name] = col.default
@@ -947,10 +1023,22 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         if s.get("subquery_from"):
             rows = _exec_derived_table(s, db, ctes)
         elif tbl in ctes:
-            rows = _exec_cte_select(s, ctes[tbl], db, ctes)
+            if s.get("group_by") or any(re.match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b", c, re.IGNORECASE) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_cte_select(raw_stmt, ctes[tbl], db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_cte_select(s, ctes[tbl], db, ctes)
         elif tbl in db.views:
             view_ast = _parse_tokens(_tokenize(db.views[tbl]))
-            rows = _exec_cte_select(s, view_ast, db, ctes)
+            if s.get("group_by") or any(re.match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b", c, re.IGNORECASE) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_cte_select(raw_stmt, view_ast, db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"), s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_cte_select(s, view_ast, db, ctes)
         elif has_window or has_scalar_sq:
             # Fetch all columns so window/scalar-sq can reference any column for correlation
             all_rows = db.select(s["table"], None, s["where"],
@@ -981,7 +1069,30 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return _format_rows(rows, cols)
 
     if op == "JOIN":
-        s = optimize_join(_resolve_alias_refs(stmt, stmt.get("col_aliases")), db)
+        ctes = stmt.get("ctes") or {}
+        s    = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+        ltbl = s.get("left_table", "")
+        rtbl = s.get("right_table", "")
+        group_by = s.get("group_by")
+        has_agg  = group_by or (s.get("having") is not None) or any(
+            __import__("re").match(r"^(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT|STRING_AGG)\b",
+                                   c, __import__("re").IGNORECASE)
+            for c in (s.get("columns") or []) if c != "*")
+        # Route through _rows_for_stmt when CTEs are involved or aggregation is needed
+        if ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views or has_agg:
+            # Fetch all rows without projection so aggregation sees every column
+            raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+            raw_rows = _rows_for_stmt(raw_stmt, db, ctes)
+            if has_agg:
+                raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
+                                              group_by, s.get("having"), db)
+            elif s.get("columns"):
+                raw_rows = [_project_row(_normalize_row(r), s["columns"]) for r in raw_rows]
+            rows = _apply_order_limit(raw_rows, s.get("order_by"),
+                                      s.get("limit"), s.get("offset"))
+            rows, cols = _apply_aliases(rows, stmt["columns"], stmt.get("col_aliases"))
+            return _format_rows(rows, cols)
+        s    = optimize_join(s, db)
         extra = s.get("extra_joins", [])
         if extra:
             rows = db.join(s["left_table"], s["right_table"],

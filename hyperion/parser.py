@@ -1038,9 +1038,27 @@ def _parse_tokens(t: list[str]) -> dict:
             i += 1
             row_vals: list[str] = []
             while i < len(t) and t[i] != ")":
-                if t[i] != ",":
-                    row_vals.append(_unquote_token(t[i]))
-                i += 1
+                # Collect tokens for one value up to the next top-level comma
+                expr_toks: list[str] = []
+                depth = 0
+                while i < len(t) and not (t[i] == "," and depth == 0) and t[i] != ")":
+                    if t[i] == "(":
+                        depth += 1
+                    elif t[i] == ")":
+                        if depth == 0:
+                            break
+                        depth -= 1
+                    expr_toks.append(t[i])
+                    i += 1
+                if expr_toks:
+                    if len(expr_toks) == 1:
+                        # Keep original token (preserves quotes) so executor can
+                        # distinguish string literals from bare names/expressions
+                        row_vals.append(expr_toks[0])
+                    else:
+                        row_vals.append(" ".join(expr_toks))
+                if i < len(t) and t[i] == ",":
+                    i += 1
             i += 1  # skip ")"
             rows.append(row_vals)
             if i < len(t) and t[i] == ",":
@@ -1288,7 +1306,8 @@ def _parse_tokens(t: list[str]) -> dict:
                 extra_joins.append({"join_type": ej_type, "right_table": ej_right,
                                     "right_alias": ej_alias,
                                     "on_left": ej_on_l, "on_right": ej_on_r})
-            where, i               = _parse_where(t, i)
+            where, i                = _parse_where(t, i)
+            group_by, having, i     = _parse_group_having(t, i)
             order_by, limit, offset = _parse_order_limit(t, i)
             return {
                 "op":           "JOIN",
@@ -1302,6 +1321,8 @@ def _parse_tokens(t: list[str]) -> dict:
                 "columns":      None if cols == ["*"] else cols,
                 "col_aliases":  col_aliases,
                 "where":        where,
+                "group_by":     group_by or None,
+                "having":       having,
                 "order_by":     order_by,
                 "limit":        limit,
                 "offset":       offset,

@@ -34,17 +34,28 @@ def _project_row(row: dict, columns: list[str]) -> dict:
         if col in row:
             result[col] = row[col]
         elif "." in col:
+            # table.col → try bare col, then alias-prefixed scan
             bare = col.split(".", 1)[1]
             if bare in row:
                 result[col] = row[bare]
+            else:
+                # scan for any key whose bare name matches
+                matches = [v for k, v in row.items() if k.split(".")[-1] == bare]
+                if matches:
+                    result[col] = matches[0]
+                elif is_expr(col):
+                    result[col] = eval_expr(col, row)
+                else:
+                    raise RuntimeError(f"Unknown column: '{col}'")
+        else:
+            # bare col → try table-qualified scan before treating as expr
+            matches = [v for k, v in row.items() if k.split(".")[-1] == col]
+            if matches:
+                result[col] = matches[0]
             elif is_expr(col):
                 result[col] = eval_expr(col, row)
             else:
                 raise RuntimeError(f"Unknown column: '{col}'")
-        elif is_expr(col):
-            result[col] = eval_expr(col, row)
-        else:
-            raise RuntimeError(f"Unknown column: '{col}'")
     return result
 
 

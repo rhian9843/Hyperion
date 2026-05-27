@@ -48,10 +48,25 @@ class WhereClause:
             cell = row[self.col]
         elif "." in self.col and self.col.split(".", 1)[1] in row:
             cell = row[self.col.split(".", 1)[1]]
-        elif is_expr(self.col):
-            cell = eval_expr(self.col, row)
+        elif "." in self.col:
+            # scan for any key whose bare name matches (e.g. t.col → table.col)
+            bare = self.col.split(".", 1)[1]
+            matches = [v for k, v in row.items() if k.split(".")[-1] == bare]
+            if matches:
+                cell = matches[0]
+            elif is_expr(self.col):
+                cell = eval_expr(self.col, row)
+            else:
+                raise RuntimeError(f"Unknown column: '{self.col}'")
         else:
-            raise RuntimeError(f"Unknown column: '{self.col}'")
+            # bare name → scan table-qualified keys
+            matches = [v for k, v in row.items() if k.split(".")[-1] == self.col]
+            if matches:
+                cell = matches[0]
+            elif is_expr(self.col):
+                cell = eval_expr(self.col, row)
+            else:
+                raise RuntimeError(f"Unknown column: '{self.col}'")
 
         if self.op == "IS NULL":     return cell is None
         if self.op == "IS NOT NULL": return cell is not None
