@@ -5,7 +5,7 @@ from typing import Any, Callable
 from .constants import PAGE_SIZE
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
-from .pager import Pager
+from .pager import Pager, MemoryPager
 from .encoding import _IDX_KEY_SZ
 from .constraints import ConstraintsMixin
 from .ddl import DDLMixin
@@ -17,12 +17,16 @@ _CAT_CHUNK = PAGE_SIZE - _CAT_HDR
 
 
 class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
-    def __init__(self, path: Path):
-        self._pager          = Pager(path)
+    def __init__(self, path: "Path | str"):
+        if str(path) == ":memory:":
+            self._pager: Pager | MemoryPager = MemoryPager()
+        else:
+            self._pager = Pager(Path(path))
         self._catalog, self._catalog_extra = self._load_catalog()
         self._txn_depth      = 0
         # Each entry: (name, page_snapshots, dirty_set, catalog_bytes, catalog_extra)
         self._savepoints: list[tuple] = []
+        self.fk_enforcement  = True
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -240,4 +244,51 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         del self._catalog.views[name]
 
     def close(self) -> None:
+        temp_tables = [n for n, m in self._catalog.tables.items() if m.temporary]
+        if temp_tables:
+            self.begin()
+            for name in temp_tables:
+                self.drop_table(name)
+            self.commit()
         self._pager.close()
+
+    def vacuum(self) -> str:
+        """Rebuild the database file compactly, reclaiming space from deleted rows."""
+        import tempfile, shutil
+        from .schema import deserialize_row
+
+        if isinstance(self._pager, MemoryPager):
+            return "Database vacuumed."
+
+        if self._txn_depth > 0:
+            raise RuntimeError("Cannot VACUUM inside a transaction")
+
+        path = self._pager._path
+
+        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+            tmp_path = Path(f.name)
+        tmp_path.unlink(missing_ok=True)
+
+        new_db = Database(tmp_path)
+        new_db.begin()
+        for tname, tmeta in list(self._catalog.tables.items()):
+            new_db.create_table(tmeta.schema)
+            for _, raw in self._table_btree(tmeta).scan():
+                row = deserialize_row(tmeta.schema, raw)
+                new_db.insert(tname, row)
+        for idx_name, idx_meta in list(self._catalog.indexes.items()):
+            if idx_name not in new_db._catalog.indexes:
+                new_db.create_index(idx_name, idx_meta.table_name, idx_meta.columns)
+        for vname, vsql in list(self._catalog.views.items()):
+            new_db.create_view(vname, vsql)
+        new_db.commit()
+        new_db._pager.close()
+
+        self._pager.close()
+        shutil.move(str(tmp_path), str(path))
+
+        self._pager = Pager(path)
+        self._catalog, self._catalog_extra = self._load_catalog()
+        self._txn_depth = 0
+        self._savepoints.clear()
+        return "Database vacuumed."

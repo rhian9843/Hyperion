@@ -6,9 +6,9 @@ Hyperion package — re-exports every public name so that
 from .constants import PAGE_SIZE, INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
 from .schema import Column, ForeignKey, Schema, serialize_row, deserialize_row
 from .btree import BTree
-from .catalog import TableMeta, IndexMeta, Catalog
+from .catalog import TableMeta, IndexMeta, TriggerMeta, Catalog
 from .wal import WAL
-from .pager import Pager
+from .pager import Pager, MemoryPager
 from .encoding import (
     _encode_index_key, _encode_composite_key,
     _make_index_key, _split_index_key,
@@ -35,4 +35,7 @@ from .parser import (
     parse, _parse_tokens,
 )
 from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows
+from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv
+from .triggers import (fire_triggers, has_triggers, has_instead_of,
+                       scan_matching_rows, apply_update_row)
 from .repl import handle_meta, repl, main

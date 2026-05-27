@@ -80,41 +80,45 @@
 
 ## Missing SQL — String / Scalar Functions
 
-- [ ] String functions — `UPPER`, `LOWER`, `LENGTH`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`
-- [ ] `REPLACE(str, from, to)` / `INSTR(str, sub)` / `PRINTF` / `FORMAT`
-- [ ] Math functions — `ABS`, `ROUND`, `CEIL`, `FLOOR`, `MOD`
-- [ ] `RANDOM()` / `RANDOMBLOB(n)`
-- [ ] `TYPEOF(x)` — returns the storage class of a value
-- [ ] `NULLIF(x, y)` / `COALESCE` (listed above but also callable in SELECT list once expression evaluation works)
-- [ ] `GROUP_CONCAT(col)` / `STRING_AGG(col, sep)` aggregate — `_AGG_RE` today only recognises COUNT/MIN/MAX/SUM/AVG
+- [x] String functions — `UPPER`, `LOWER`, `LENGTH`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`
+- [x] `REPLACE(str, from, to)` / `INSTR(str, sub)` / `PRINTF` / `FORMAT`
+- [x] Math functions — `ABS`, `ROUND`, `CEIL`, `FLOOR`, `MOD`
+- [x] `RANDOM()` / `RANDOMBLOB(n)`
+- [x] `TYPEOF(x)` — returns the storage class of a value
+- [x] `NULLIF(x, y)` / `COALESCE` (listed above but also callable in SELECT list once expression evaluation works)
+- [x] `GROUP_CONCAT(col)` / `STRING_AGG(col, sep)` aggregate — `_AGG_RE` today only recognises COUNT/MIN/MAX/SUM/AVG
 
 ## Missing Operational SQL
 
-- [ ] `PRAGMA foreign_keys = ON/OFF` — enable/disable FK enforcement at runtime
-- [ ] `PRAGMA table_info(t)` — returns column metadata (name, type, notnull, dflt_value, pk)
-- [ ] `PRAGMA index_list(t)` / `PRAGMA index_info(idx)` — index introspection
-- [ ] `VACUUM` — rebuild database file to reclaim space from deleted rows and pages
-- [ ] Quoted identifiers — `"column name"` or `` `column` `` for reserved words or names with spaces
+- [x] `PRAGMA foreign_keys = ON/OFF` — enable/disable FK enforcement at runtime
+- [x] `PRAGMA table_info(t)` — returns column metadata (name, type, notnull, dflt_value, pk)
+- [x] `PRAGMA index_list(t)` / `PRAGMA index_info(idx)` — index introspection
+- [x] `VACUUM` — rebuild database file to reclaim space from deleted rows and pages
+- [x] Quoted identifiers — `"column name"` or `` `column` `` for reserved words or names with spaces
 
 ## Missing — Concurrency & Safety
 
-- [ ] File locking — shared/exclusive lock protocol so multiple connections to the same file do not corrupt the database
-- [ ] In-memory databases — `Database(":memory:")` backed by a dict instead of file I/O; critical for testing and temporary workloads
+- [x] File locking — shared/exclusive lock protocol so multiple connections to the same file do not corrupt the database
+- [x] In-memory databases — `Database(":memory:")` backed by a dict instead of file I/O; critical for testing and temporary workloads
 
 ## Missing — Query Execution
 
-- [ ] Query optimizer / cost-based planner — today multi-join queries do nested full scans; a cost model is needed so the engine picks the cheapest join order and access path
-- [ ] `ANALYZE` — collect per-table/index statistics (row count, distinct values) that the query optimizer can use
-- [ ] `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` — `_AGG_RE` today does not handle the DISTINCT modifier inside aggregate calls
-- [ ] Expression indexes — `CREATE INDEX idx ON t(UPPER(col))` — index on a computed expression rather than a raw column
+- [x] Query optimizer / cost-based planner — today multi-join queries do nested full scans; a cost model is needed so the engine picks the cheapest join order and access path
+- [x] `ANALYZE` — collect per-table/index statistics (row count, distinct values) that the query optimizer can use
+- [x] `COUNT(DISTINCT col)` / `SUM(DISTINCT col)` — `_AGG_RE` today does not handle the DISTINCT modifier inside aggregate calls
+- [x] Expression indexes — `CREATE INDEX idx ON t(UPPER(col))` — index on a computed expression rather than a raw column
 
 ## Missing — DDL / Schema
 
-- [ ] Triggers — `CREATE TRIGGER BEFORE/AFTER INSERT/UPDATE/DELETE ON t` with `FOR EACH ROW` body; required by many ORMs and audit-log patterns
-- [ ] `CREATE TEMP TABLE` / `CREATE TEMPORARY TABLE` — session-scoped table that is automatically dropped on close
-- [ ] Recursive CTEs — `WITH RECURSIVE cte AS (base UNION ALL recursive_step) SELECT ...` — needed for trees, graphs, and hierarchical data
-- [ ] Generated / computed columns — `col INTEGER AS (expr) STORED` / `VIRTUAL`
-- [ ] `COLLATE` clause — `ORDER BY name COLLATE NOCASE`; Unicode-aware and case-insensitive comparison
+- [x] Triggers — `CREATE TRIGGER BEFORE/AFTER INSERT/UPDATE/DELETE ON t` with `FOR EACH ROW` body; required by many ORMs and audit-log patterns
+- [x] Trigger gap: `UPDATE OF col1, col2` filter — parsed and stored but `_triggers_for` never checks `update_cols`, so the trigger fires on every UPDATE regardless
+- [x] Trigger gap: `RAISE(ABORT|FAIL|IGNORE|ROLLBACK, 'msg')` in trigger body — standard SQLite validation pattern; not parsed or executed today
+- [x] Trigger gap: expression assignments in `apply_update_row` — `SET col = col + 1` stores the raw string instead of evaluating against the old row, so BEFORE/AFTER UPDATE triggers see the wrong `NEW.col` value
+- [x] Trigger gap: `INSTEAD OF` triggers on views — redirect INSERT/UPDATE/DELETE on a view to the underlying base tables
+- [x] `CREATE TEMP TABLE` / `CREATE TEMPORARY TABLE` — session-scoped table that is automatically dropped on close
+- [x] Recursive CTEs — `WITH RECURSIVE cte AS (base UNION ALL recursive_step) SELECT ...` — needed for trees, graphs, and hierarchical data
+- [x] Generated / computed columns — `col INTEGER AS (expr) STORED` / `VIRTUAL`
+- [x] `COLLATE` clause — `ORDER BY name COLLATE NOCASE`; Unicode-aware and case-insensitive comparison
 
 ## Missing — Functions & Types
 
@@ -126,6 +130,15 @@
 - [ ] System catalog table — queryable `_hyperion_master` (equiv. of `sqlite_master`) exposing table/index/view definitions as rows; ORMs and tools depend on this
 - [ ] `PRAGMA integrity_check` — verify B-tree structure and page consistency
 - [ ] `EXPLAIN` / `EXPLAIN QUERY PLAN` — show the query execution plan; critical for debugging performance and verifying index usage
+
+## Python DB-API / Convenience Layer
+
+- [ ] PEP 249 cursor interface — `db.execute(sql)` / `db.executemany(sql, params)` / `db.executescript(sql)` returning cursor objects with `.fetchone()`, `.fetchall()`, `.fetchmany(n)`, `.rowcount`, `.description` (column name/type metadata)
+- [ ] Parameter binding — positional `?` and named `:name` / `$name` placeholders so values are passed safely without string formatting (`db.execute("SELECT * FROM t WHERE id = ?", (1,))`)
+- [ ] Context manager — `with Database(":memory:") as db:` auto-closes; `with db:` wraps an implicit transaction (commit on exit, rollback on exception)
+- [ ] `db.row_factory` — pluggable row format; default tuple, built-ins for `dict` and named-access rows; user-assignable callable
+- [ ] `db.set_authorizer(fn)` — callback invoked per SQL operation; return allow/deny/ignore to gate access (security hook, mirrors sqlite3)
+- [ ] `db.iterdump()` — yield SQL statements that recreate the full database; useful for backup, migration, and test fixtures
 
 ## Code Quality
 

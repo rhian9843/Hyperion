@@ -9,7 +9,7 @@ class ParseError(ValueError):
     pass
 
 
-_TOKEN_RE = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|\w+\([^)]*\)|[(),;*]|[^\s(),;*]+")
+_TOKEN_RE = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|\w+\([^()]*\)|[(),;*]|[^\s(),;*]+")
 
 
 def _unquote_token(t: str) -> str:
@@ -18,8 +18,10 @@ def _unquote_token(t: str) -> str:
         return t[1:-1].replace("''", "'")
     return t
 
-# Aggregate function detection
-_AGG_RE = re.compile(r"^(COUNT|MIN|MAX|SUM|AVG)\(([^)]*)\)$", re.IGNORECASE)
+# Aggregate function detection (with optional DISTINCT modifier)
+_AGG_RE = re.compile(
+    r"^(COUNT|MIN|MAX|SUM|AVG)\(\s*(DISTINCT\s+)?(.+?)\s*\)$", re.IGNORECASE
+)
 
 # Keywords that cannot be bare table aliases
 _ALIAS_BLOCKLIST = frozenset({
@@ -44,7 +46,7 @@ def _parse_table_alias(tokens: list[str], pos: int, table: str) -> tuple[str, in
 def _parse_agg(col: str) -> tuple[str, str] | None:
     """If col is an aggregate call like MIN(id), return (FUNC_UPPER, arg). Else None."""
     m = _AGG_RE.match(col)
-    return (m.group(1).upper(), m.group(2).strip()) if m else None
+    return (m.group(1).upper(), m.group(3).strip()) if m else None
 
 
 def _tokenize(sql: str) -> list[str]:
@@ -52,6 +54,8 @@ def _tokenize(sql: str) -> list[str]:
     for t in _TOKEN_RE.findall(sql):
         if t.startswith('"') and t.endswith('"'):
             tokens.append(t[1:-1])   # double-quoted identifiers: strip quotes
+        elif t.startswith('`') and t.endswith('`'):
+            tokens.append(t[1:-1])   # backtick-quoted identifiers: strip quotes
         else:
             tokens.append(t)         # keep single-quoted strings as-is for expression building
     return tokens
@@ -78,6 +82,8 @@ def _parse_col_type(token: str) -> tuple[str, int]:
     if u in (BLOB, "BYTES", "BINARY", "VARBINARY"):
         return BLOB, DEFAULT_TEXT_SIZE
     # Parameterized types
+    m = re.fullmatch(r"TEXT\((\d+)\)", u)
+    if m:             return TEXT,    int(m.group(1))
     m = re.fullmatch(r"VARCHAR\((\d+)\)", u)
     if m:             return TEXT,    int(m.group(1))
     m = re.fullmatch(r"NVARCHAR\((\d+)\)", u)
@@ -398,16 +404,26 @@ def _parse_order_limit(tokens: list[str], pos: int
         while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT",):
             col = tokens[pos]; pos += 1
             desc = False
+            collation: str | None = None
+            if pos < len(tokens) and tokens[pos].upper() == "COLLATE":
+                pos += 1
+                if pos < len(tokens):
+                    collation = tokens[pos].upper(); pos += 1
             if pos < len(tokens) and tokens[pos].upper() in ("ASC", "DESC"):
                 desc = tokens[pos].upper() == "DESC"
                 pos += 1
+            if collation is None and pos < len(tokens) and tokens[pos].upper() == "COLLATE":
+                pos += 1
+                if pos < len(tokens):
+                    collation = tokens[pos].upper(); pos += 1
             nulls_first: bool | None = None
             if pos < len(tokens) and tokens[pos].upper() == "NULLS":
                 pos += 1
                 if pos < len(tokens) and tokens[pos].upper() in ("FIRST", "LAST"):
                     nulls_first = tokens[pos].upper() == "FIRST"
                     pos += 1
-            order_by.append({"col": col, "desc": desc, "nulls_first": nulls_first})
+            order_by.append({"col": col, "desc": desc, "nulls_first": nulls_first,
+                             "collate": collation})
             if pos < len(tokens) and tokens[pos] == ",":
                 pos += 1
 
@@ -463,18 +479,48 @@ def _parse_tokens(t: list[str]) -> dict:
 
     if kw == "WITH":
         i = 1
+        recursive = False
+        if i < len(t) and t[i].upper() == "RECURSIVE":
+            recursive = True; i += 1
         ctes: dict[str, dict] = {}
+        recursive_ctes: set[str] = set()
         while True:
             if i >= len(t):
                 raise ParseError("Expected CTE name in WITH clause")
-            cte_name = t[i]; i += 1
+            cte_name_raw = t[i]; i += 1
+            # Strip column-list suffix: "cnt(n)" → "cnt"
+            cte_name = cte_name_raw.split("(")[0]
             if i >= len(t) or t[i].upper() != "AS":
-                raise ParseError(f"Expected AS after CTE name '{cte_name}'")
+                raise ParseError(f"Expected AS after CTE name '{cte_name_raw}'")
             i += 1
             if i >= len(t) or t[i] != "(":
                 raise ParseError("Expected ( for CTE body")
             inner, i = _extract_paren_tokens(t, i)
-            ctes[cte_name] = _parse_tokens(inner)
+            # For RECURSIVE CTEs: split body at top-level UNION ALL into base + recursive parts
+            if recursive:
+                union_idx = None
+                depth = 0
+                for j, tok in enumerate(inner):
+                    if tok == "(": depth += 1
+                    elif tok == ")": depth -= 1
+                    elif depth == 0 and tok.upper() == "UNION":
+                        union_idx = j; break
+                if union_idx is not None:
+                    all_flag = (union_idx + 1 < len(inner)
+                                and inner[union_idx + 1].upper() == "ALL")
+                    rec_start = union_idx + 2 if all_flag else union_idx + 1
+                    ctes[cte_name] = {
+                        "op": "RECURSIVE_CTE",
+                        "name": cte_name_raw,
+                        "base": _parse_tokens(inner[:union_idx]),
+                        "recursive": _parse_tokens(inner[rec_start:]),
+                        "union_all": all_flag,
+                    }
+                    recursive_ctes.add(cte_name)
+                else:
+                    ctes[cte_name] = _parse_tokens(inner)
+            else:
+                ctes[cte_name] = _parse_tokens(inner)
             if i < len(t) and t[i] == ",":
                 i += 1
             else:
@@ -538,6 +584,11 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "CREATE_VIEW", "name": view_name, "sql": select_sql,
                     "if_not_exists": False, "or_replace": True}
         sub = t[1].upper()
+        temporary_table = False
+        if sub in ("TEMP", "TEMPORARY") and len(t) > 2 and t[2].upper() == "TABLE":
+            temporary_table = True
+            sub = "TABLE"
+            t = [t[0]] + t[2:]   # splice out TEMP/TEMPORARY so rest of parse is identical
         if sub == "TABLE":
             i = 2
             if_not_exists = False
@@ -629,6 +680,28 @@ def _parse_tokens(t: list[str]) -> dict:
                 check         = None
                 primary_key   = False
                 autoincrement = False
+                generated_expr: str | None = None
+                generated_stored = False
+                # Generated column: col TYPE AS (expr) [STORED|VIRTUAL]
+                if i < len(t) and t[i].upper() == "AS":
+                    i += 1
+                    if i < len(t) and t[i] == "(":
+                        i += 1
+                        gen_toks: list[str] = []
+                        depth = 1
+                        while i < len(t) and depth > 0:
+                            tok = t[i]; i += 1
+                            if tok == "(": depth += 1; gen_toks.append(tok)
+                            elif tok == ")":
+                                depth -= 1
+                                if depth > 0: gen_toks.append(tok)
+                            else: gen_toks.append(tok)
+                        generated_expr = " ".join(gen_toks)
+                    if i < len(t) and t[i].upper() in ("STORED", "VIRTUAL"):
+                        generated_stored = t[i].upper() == "STORED"
+                        i += 1
+                    else:
+                        generated_stored = False  # default is VIRTUAL
                 while i < len(t) and t[i].upper() in (
                         "NOT", "UNIQUE", "DEFAULT", "CHECK", "REFERENCES",
                         "PRIMARY", "AUTOINCREMENT", "AUTO_INCREMENT"):
@@ -696,14 +769,16 @@ def _parse_tokens(t: list[str]) -> dict:
                             ForeignKey([col_name], ref_table_fk, ref_cols_fk,
                                        on_delete_action, on_update_action))
                 columns.append(Column(col_name, col_type, col_size, nullable, unique,
-                                      default, check, primary_key, autoincrement))
+                                      default, check, primary_key, autoincrement,
+                                      generated_expr, generated_stored))
                 if i < len(t) and t[i] == ",":
                     i += 1
             return {"op": "CREATE_TABLE", "name": name, "columns": columns,
                     "foreign_keys": fk_constraints,
                     "unique_constraints": uc_constraints,
                     "primary_key_columns": pk_constraint,
-                    "if_not_exists": if_not_exists}
+                    "if_not_exists": if_not_exists,
+                    "temporary": temporary_table}
         if sub == "VIEW":
             i = 2
             or_replace    = False
@@ -763,7 +838,79 @@ def _parse_tokens(t: list[str]) -> dict:
                 raise ParseError("Expected at least one column in index")
             return {"op": "CREATE_INDEX", "idx_name": idx_name,
                     "table": table, "cols": cols, "if_not_exists": if_not_exists}
-        raise ParseError(f"Expected TABLE or INDEX, got '{t[1]}'")
+        if sub == "TRIGGER":
+            i = 2
+            if_not_exists = False
+            if i < len(t) and t[i].upper() == "IF":
+                if i + 2 < len(t) and t[i+1].upper() == "NOT" and t[i+2].upper() == "EXISTS":
+                    if_not_exists = True; i += 3
+                else:
+                    raise ParseError("Expected NOT EXISTS after IF in CREATE TRIGGER")
+            if i >= len(t):
+                raise ParseError("Expected trigger name after CREATE TRIGGER")
+            trig_name = t[i]; i += 1
+            # timing: BEFORE, AFTER, or INSTEAD OF
+            if i < len(t) and t[i].upper() == "INSTEAD":
+                if i + 1 < len(t) and t[i + 1].upper() == "OF":
+                    timing = "INSTEAD OF"; i += 2
+                else:
+                    raise ParseError("Expected OF after INSTEAD in CREATE TRIGGER")
+            elif i < len(t) and t[i].upper() in ("BEFORE", "AFTER"):
+                timing = t[i].upper(); i += 1
+            else:
+                raise ParseError("Expected BEFORE, AFTER, or INSTEAD OF in CREATE TRIGGER")
+            # event: INSERT, UPDATE [OF col,...], DELETE
+            if i >= len(t) or t[i].upper() not in ("INSERT", "UPDATE", "DELETE"):
+                raise ParseError("Expected INSERT, UPDATE, or DELETE in CREATE TRIGGER")
+            event = t[i].upper(); i += 1
+            update_cols: list[str] = []
+            if event == "UPDATE" and i < len(t) and t[i].upper() == "OF":
+                i += 1
+                while i < len(t) and t[i].upper() != "ON":
+                    if t[i] != ",":
+                        update_cols.append(t[i])
+                    i += 1
+            # ON table_name
+            if i >= len(t) or t[i].upper() != "ON":
+                raise ParseError("Expected ON in CREATE TRIGGER")
+            i += 1
+            if i >= len(t):
+                raise ParseError("Expected table name after ON in CREATE TRIGGER")
+            trig_table = t[i]; i += 1
+            # optional FOR EACH ROW
+            if i < len(t) and t[i].upper() == "FOR":
+                if i + 2 < len(t) and t[i+1].upper() == "EACH" and t[i+2].upper() == "ROW":
+                    i += 3
+            # optional WHEN condition
+            when_tokens: list[str] = []
+            if i < len(t) and t[i].upper() == "WHEN":
+                i += 1
+                while i < len(t) and t[i].upper() != "BEGIN":
+                    when_tokens.append(t[i]); i += 1
+            # BEGIN ... END body
+            if i >= len(t) or t[i].upper() != "BEGIN":
+                raise ParseError("Expected BEGIN in CREATE TRIGGER body")
+            i += 1
+            body_tokens: list[str] = []
+            depth = 1
+            while i < len(t):
+                tok = t[i]; i += 1
+                if tok.upper() == "BEGIN":
+                    depth += 1
+                    body_tokens.append(tok)
+                elif tok.upper() == "END":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                    body_tokens.append(tok)
+                else:
+                    body_tokens.append(tok)
+            return {"op": "CREATE_TRIGGER", "name": trig_name,
+                    "if_not_exists": if_not_exists,
+                    "timing": timing, "event": event,
+                    "table": trig_table, "update_cols": update_cols,
+                    "when_tokens": when_tokens, "body_tokens": body_tokens}
+        raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
     # ALTER TABLE
     if kw == "ALTER":
@@ -842,7 +989,18 @@ def _parse_tokens(t: list[str]) -> dict:
             if i >= len(t):
                 raise ParseError("Expected view name after DROP VIEW")
             return {"op": "DROP_VIEW", "name": t[i], "if_exists": if_exists}
-        raise ParseError(f"Expected TABLE, INDEX, or VIEW, got '{t[1]}'")
+        if sub == "TRIGGER":
+            i = 2
+            if_exists = False
+            if i < len(t) and t[i].upper() == "IF":
+                if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                    if_exists = True; i += 2
+                else:
+                    raise ParseError("Expected EXISTS after IF in DROP TRIGGER")
+            if i >= len(t):
+                raise ParseError("Expected trigger name after DROP TRIGGER")
+            return {"op": "DROP_TRIGGER", "name": t[i], "if_exists": if_exists}
+        raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
     # INSERT [OR REPLACE|IGNORE] INTO
     if kw == "INSERT":
@@ -1181,9 +1339,16 @@ def _parse_tokens(t: list[str]) -> dict:
                 col, val = token.split("=", 1)
                 assignments[col] = _unquote_token(val)
                 i += 1
-            elif i + 2 < len(t) and t[i + 1] == "=":  # col = val
-                assignments[t[i]] = _unquote_token(t[i + 2])
-                i += 3
+            elif i + 2 < len(t) and t[i + 1] == "=":  # col = expr
+                col_name = t[i]; i += 2
+                val_toks: list[str] = []
+                while (i < len(t)
+                       and t[i].upper() not in ("WHERE", "LIMIT", "RETURNING")
+                       and t[i] != ","):
+                    val_toks.append(t[i]); i += 1
+                val_raw = " ".join(val_toks)
+                assignments[col_name] = (_unquote_token(val_toks[0])
+                                         if len(val_toks) == 1 else val_raw)
             else:
                 raise ParseError(f"Expected col=val near '{token}'")
         where, pos = _parse_where(t, i)
@@ -1232,5 +1397,24 @@ def _parse_tokens(t: list[str]) -> dict:
         if len(t) < 3 or t[1].upper() != "TABLE":
             raise ParseError("Expected: TRUNCATE TABLE <name>")
         return {"op": "TRUNCATE", "table": t[2]}
+
+    if kw == "PRAGMA":
+        if len(t) < 2:
+            raise ParseError("Expected pragma name")
+        # Tokenizer may collapse: table_info(t) → single token
+        m = re.fullmatch(r'(\w+)\((\w*)\)', t[1])
+        if m:
+            return {"op": "PRAGMA", "name": m.group(1).lower(), "arg": m.group(2)}
+        name = t[1].lower()
+        if len(t) >= 4 and t[2] == "=":
+            return {"op": "PRAGMA", "name": name, "value": t[3]}
+        return {"op": "PRAGMA", "name": name, "arg": None}
+
+    if kw == "VACUUM":
+        return {"op": "VACUUM"}
+
+    if kw == "ANALYZE":
+        table = t[1] if len(t) > 1 and t[1] != ";" else None
+        return {"op": "ANALYZE", "table": table}
 
     raise ParseError(f"Unrecognized statement: '{t[0]}'")

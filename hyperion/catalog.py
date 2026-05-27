@@ -7,11 +7,22 @@ from .schema import Schema
 
 
 @dataclass
+class TriggerMeta:
+    table:       str
+    timing:      str        # "BEFORE" or "AFTER"
+    event:       str        # "INSERT", "UPDATE", "DELETE"
+    update_cols: list       # UPDATE OF cols; empty = any column
+    when_tokens: list       # WHEN expr tokens; empty = no condition
+    body_tokens: list       # tokens between BEGIN and END
+
+
+@dataclass
 class TableMeta:
     schema:    Schema
     root_page: int
     next_page: int
     next_key:  int
+    temporary: bool = False
 
 
 @dataclass
@@ -28,11 +39,14 @@ class IndexMeta:
 
 @dataclass
 class Catalog:
-    tables:         dict[str, TableMeta]  = field(default_factory=dict)
-    indexes:        dict[str, IndexMeta]  = field(default_factory=dict)
-    views:          dict[str, str]        = field(default_factory=dict)
-    next_free_page: int                   = 1   # page 0 = catalog
-    free_pages:     list[int]             = field(default_factory=list)
+    tables:         dict[str, TableMeta]      = field(default_factory=dict)
+    indexes:        dict[str, IndexMeta]      = field(default_factory=dict)
+    views:          dict[str, str]            = field(default_factory=dict)
+    next_free_page: int                       = 1   # page 0 = catalog
+    free_pages:     list[int]                 = field(default_factory=list)
+    # stats["table"] = {"row_count": N, "columns": {"col": {"ndv": K}}}
+    stats:          dict[str, dict]           = field(default_factory=dict)
+    triggers:       dict[str, TriggerMeta]    = field(default_factory=dict)
 
     CATALOG_PAGE = 0
 
@@ -44,7 +58,7 @@ class Catalog:
             "tables": {
                 n: {"schema": m.schema.to_dict(), "root_page": m.root_page,
                     "next_page": m.next_page, "next_key": m.next_key}
-                for n, m in self.tables.items()
+                for n, m in self.tables.items() if not m.temporary
             },
             "indexes": {
                 n: {"table_name": m.table_name, "columns": m.columns,
@@ -52,6 +66,13 @@ class Catalog:
                 for n, m in self.indexes.items()
             },
             "views": self.views,
+            "stats": self.stats,
+            "triggers": {
+                n: {"table": m.table, "timing": m.timing, "event": m.event,
+                    "update_cols": m.update_cols, "when_tokens": m.when_tokens,
+                    "body_tokens": m.body_tokens}
+                for n, m in self.triggers.items()
+            },
         }).encode()
 
     @classmethod
@@ -71,7 +92,15 @@ class Catalog:
                          i["root_page"], i["next_page"])
             for n, i in d.get("indexes", {}).items()
         }
+        triggers = {
+            n: TriggerMeta(t["table"], t["timing"], t["event"],
+                           t.get("update_cols", []), t.get("when_tokens", []),
+                           t.get("body_tokens", []))
+            for n, t in d.get("triggers", {}).items()
+        }
         return cls(tables=tables, indexes=indexes,
                    views=d.get("views", {}),
                    next_free_page=d.get("next_free_page", 1),
-                   free_pages=d.get("free_pages", []))
+                   free_pages=d.get("free_pages", []),
+                   stats=d.get("stats", {}),
+                   triggers=triggers)

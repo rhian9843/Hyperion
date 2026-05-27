@@ -118,6 +118,8 @@ class ConstraintsMixin:
 
     def _check_fk_child(self, schema: Schema, row: dict[str, Any]) -> None:
         """Raise if any FK column values are not present in the referenced parent table."""
+        if not getattr(self, "fk_enforcement", True):
+            return
         for fk in schema.foreign_keys:
             vals = []
             for col_name in fk.columns:
@@ -161,6 +163,8 @@ class ConstraintsMixin:
         On DELETE: applies fk.on_delete (RESTRICT, CASCADE, SET NULL, NO ACTION).
         On UPDATE: applies fk.on_update; for CASCADE, propagates new ref values to children.
         """
+        if not getattr(self, "fk_enforcement", True):
+            return
         for tname, tmeta in self.tables.items():
             for fk in tmeta.schema.foreign_keys:
                 if fk.ref_table.lower() != table.lower():

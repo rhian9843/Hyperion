@@ -67,17 +67,39 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
                        offset: int | None = None) -> list[dict]:
     """Sort rows by ORDER BY clauses (NULLs last), then apply OFFSET and LIMIT."""
     if order_by:
+        from .expr import eval_expr, is_expr
+
+        def _key_val(row: dict, col: str):
+            v = row.get(col)
+            if v is None and col not in row and is_expr(col):
+                v = eval_expr(col, row)
+            return v
+
+        def _collate_key(v, collation: str | None):
+            if v is None:
+                return v
+            if collation == "NOCASE":
+                return str(v).lower()
+            if collation == "RTRIM":
+                return str(v).rstrip()
+            return v
+
         # Stable multi-key sort: apply keys in reverse order so the first
         # key ends up as the primary sort (Python sort is stable).
         for ob in reversed(order_by):
             col, desc = ob["col"], ob["desc"]
+            collation  = ob.get("collate")
             nulls_first = ob.get("nulls_first")
-            non_null = [r for r in rows if r.get(col) is not None]
-            null_rows = [r for r in rows if r.get(col) is None]
+            non_null = [r for r in rows if _key_val(r, col) is not None]
+            null_rows = [r for r in rows if _key_val(r, col) is None]
             try:
-                non_null.sort(key=lambda r, c=col: r[c], reverse=desc)
+                non_null.sort(
+                    key=lambda r, c=col, coll=collation: _collate_key(_key_val(r, c), coll),
+                    reverse=desc)
             except TypeError:
-                non_null.sort(key=lambda r, c=col: str(r[c]), reverse=desc)
+                non_null.sort(
+                    key=lambda r, c=col, coll=collation: str(_collate_key(_key_val(r, c), coll)),
+                    reverse=desc)
             rows = (null_rows + non_null) if nulls_first else (non_null + null_rows)
     if offset is not None:
         rows = rows[offset:]

@@ -1,4 +1,6 @@
 """SQL expression evaluator: arithmetic, CAST, COALESCE, NULLIF, IFNULL, CASE WHEN."""
+import math
+import random
 import re
 from datetime import datetime
 from typing import Any
@@ -165,12 +167,23 @@ def _parse_primary(toks: list[str], pos: int, row: dict) -> tuple[Any, int]:
 # ── Function evaluator ─────────────────────────────────────────────────────────
 
 def _split_args(args_str: str) -> list[str]:
-    """Split comma-separated function arguments respecting nested parentheses."""
+    """Split comma-separated function arguments respecting nested parentheses and string literals."""
     result: list[str] = []
     current: list[str] = []
     depth = 0
-    for ch in args_str:
-        if ch == "(":
+    in_str = False
+    i = 0
+    while i < len(args_str):
+        ch = args_str[i]
+        if in_str:
+            current.append(ch)
+            if ch == "'":
+                if i + 1 < len(args_str) and args_str[i + 1] == "'":
+                    current.append(args_str[i + 1]); i += 2; continue
+                in_str = False
+        elif ch == "'":
+            in_str = True; current.append(ch)
+        elif ch == "(":
             depth += 1; current.append(ch)
         elif ch == ")":
             depth -= 1; current.append(ch)
@@ -178,6 +191,7 @@ def _split_args(args_str: str) -> list[str]:
             result.append("".join(current).strip()); current = []
         else:
             current.append(ch)
+        i += 1
     if current:
         result.append("".join(current).strip())
     return [a for a in result if a]
@@ -219,7 +233,189 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
             return None
         return args[0] if args else None
 
+    # ── String functions ───────────────────────────────────────────────────────
+
+    if fname in ("UPPER", "LOWER", "LENGTH", "TRIM", "LTRIM", "RTRIM"):
+        if not args or args[0] is None:
+            return None
+        s = str(args[0])
+        if fname == "UPPER":   return s.upper()
+        if fname == "LOWER":   return s.lower()
+        if fname == "LENGTH":  return len(s)
+        chars = str(args[1]) if len(args) > 1 and args[1] is not None else None
+        if fname == "TRIM":    return s.strip(chars)
+        if fname == "LTRIM":   return s.lstrip(chars)
+        if fname == "RTRIM":   return s.rstrip(chars)
+
+    if fname == "SUBSTR":
+        # SUBSTR(str, start[, length]) — SQL uses 1-based indexing
+        if len(args) < 2 or args[0] is None:
+            return None
+        s     = str(args[0])
+        start = int(args[1]) if args[1] is not None else 1
+        # SQL SUBSTR: negative start counts from end; 0 is treated as 1
+        if start == 0:
+            start = 1
+        py_start = (start - 1) if start > 0 else (len(s) + start)
+        py_start = max(0, py_start)
+        if len(args) >= 3 and args[2] is not None:
+            length = int(args[2])
+            return s[py_start: py_start + length]
+        return s[py_start:]
+
+    if fname == "REPLACE":
+        if len(args) < 3 or args[0] is None:
+            return None
+        return str(args[0]).replace(
+            str(args[1]) if args[1] is not None else "",
+            str(args[2]) if args[2] is not None else "",
+        )
+
+    if fname == "INSTR":
+        # INSTR(str, sub) — returns 1-based position of first occurrence, 0 if not found
+        if len(args) < 2 or args[0] is None or args[1] is None:
+            return 0
+        idx = str(args[0]).find(str(args[1]))
+        return idx + 1 if idx >= 0 else 0
+
+    if fname in ("PRINTF", "FORMAT"):
+        # PRINTF(fmt, arg1, arg2, ...) — C-style formatted string
+        if not args or args[0] is None:
+            return None
+        return _printf(str(args[0]), args[1:])
+
+    # ── Math functions ─────────────────────────────────────────────────────────
+
+    if fname == "ABS":
+        if not args or args[0] is None:
+            return None
+        v = args[0]
+        return abs(v) if isinstance(v, (int, float)) else None
+
+    if fname == "ROUND":
+        if not args or args[0] is None:
+            return None
+        try:
+            v = float(args[0])
+        except (ValueError, TypeError):
+            return None
+        digits = int(args[1]) if len(args) > 1 and args[1] is not None else 0
+        result = round(v, digits)
+        return int(result) if digits == 0 else result
+
+    if fname in ("CEIL", "CEILING"):
+        if not args or args[0] is None:
+            return None
+        try:
+            return math.ceil(float(args[0]))
+        except (ValueError, TypeError):
+            return None
+
+    if fname == "FLOOR":
+        if not args or args[0] is None:
+            return None
+        try:
+            return math.floor(float(args[0]))
+        except (ValueError, TypeError):
+            return None
+
+    if fname == "MOD":
+        if len(args) < 2 or args[0] is None or args[1] is None:
+            return None
+        try:
+            a, b = int(args[0]), int(args[1])
+            return a % b if b != 0 else None
+        except (ValueError, TypeError):
+            return None
+
+    # ── Random functions ───────────────────────────────────────────────────────
+
+    if fname == "RANDOM":
+        return random.randint(-(1 << 63), (1 << 63) - 1)
+
+    if fname == "RANDOMBLOB":
+        if not args or args[0] is None:
+            return None
+        try:
+            n = max(0, int(args[0]))
+        except (ValueError, TypeError):
+            return None
+        return bytes(random.randint(0, 255) for _ in range(n))
+
+    # ── Type introspection ─────────────────────────────────────────────────────
+
+    if fname == "TYPEOF":
+        if not args:
+            return "null"
+        v = args[0]
+        if v is None:
+            return "null"
+        if isinstance(v, bool):
+            return "integer"
+        if isinstance(v, int):
+            return "integer"
+        if isinstance(v, float):
+            return "real"
+        if isinstance(v, bytes):
+            return "blob"
+        return "text"
+
     return None  # unknown function → NULL
+
+
+def _printf(fmt: str, args: list) -> str:
+    """Format a string using SQLite-compatible C-style format specifiers."""
+    result: list[str] = []
+    arg_idx = 0
+    i = 0
+    while i < len(fmt):
+        if fmt[i] != "%" or i + 1 >= len(fmt):
+            result.append(fmt[i]); i += 1; continue
+        i += 1
+        if fmt[i] == "%":
+            result.append("%"); i += 1; continue
+        # flags
+        flags = ""
+        while i < len(fmt) and fmt[i] in "-+ #0":
+            flags += fmt[i]; i += 1
+        # width
+        width = ""
+        while i < len(fmt) and fmt[i].isdigit():
+            width += fmt[i]; i += 1
+        # precision
+        prec = ""
+        if i < len(fmt) and fmt[i] == ".":
+            i += 1
+            while i < len(fmt) and fmt[i].isdigit():
+                prec += fmt[i]; i += 1
+        if i >= len(fmt):
+            break
+        spec = fmt[i]; i += 1
+        val = args[arg_idx] if arg_idx < len(args) else None
+        arg_idx += 1
+        py_fmt = "%" + flags + width + ("." + prec if prec else "")
+        try:
+            if spec in "di":
+                result.append((py_fmt + "d") % (int(val) if val is not None else 0))
+            elif spec in "uoxX":
+                result.append((py_fmt + spec) % (int(val) if val is not None else 0))
+            elif spec in "eEfgG":
+                result.append((py_fmt + spec) % (float(val) if val is not None else 0.0))
+            elif spec == "s":
+                result.append((py_fmt + "s") % ("" if val is None else str(val)))
+            elif spec == "q":
+                # like %s but escapes single quotes by doubling them
+                s = "" if val is None else str(val).replace("'", "''")
+                result.append((py_fmt + "s") % s)
+            elif spec == "Q":
+                # like %q but wraps in single quotes
+                s = "" if val is None else str(val).replace("'", "''")
+                result.append("'" + s + "'")
+            else:
+                result.append(str(val) if val is not None else "")
+        except (ValueError, TypeError):
+            result.append("")
+    return "".join(result)
 
 
 # ── CASE WHEN evaluator ────────────────────────────────────────────────────────

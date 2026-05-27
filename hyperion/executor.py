@@ -6,10 +6,13 @@ from typing import Any
 from .database import Database
 from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, _make_index_key
 from .expr import eval_expr
+from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
 from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
 from .query import _project_row
+from .triggers import (fire_triggers, has_triggers, has_instead_of,
+                       scan_matching_rows, apply_update_row)
 
 # ── Window function helpers ────────────────────────────────────────────────────
 
@@ -193,6 +196,55 @@ def _exec_derived_table(stmt: dict, db: "Database",
                               stmt.get("limit"), stmt.get("offset"))
 
 
+def _exec_recursive_cte(cte_def: dict, db: "Database", ctes: dict) -> list[dict]:
+    """Execute a RECURSIVE CTE: seed with base, iterate recursive part until empty."""
+    # Extract column aliases from name like "cnt(n, m)" → ["n", "m"]
+    raw_name = cte_def["name"]
+    cte_key  = raw_name.split("(")[0]
+    col_aliases: list[str] = []
+    m = __import__("re").search(r"\(([^)]+)\)", raw_name)
+    if m:
+        col_aliases = [c.strip() for c in m.group(1).split(",")]
+
+    def _apply_aliases(row: dict) -> dict:
+        if not col_aliases:
+            return row
+        vals = list(row.values())
+        return {col_aliases[i]: vals[i] for i in range(min(len(col_aliases), len(vals)))}
+
+    def _row_key(r: dict) -> tuple:
+        return tuple(r.values())
+
+    accumulated: list[dict] = []
+    seen: list[tuple] = []
+    union_all = cte_def.get("union_all", True)
+
+    working = [_apply_aliases(r) for r in _rows_for_stmt(cte_def["base"], db, ctes)]
+    for row in working:
+        k = _row_key(row)
+        if union_all or k not in seen:
+            accumulated.append(row)
+            seen.append(k)
+
+    max_iterations = 1000
+    for _ in range(max_iterations):
+        if not working:
+            break
+        step_ctes = {**ctes, cte_key: {"op": "INLINE_ROWS", "rows": working}}
+        raw = _rows_for_stmt(cte_def["recursive"], db, step_ctes)
+        working = [_apply_aliases(r) for r in raw]
+        new_rows: list[dict] = []
+        for row in working:
+            k = _row_key(row)
+            if union_all or k not in seen:
+                accumulated.append(row)
+                seen.append(k)
+                new_rows.append(row)
+        working = new_rows if not union_all else working
+
+    return accumulated
+
+
 def _exec_cte_select(outer: dict, cte_ast: dict, db: "Database",
                      ctes: dict) -> list[dict]:
     """Execute a SELECT whose FROM table is a CTE name."""
@@ -216,19 +268,25 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     join_type   = join_info.get("join_type", "INNER")
     on_left     = join_info.get("on_left")
     on_right    = join_info.get("on_right")
-
-    rmeta       = db._meta(right_table)
-    right_rows  = [deserialize_row(rmeta.schema, r)
-                   for _, r in db._table_btree(rmeta).scan()]
-    right_null  = {f"{right_alias}.{c.name}": None for c in rmeta.schema.columns}
     rcol        = on_right.split(".")[-1] if on_right else None
+
+    rmeta      = db._meta(right_table)
+    right_null = {f"{right_alias}.{c.name}": None for c in rmeta.schema.columns}
+
+    # Use INLJ for INNER joins when the right side has an index on the join column
+    use_inlj = (join_type == "INNER" and rcol is not None
+                and _find_eq_index(db, right_table, rcol) is not None)
+
+    if not use_inlj:
+        right_rows = [deserialize_row(rmeta.schema, r)
+                      for _, r in db._table_btree(rmeta).scan()]
 
     result: list[dict] = []
     matched_right: set[int] = set()
 
     for lr in rows:
         if rcol is None:            # CROSS JOIN
-            for rr in right_rows:
+            for rr in right_rows:  # type: ignore[possibly-undefined]
                 merged = dict(lr)
                 merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
                 result.append(merged)
@@ -238,23 +296,32 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
         if lval is None and on_left:
             lval = lr.get(on_left.split(".")[-1])
 
-        on_matched = False
-        for j, rr in enumerate(right_rows):
-            if lval != rr.get(rcol):
-                continue
-            on_matched = True
-            matched_right.add(j)
-            merged = dict(lr)
-            merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
-            result.append(merged)
-        if not on_matched and join_type in ("LEFT", "FULL"):
-            merged = dict(lr)
-            merged.update(right_null)
-            result.append(merged)
+        if use_inlj:
+            if lval is None:
+                continue  # INNER JOIN: NULL never matches
+            probed = _probe_index(db, right_table, rcol, lval)
+            for rr in (probed or []):
+                merged = dict(lr)
+                merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
+                result.append(merged)
+        else:
+            on_matched = False
+            for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                if lval != rr.get(rcol):
+                    continue
+                on_matched = True
+                matched_right.add(j)
+                merged = dict(lr)
+                merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
+                result.append(merged)
+            if not on_matched and join_type in ("LEFT", "FULL"):
+                merged = dict(lr)
+                merged.update(right_null)
+                result.append(merged)
 
-    if join_type in ("RIGHT", "FULL"):
+    if not use_inlj and join_type in ("RIGHT", "FULL"):
         left_null = {k: None for k in (rows[0] if rows else {})}
-        for j, rr in enumerate(right_rows):
+        for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
             if j not in matched_right:
                 merged = dict(left_null)
                 merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
@@ -262,11 +329,98 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     return result
 
 
+def _materialize_table(tname: str, db: "Database", ctes: dict,
+                        alias: str | None = None) -> list[dict]:
+    """Return rows for a real table or CTE, with optional alias prefix."""
+    if tname in ctes:
+        raw = _rows_for_stmt(ctes[tname], db, ctes)
+    elif tname in db.views:
+        view_ast = _parse_tokens(_tokenize(db.views[tname]))
+        raw = _rows_for_stmt(view_ast, db, ctes)
+    else:
+        from .schema import deserialize_row
+        meta = db._meta(tname)
+        raw = [deserialize_row(meta.schema, r) for _, r in db._table_btree(meta).scan()]
+    if alias:
+        return [{f"{alias}.{k}": v for k, v in row.items()} for row in raw]
+    return raw
+
+
+def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
+    """Nested-loop join when one or both tables are CTEs or views."""
+    ltbl   = stmt["left_table"]
+    rtbl   = stmt["right_table"]
+    lalias = stmt.get("left_alias") or ltbl
+    ralias = stmt.get("right_alias") or rtbl
+    on_left  = stmt.get("on_left")
+    on_right = stmt.get("on_right")
+    join_type = stmt.get("join_type", "INNER")
+
+    left_rows  = _materialize_table(ltbl, db, ctes)
+    right_rows = _materialize_table(rtbl, db, ctes)
+
+    # Prefix keys with alias so ON and WHERE can find them via both alias.col and col
+    def _key(row: dict, col: str | None) -> object:
+        if col is None:
+            return None
+        if col in row:
+            return row[col]
+        bare = col.split(".")[-1]
+        if bare in row:
+            return row[bare]
+        for k, v in row.items():
+            if k.split(".")[-1] == bare:
+                return v
+        return None
+
+    result: list[dict] = []
+    matched_right: set[int] = set()
+    for lr in left_rows:
+        matched = False
+        lval = _key(lr, on_left)
+        for ri, rr in enumerate(right_rows):
+            rval = _key(rr, on_right)
+            if on_left is None or lval == rval:
+                merged = {**lr, **rr}
+                # Also add alias-prefixed keys for each side
+                for k, v in lr.items():
+                    merged[f"{lalias}.{k.split('.')[-1]}"] = v
+                for k, v in rr.items():
+                    merged[f"{ralias}.{k.split('.')[-1]}"] = v
+                result.append(merged)
+                matched = True
+                matched_right.add(ri)
+        if not matched and join_type in ("LEFT", "LEFT OUTER"):
+            merged = dict(lr)
+            for k, v in lr.items():
+                merged[f"{lalias}.{k.split('.')[-1]}"] = v
+            result.append(merged)
+
+    if join_type in ("RIGHT", "RIGHT OUTER"):
+        for ri, rr in enumerate(right_rows):
+            if ri not in matched_right:
+                merged = dict(rr)
+                for k, v in rr.items():
+                    merged[f"{ralias}.{k.split('.')[-1]}"] = v
+                result.append(merged)
+
+    if stmt.get("where"):
+        result = [r for r in result if stmt["where"].evaluate(r, db)]
+    if stmt.get("columns"):
+        result = [_project_row(r, stmt["columns"]) for r in result]
+    return _apply_order_limit(result, stmt.get("order_by"),
+                              stmt.get("limit"), stmt.get("offset"))
+
+
 def _rows_for_stmt(stmt: dict, db: "Database",
                    ctes: dict | None = None) -> list[dict]:
     """Execute any SELECT-like statement and return its rows."""
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     op = stmt["op"]
+    if op == "INLINE_ROWS":
+        return stmt["rows"]
+    if op == "RECURSIVE_CTE":
+        return _exec_recursive_cte(stmt, db, ctes)
     if op == "SELECT_NOFROM":
         row: dict = {}
         return [{col: eval_expr(col, row) for col in (stmt.get("columns") or [])}]
@@ -284,6 +438,12 @@ def _rows_for_stmt(stmt: dict, db: "Database",
                          stmt.get("group_by"), stmt.get("having"),
                          stmt.get("distinct", False), stmt.get("offset"))
     if op == "JOIN":
+        # If either join table is a CTE, materialize and do an in-memory join
+        ltbl = stmt.get("left_table", "")
+        rtbl = stmt.get("right_table", "")
+        if ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views:
+            return _exec_in_memory_join(stmt, db, ctes)
+        stmt = optimize_join(stmt, db)      # cost-based join reordering
         extra = stmt.get("extra_joins", [])
         if extra:
             rows = db.join(stmt["left_table"], stmt["right_table"],
@@ -314,6 +474,117 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     raise RuntimeError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
 
 
+def _is_unique_index(idx_name: str, idx_meta, db: Database) -> bool:
+    if idx_name.startswith("_pk_"):
+        return True
+    tname = idx_meta.table_name
+    if tname in db.tables:
+        schema = db._meta(tname).schema
+        for col in schema.columns:
+            if col.name in idx_meta.columns and (col.unique or col.primary_key):
+                return True
+        for uc in schema.unique_constraints:
+            if sorted(uc) == sorted(idx_meta.columns):
+                return True
+    return False
+
+
+def _handle_pragma(stmt: dict, db: Database) -> str:
+    name = stmt.get("name", "")
+
+    if name == "foreign_keys":
+        value = stmt.get("value", "").upper()
+        if value in ("ON", "1", "TRUE"):
+            db.fk_enforcement = True
+            return "foreign_keys = 1"
+        if value in ("OFF", "0", "FALSE"):
+            db.fk_enforcement = False
+            return "foreign_keys = 0"
+        return f"foreign_keys = {1 if db.fk_enforcement else 0}"
+
+    if name == "table_info":
+        tname = stmt.get("arg") or ""
+        if tname not in db.tables:
+            raise RuntimeError(f"No such table: '{tname}'")
+        schema = db._meta(tname).schema
+        pk_cols = set(schema.primary_key_columns or [])
+        rows = []
+        for cid, col in enumerate(schema.columns):
+            is_pk = 1 if (col.primary_key or col.name in pk_cols) else 0
+            rows.append({
+                "cid": cid, "name": col.name, "type": col.type,
+                "notnull": 0 if col.nullable else 1,
+                "dflt_value": col.default, "pk": is_pk,
+            })
+        return _format_rows(rows, ["cid", "name", "type", "notnull", "dflt_value", "pk"])
+
+    if name == "index_list":
+        tname = stmt.get("arg") or ""
+        rows = []
+        for seq, (idx_name, idx_meta) in enumerate(
+                (n, m) for n, m in db.indexes.items() if m.table_name == tname):
+            rows.append({"seq": seq, "name": idx_name,
+                         "unique": 1 if _is_unique_index(idx_name, idx_meta, db) else 0})
+        return _format_rows(rows, ["seq", "name", "unique"]) if rows else "(no rows)"
+
+    if name == "index_info":
+        idx_name = stmt.get("arg") or ""
+        if idx_name not in db.indexes:
+            raise RuntimeError(f"No such index: '{idx_name}'")
+        idx_meta = db.indexes[idx_name]
+        schema = db._meta(idx_meta.table_name).schema
+        col_cids = {c.name: i for i, c in enumerate(schema.columns)}
+        rows = [{"seqno": i, "cid": col_cids.get(col, -1), "name": col}
+                for i, col in enumerate(idx_meta.columns)]
+        return _format_rows(rows, ["seqno", "cid", "name"])
+
+    raise RuntimeError(f"Unknown PRAGMA: '{name}'")
+
+
+def _execute_analyze(stmt: dict, db: Database) -> str:
+    """Scan tables and persist row count + per-column NDV statistics to the catalog."""
+    target = stmt.get("table")
+    tables_to_analyze = ([target] if target and target in db.tables
+                         else list(db.tables.keys()))
+
+    if target and target not in db.tables:
+        raise RuntimeError(f"No such table: '{target}'")
+
+    for tname in tables_to_analyze:
+        meta   = db._meta(tname)
+        schema = meta.schema
+        col_names = [c.name for c in schema.columns]
+
+        row_count = 0
+        distinct: dict[str, set] = {c: set() for c in col_names}
+
+        for _, raw in db._table_btree(meta).scan():
+            row = deserialize_row(schema, raw)
+            row_count += 1
+            for c in col_names:
+                val = row.get(c)
+                # Use a hashable sentinel for None so it counts as a distinct value
+                distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
+
+        db._catalog.stats[tname] = {
+            "row_count": row_count,
+            "columns": {c: {"ndv": len(distinct[c])} for c in col_names},
+        }
+
+        # Refresh session row-count cache
+        if hasattr(db, "_opt_row_counts"):
+            db._opt_row_counts[tname] = row_count
+
+    db._flush_catalog()
+
+    n = len(tables_to_analyze)
+    summary = ", ".join(tables_to_analyze) if n <= 5 else f"{n} tables"
+    return f"Statistics collected for: {summary}."
+
+
+_ANALYZE_NULL_SENTINEL = object()
+
+
 def execute(stmt: dict, db: Database) -> str:
     op = stmt["op"]
 
@@ -337,6 +608,12 @@ def execute(stmt: dict, db: Database) -> str:
         db.rollback_to_savepoint(stmt["name"])
         return f"Rolled back to savepoint '{stmt['name']}'."
 
+    if op == "PRAGMA":
+        return _handle_pragma(stmt, db)
+
+    if op == "VACUUM":
+        return db.vacuum()
+
     # All other statements: auto-commit if not inside an explicit BEGIN
     auto = not db.in_transaction
     if auto:
@@ -352,9 +629,87 @@ def execute(stmt: dict, db: Database) -> str:
     return result
 
 
+def _view_rows(view_name: str, where: Any, db: Database) -> list[dict]:
+    """Execute a view's SELECT and return rows matching where.
+
+    Rows are normalized so bare column names (e.g. 'id') are available
+    alongside table-qualified ones ('users.id'), allowing WHERE clauses
+    and OLD.col references in trigger bodies to use simple column names.
+    """
+    view_ast = _parse_tokens(_tokenize(db.views[view_name]))
+    raw_rows = _rows_for_stmt(view_ast, db)
+    rows = []
+    for row in raw_rows:
+        nr = dict(row)
+        for k, v in row.items():
+            if "." in k:
+                bare = k.split(".", 1)[1]
+                if bare not in nr:
+                    nr[bare] = v
+        rows.append(nr)
+    if where:
+        rows = [r for r in rows if where.evaluate(r, db)]
+    return rows
+
+
+def _exec_instead_of_insert(stmt: dict, db: Database) -> str:
+    tname = stmt["table"]
+    col_names = stmt["col_names"]
+    if not col_names:
+        rows = _view_rows(tname, None, db)
+        if rows:
+            col_names = list(rows[0].keys())
+        else:
+            raise RuntimeError(
+                f"Cannot determine columns for INSERT on view '{tname}' "
+                f"— specify column names explicitly")
+    count = 0
+    for values in stmt["rows"]:
+        if len(col_names) != len(values):
+            raise RuntimeError(
+                f"Column/value mismatch: {len(col_names)} columns, {len(values)} values")
+        parsed: dict[str, Any] = {
+            n: (None if v.upper() == "NULL" else v)
+            for n, v in zip(col_names, values)
+        }
+        fire_triggers(db, tname, "INSTEAD OF", "INSERT", parsed, None)
+        count += 1
+    return f"{count} row{'s' if count != 1 else ''} inserted."
+
+
+def _exec_instead_of_update(stmt: dict, db: Database) -> str:
+    from .expr import eval_expr, is_expr as _is_expr
+    tname = stmt["table"]
+    old_rows = _view_rows(tname, stmt.get("where"), db)
+    for old_row in old_rows:
+        new_row = dict(old_row)
+        for col, val_str in stmt["assignments"].items():
+            if val_str is None or (isinstance(val_str, str) and val_str.upper() == "NULL"):
+                new_row[col] = None
+            elif _is_expr(str(val_str)):
+                new_row[col] = eval_expr(str(val_str), old_row)
+            else:
+                new_row[col] = val_str
+        fire_triggers(db, tname, "INSTEAD OF", "UPDATE", new_row, old_row)
+    n = len(old_rows)
+    return f"{n} row{'s' if n != 1 else ''} updated."
+
+
+def _exec_instead_of_delete(stmt: dict, db: Database) -> str:
+    tname = stmt["table"]
+    old_rows = _view_rows(tname, stmt.get("where"), db)
+    for old_row in old_rows:
+        fire_triggers(db, tname, "INSTEAD OF", "DELETE", None, old_row)
+    n = len(old_rows)
+    return f"{n} row{'s' if n != 1 else ''} deleted."
+
+
 def _execute_inner(stmt: dict, db: Database) -> str:
     from .schema import Schema
     op = stmt["op"]
+
+    if op == "ANALYZE":
+        return _execute_analyze(stmt, db)
 
     if op == "CREATE_TABLE_AS_SELECT":
         from .schema import Schema, Column
@@ -397,7 +752,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         db.create_table(Schema(name=stmt["name"], columns=stmt["columns"],
                                foreign_keys=stmt.get("foreign_keys", []),
                                unique_constraints=stmt.get("unique_constraints", []),
-                               primary_key_columns=pk_cols))
+                               primary_key_columns=pk_cols),
+                        temporary=stmt.get("temporary", False))
         for col in stmt["columns"]:
             if col.primary_key:
                 pk_idx = f"_pk_{stmt['name']}_{col.name}"
@@ -456,13 +812,35 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 raise
         return f"Index '{stmt['idx_name']}' dropped."
 
+    if op == "CREATE_TRIGGER":
+        from .catalog import TriggerMeta
+        if stmt.get("if_not_exists") and stmt["name"] in db._catalog.triggers:
+            return f"Trigger '{stmt['name']}' already exists."
+        trig = TriggerMeta(stmt["table"], stmt["timing"], stmt["event"],
+                           stmt.get("update_cols", []), stmt.get("when_tokens", []),
+                           stmt.get("body_tokens", []))
+        db.create_trigger(stmt["name"], trig)
+        return f"Trigger '{stmt['name']}' created."
+
+    if op == "DROP_TRIGGER":
+        if stmt.get("if_exists") and stmt["name"] not in db._catalog.triggers:
+            return f"Trigger '{stmt['name']}' does not exist."
+        db.drop_trigger(stmt["name"])
+        return f"Trigger '{stmt['name']}' dropped."
+
     if op == "INSERT":
+        if stmt["table"] not in db.tables and stmt["table"] in db.views:
+            if not has_instead_of(db, stmt["table"], "INSERT"):
+                raise RuntimeError(
+                    f"Cannot insert into view '{stmt['table']}' without an INSTEAD OF trigger")
+            return _exec_instead_of_insert(stmt, db)
         meta            = db._meta(stmt["table"])
         col_names       = stmt["col_names"] or [c.name for c in meta.schema.columns]
         conflict_action = stmt.get("conflict_action")
         on_conflict_set = stmt.get("on_conflict_set") or {}
         returning_cols  = stmt.get("returning")
         returned_rows: list[dict] = []
+        _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
         for values in stmt["rows"]:
             if len(col_names) != len(values):
                 raise RuntimeError(
@@ -474,9 +852,13 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             for col in meta.schema.columns:
                 if col.name not in parsed:
                     parsed[col.name] = col.default
+            if _has_ins_trig:
+                fire_triggers(db, stmt["table"], "BEFORE", "INSERT", parsed, None)
             if conflict_action == "IGNORE":
                 try:
                     row_out = db.insert(stmt["table"], parsed)
+                    if _has_ins_trig:
+                        fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                     if returning_cols:
                         returned_rows.append(row_out)
                 except RuntimeError as _e:
@@ -488,11 +870,15 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             elif conflict_action == "REPLACE":
                 _remove_conflicting_rows(db, meta, parsed)
                 row_out = db.insert(stmt["table"], parsed)
+                if _has_ins_trig:
+                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                 if returning_cols:
                     returned_rows.append(row_out)
             elif conflict_action == "UPDATE":
                 try:
                     row_out = db.insert(stmt["table"], parsed)
+                    if _has_ins_trig:
+                        fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                     if returning_cols:
                         returned_rows.append(row_out)
                 except RuntimeError as _e:
@@ -502,6 +888,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                         raise
             else:
                 row_out = db.insert(stmt["table"], parsed)
+                if _has_ins_trig:
+                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                 if returning_cols:
                     returned_rows.append(row_out)
         n = len(stmt["rows"])
@@ -515,6 +903,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         col_names = stmt.get("col_names")
         meta = db._meta(stmt["table"])
         target_cols = [c.name for c in meta.schema.columns]
+        _has_ins_trig2 = has_triggers(db, stmt["table"], "INSERT")
         for src_row in src_rows:
             if col_names:
                 row_vals = list(src_row.values())
@@ -533,7 +922,11 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             for col in meta.schema.columns:
                 if col.name not in data:
                     data[col.name] = col.default
-            db.insert(stmt["table"], data)
+            if _has_ins_trig2:
+                fire_triggers(db, stmt["table"], "BEFORE", "INSERT", data, None)
+            row_out = db.insert(stmt["table"], data)
+            if _has_ins_trig2:
+                fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
         n = len(src_rows)
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
@@ -588,7 +981,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return _format_rows(rows, cols)
 
     if op == "JOIN":
-        s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+        s = optimize_join(_resolve_alias_refs(stmt, stmt.get("col_aliases")), db)
         extra = s.get("extra_joins", [])
         if extra:
             rows = db.join(s["left_table"], s["right_table"],
@@ -627,8 +1020,25 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
 
     if op == "UPDATE":
-        rows = db.update(stmt["table"], stmt["assignments"], stmt["where"],
-                         stmt.get("limit"))
+        tname = stmt["table"]
+        if tname not in db.tables and tname in db.views:
+            if not has_instead_of(db, tname, "UPDATE"):
+                raise RuntimeError(
+                    f"Cannot update view '{tname}' without an INSTEAD OF trigger")
+            return _exec_instead_of_update(stmt, db)
+        if has_triggers(db, tname, "UPDATE"):
+            changed_cols = list(stmt["assignments"].keys())
+            old_rows = scan_matching_rows(db, tname, stmt["where"])
+            _upd_meta = db._meta(tname)
+            for old_row in old_rows:
+                new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
+                fire_triggers(db, tname, "BEFORE", "UPDATE", new_row, old_row, changed_cols)
+            rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
+            for old_row in old_rows:
+                new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
+                fire_triggers(db, tname, "AFTER", "UPDATE", new_row, old_row, changed_cols)
+        else:
+            rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
         n = len(rows)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
@@ -636,7 +1046,21 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return f"{n} row{'s' if n != 1 else ''} updated."
 
     if op == "DELETE":
-        rows = db.delete(stmt["table"], stmt["where"], stmt.get("limit"))
+        tname = stmt["table"]
+        if tname not in db.tables and tname in db.views:
+            if not has_instead_of(db, tname, "DELETE"):
+                raise RuntimeError(
+                    f"Cannot delete from view '{tname}' without an INSTEAD OF trigger")
+            return _exec_instead_of_delete(stmt, db)
+        if has_triggers(db, tname, "DELETE"):
+            old_rows = scan_matching_rows(db, tname, stmt["where"])
+            for old_row in old_rows:
+                fire_triggers(db, tname, "BEFORE", "DELETE", None, old_row)
+            rows = db.delete(tname, stmt["where"], stmt.get("limit"))
+            for old_row in old_rows:
+                fire_triggers(db, tname, "AFTER", "DELETE", None, old_row)
+        else:
+            rows = db.delete(tname, stmt["where"], stmt.get("limit"))
         n = len(rows)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]

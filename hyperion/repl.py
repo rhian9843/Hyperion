@@ -142,7 +142,7 @@ def main() -> None:
     if len(sys.argv) < 2:
         print("Usage: python -m hyperion <database_file>")
         sys.exit(1)
-    db = Database(Path(sys.argv[1]))
+    db = Database(sys.argv[1])
     try:
         repl(db)
     finally:

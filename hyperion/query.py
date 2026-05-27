@@ -9,13 +9,22 @@ from .encoding import (
     _make_index_key, _apply_order_limit,
 )
 from .expr import eval_expr, is_expr
+from .optimizer import find_eq_index, probe_index as _probe_index
 
 
-def _parse_agg(col: str) -> tuple[str, str] | None:
-    """If col is an aggregate call like MIN(id), return (FUNC_UPPER, arg). Else None."""
-    _AGG_RE = re.compile(r"^(COUNT|MIN|MAX|SUM|AVG)\(([^)]*)\)$", re.IGNORECASE)
+_AGG_RE = re.compile(
+    r"^(COUNT|MIN|MAX|SUM|AVG|GROUP_CONCAT|STRING_AGG)"
+    r"\(\s*(DISTINCT\s+)?(.+?)\s*\)$",
+    re.IGNORECASE,
+)
+
+
+def _parse_agg(col: str) -> tuple[str, str, bool] | None:
+    """If col is an aggregate call, return (FUNC_UPPER, arg, distinct). Else None."""
     m = _AGG_RE.match(col)
-    return (m.group(1).upper(), m.group(2).strip()) if m else None
+    if not m:
+        return None
+    return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
 
 
 def _project_row(row: dict, columns: list[str]) -> dict:
@@ -92,13 +101,34 @@ class QueryMixin:
             if agg is None:
                 result[col] = bucket_rows[0].get(col) if bucket_rows else None
                 continue
-            func, arg = agg
+            func, arg, distinct = agg
             if func == "COUNT":
-                result[col] = (len(bucket_rows) if arg == "*"
-                               else sum(1 for r in bucket_rows if r.get(arg) is not None))
+                if arg == "*":
+                    result[col] = len(bucket_rows)
+                else:
+                    vals = [r.get(arg) for r in bucket_rows if r.get(arg) is not None]
+                    if distinct:
+                        vals = list(dict.fromkeys(vals))
+                    result[col] = len(vals)
+            elif func in ("GROUP_CONCAT", "STRING_AGG"):
+                parts = [p.strip() for p in arg.split(",", 1)]
+                col_name = parts[0]
+                if len(parts) > 1:
+                    sep_raw = parts[1].strip()
+                    sep = sep_raw[1:-1] if (sep_raw.startswith("'")
+                                            and sep_raw.endswith("'")) else sep_raw
+                else:
+                    sep = ","
+                str_vals = [str(r[col_name]) for r in bucket_rows
+                            if col_name in r and r.get(col_name) is not None]
+                if distinct:
+                    str_vals = list(dict.fromkeys(str_vals))
+                result[col] = sep.join(str_vals) if str_vals else None
             else:
                 vals = [r[arg] for r in bucket_rows
                         if r.get(arg) is not None and arg in r]
+                if distinct:
+                    vals = list(dict.fromkeys(vals))
                 if not vals:
                     result[col] = None
                 elif func == "MIN":  result[col] = min(vals)
@@ -211,34 +241,51 @@ class QueryMixin:
 
         lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
         rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
-        matched_right: set[int] = set()
 
-        for lr in left_rows:
-            on_matched = False
-            for j, rr in enumerate(right_rows):
-                if lr.get(lcol) != rr.get(rcol):
-                    continue
-                on_matched = True
-                matched_right.add(j)
-                row = _emit(_merge(lr, rr))
-                if row is not None:
-                    results.append(row)
-            if not on_matched and join_type in ("LEFT", "FULL"):
-                merged = {f"{la}.{k}": v for k, v in lr.items()}
-                merged.update(right_null)
-                row = _emit(merged)
-                if row is not None:
-                    results.append(row)
+        # Use INLJ for INNER joins when the right side has an index on the join column
+        use_inlj = (join_type == "INNER"
+                    and find_eq_index(self, right_table, rcol) is not None)
 
-        if join_type in ("RIGHT", "FULL"):
-            for j, rr in enumerate(right_rows):
-                if j in matched_right:
+        if use_inlj:
+            for lr in left_rows:
+                val = lr.get(lcol)
+                if val is None:
+                    continue  # INNER JOIN: NULL never matches
+                probed = _probe_index(self, right_table, rcol, val)
+                if not probed:
                     continue
-                merged = dict(left_null)
-                merged.update({f"{ra}.{k}": v for k, v in rr.items()})
-                row = _emit(merged)
-                if row is not None:
-                    results.append(row)
+                for rr in probed:
+                    row = _emit(_merge(lr, rr))
+                    if row is not None:
+                        results.append(row)
+        else:
+            matched_right: set[int] = set()
+            for lr in left_rows:
+                on_matched = False
+                for j, rr in enumerate(right_rows):
+                    if lr.get(lcol) != rr.get(rcol):
+                        continue
+                    on_matched = True
+                    matched_right.add(j)
+                    row = _emit(_merge(lr, rr))
+                    if row is not None:
+                        results.append(row)
+                if not on_matched and join_type in ("LEFT", "FULL"):
+                    merged = {f"{la}.{k}": v for k, v in lr.items()}
+                    merged.update(right_null)
+                    row = _emit(merged)
+                    if row is not None:
+                        results.append(row)
+
+            if join_type in ("RIGHT", "FULL"):
+                for j, rr in enumerate(right_rows):
+                    if j in matched_right:
+                        continue
+                    merged = dict(left_null)
+                    merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                    row = _emit(merged)
+                    if row is not None:
+                        results.append(row)
 
         return _apply_order_limit(results, order_by, limit)
 
@@ -252,8 +299,12 @@ class QueryMixin:
         for col_name in idx_meta.columns:
             col_obj = next((c for c in schema.columns if c.name == col_name), None)
             if col_obj is None:
-                return []
-            col_types.append(col_obj.type)
+                if is_expr(col_name):
+                    col_types.append(TEXT)  # expression index: stored as TEXT
+                else:
+                    return []
+            else:
+                col_types.append(col_obj.type)
         vals = [eq_cols[n] for n in idx_meta.columns]
         try:
             val_key = _encode_composite_key(vals, col_types)
@@ -272,8 +323,12 @@ class QueryMixin:
             row = deserialize_row(schema, raw)
             match = True
             for col_name, val in eq_cols.items():
-                col_type = next(c.type for c in schema.columns if c.name == col_name)
-                actual   = row.get(col_name)
+                if is_expr(col_name):
+                    actual   = eval_expr(col_name, row)
+                    col_type = TEXT
+                else:
+                    col_type = next(c.type for c in schema.columns if c.name == col_name)
+                    actual   = row.get(col_name)
                 if col_type == TEXT:
                     if str(actual) != str(val):
                         match = False; break
