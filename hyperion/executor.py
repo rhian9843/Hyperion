@@ -6,6 +6,7 @@ from typing import Any
 from .database import Database
 from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, _make_index_key
 from .expr import eval_expr, is_expr
+from .json_funcs import json_each_rows as _json_each_rows
 from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
@@ -389,9 +390,40 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     return result
 
 
+_JSON_EACH_RE = re.compile(r'^(json_each|json_tree)\s*\((.+)\)\s*$', re.IGNORECASE | re.DOTALL)
+
+
 def _materialize_table(tname: str, db: "Database", ctes: dict,
                         alias: str | None = None) -> list[dict]:
-    """Return rows for a real table or CTE, with optional alias prefix."""
+    """Return rows for a real table, CTE, view, or table-valued function."""
+    m = _JSON_EACH_RE.match(tname)
+    if m:
+        args_str = m.group(2).strip()
+        # Split on comma respecting nested parens/quotes
+        parts: list[str] = []
+        depth = 0; buf: list[str] = []; in_str = False; i = 0
+        while i < len(args_str):
+            ch = args_str[i]
+            if in_str:
+                buf.append(ch)
+                if ch == "'":
+                    if i + 1 < len(args_str) and args_str[i + 1] == "'":
+                        buf.append(args_str[i + 1]); i += 2; continue
+                    in_str = False
+            elif ch == "'": in_str = True; buf.append(ch)
+            elif ch == "(": depth += 1; buf.append(ch)
+            elif ch == ")": depth -= 1; buf.append(ch)
+            elif ch == "," and depth == 0: parts.append("".join(buf).strip()); buf = []
+            else: buf.append(ch)
+            i += 1
+        if buf: parts.append("".join(buf).strip())
+        json_val = eval_expr(parts[0], {}) if parts else None
+        path     = eval_expr(parts[1], {}) if len(parts) >= 2 else "$"
+        raw = _json_each_rows(json_val, str(path) if path else "$")
+        if alias:
+            return [{f"{alias}.{k}": v for k, v in row.items()} for row in raw]
+        return raw
+
     if tname in ctes:
         cte_ast = ctes[tname]
         raw = _rows_for_stmt(cte_ast, db, ctes)
@@ -421,8 +453,10 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
     on_right = stmt.get("on_right")
     join_type = stmt.get("join_type", "INNER")
 
-    left_rows  = _materialize_table(ltbl, db, ctes)
-    right_rows = _materialize_table(rtbl, db, ctes)
+    left_rows = _materialize_table(ltbl, db, ctes)
+    # Detect lateral TVF: right side may be correlated (e.g. json_each(t.col))
+    _rtbl_is_tvf = bool(_JSON_EACH_RE.match(rtbl))
+    right_rows_static = None if _rtbl_is_tvf else _materialize_table(rtbl, db, ctes)
 
     # Prefix keys with alias so ON and WHERE can find them via both alias.col and col
     def _key(row: dict, col: str | None) -> object:
@@ -438,11 +472,22 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
                 return v
         return None
 
+    def _right_rows_for(lr: dict) -> list[dict]:
+        if not _rtbl_is_tvf:
+            return right_rows_static  # type: ignore[return-value]
+        # Lateral TVF: substitute column references in the TVF call from lr
+        m = _JSON_EACH_RE.match(rtbl)
+        assert m
+        args_str = m.group(2).strip()
+        resolved = eval_expr(args_str, lr)
+        return _json_each_rows(resolved)
+
     result: list[dict] = []
     matched_right: set[int] = set()
     for lr in left_rows:
         matched = False
         lval = _key(lr, on_left)
+        right_rows = _right_rows_for(lr)
         for ri, rr in enumerate(right_rows):
             rval = _key(rr, on_right)
             if on_left is None or lval == rval:
@@ -461,8 +506,8 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
                 merged[f"{lalias}.{k.split('.')[-1]}"] = v
             result.append(merged)
 
-    if join_type in ("RIGHT", "RIGHT OUTER"):
-        for ri, rr in enumerate(right_rows):
+    if join_type in ("RIGHT", "RIGHT OUTER") and right_rows_static is not None:
+        for ri, rr in enumerate(right_rows_static):
             if ri not in matched_right:
                 merged = dict(rr)
                 for k, v in rr.items():
@@ -488,7 +533,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         return _exec_recursive_cte(stmt, db, ctes)
     if op == "SELECT_NOFROM":
         row: dict = {}
-        return [{col: eval_expr(col, row) for col in (stmt.get("columns") or [])}]
+        col_aliases = stmt.get("col_aliases") or {}
+        result = {col: eval_expr(col, row) for col in (stmt.get("columns") or [])}
+        return [{col_aliases.get(k, k): v for k, v in result.items()}]
     if op == "SELECT":
         if stmt.get("subquery_from"):
             return _exec_derived_table(stmt, db, ctes)
@@ -498,15 +545,22 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         if tbl in db.views:
             view_ast = _parse_tokens(_tokenize(db.views[tbl]))
             return _exec_cte_select(stmt, view_ast, db, ctes)
-        return db.select(stmt["table"], stmt["columns"], stmt["where"],
-                         stmt.get("order_by"), stmt.get("limit"),
-                         stmt.get("group_by"), stmt.get("having"),
-                         stmt.get("distinct", False), stmt.get("offset"))
+        if _JSON_EACH_RE.match(tbl):
+            return _exec_cte_select(stmt, {"op": "INLINE_ROWS", "rows": _materialize_table(tbl, db, ctes)}, db, ctes)
+        col_aliases = stmt.get("col_aliases") or {}
+        raw = db.select(stmt["table"], stmt["columns"], stmt["where"],
+                        stmt.get("order_by"), stmt.get("limit"),
+                        stmt.get("group_by"), stmt.get("having"),
+                        stmt.get("distinct", False), stmt.get("offset"))
+        if col_aliases:
+            raw = [{col_aliases.get(k, k): v for k, v in row.items()} for row in raw]
+        return raw
     if op == "JOIN":
-        # If either join table is a CTE, materialize and do an in-memory join
+        # If either join table is a CTE, view, or table-valued function, use in-memory join
         ltbl = stmt.get("left_table", "")
         rtbl = stmt.get("right_table", "")
-        if ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views:
+        if (ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views
+                or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl)):
             return _exec_in_memory_join(stmt, db, ctes)
         stmt = optimize_join(stmt, db)      # cost-based join reordering
         extra = stmt.get("extra_joins", [])

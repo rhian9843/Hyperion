@@ -30,6 +30,28 @@ _ALIAS_BLOCKLIST = frozenset({
     "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM",
 })
 
+_JSON_EACH_RE_PARSER = re.compile(r'^(json_each|json_tree)\s*\(', re.IGNORECASE)
+
+
+_TABLE_VALUED_FUNCS = frozenset({"JSON_EACH", "JSON_TREE"})
+
+
+def _collect_func_call(tokens: list[str], name: str, pos: int) -> tuple[str, int]:
+    """If tokens[pos] == '(' and name is a table-valued function, collect the full
+    'name(...)' expression as a single string and return (expr, pos_after_close)."""
+    if pos >= len(tokens) or tokens[pos] != "(":
+        return name, pos
+    parts = [name, "("]
+    pos += 1
+    depth = 1
+    while pos < len(tokens) and depth > 0:
+        tok = tokens[pos]
+        parts.append(tok)
+        if tok == "(":   depth += 1
+        elif tok == ")": depth -= 1
+        pos += 1
+    return "".join(parts), pos
+
 
 def _parse_table_alias(tokens: list[str], pos: int, table: str) -> tuple[str, int]:
     """Consume an optional [AS] alias after a table name.  Returns (alias, new_pos)."""
@@ -1191,6 +1213,9 @@ def _parse_tokens(t: list[str]) -> dict:
             }
 
         table = t[i]; i += 1
+        # Table-valued functions: json_each(...), json_tree(...)
+        if table.upper() in _TABLE_VALUED_FUNCS:
+            table, i = _collect_func_call(t, table, i)
         left_alias, i = _parse_table_alias(t, i, table)
 
         # Multi-table implicit FROM: SELECT * FROM a, b WHERE a.id = b.id
@@ -1249,9 +1274,12 @@ def _parse_tokens(t: list[str]) -> dict:
                 join_type = "INNER"; i += 1
         if join_type is not None:
             right_table = t[i]; i += 1
+            if right_table.upper() in _TABLE_VALUED_FUNCS:
+                right_table, i = _collect_func_call(t, right_table, i)
             right_alias, i = _parse_table_alias(t, i, right_table)
             on_left = on_right = None
-            if join_type not in ("CROSS", "NATURAL"):
+            _is_tvf = _JSON_EACH_RE_PARSER.match(right_table) is not None
+            if join_type not in ("CROSS", "NATURAL") and not _is_tvf:
                 if i >= len(t) or t[i].upper() != "ON":
                     raise ParseError(f"Expected ON after {right_table} for {join_type} JOIN")
                 i += 1

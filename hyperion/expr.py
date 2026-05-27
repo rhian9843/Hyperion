@@ -5,6 +5,8 @@ import re
 from datetime import datetime
 from typing import Any
 
+from .json_funcs import eval_json_func as _eval_json_func
+
 _ARITH_OPS = frozenset({"+", "-", "*", "/", "%", "||"})
 _COMP_OPS  = frozenset({"=", "!=", "<", ">", "<=", ">="})
 
@@ -359,6 +361,11 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
         if isinstance(v, bytes):
             return "blob"
         return "text"
+
+    # ── JSON functions ─────────────────────────────────────────────────────────
+
+    if fname.upper().startswith("JSON"):
+        return _eval_json_func(fname, args)
 
     return None  # unknown function → NULL
 
