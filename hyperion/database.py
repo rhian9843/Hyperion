@@ -30,6 +30,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # Each entry: (name, page_snapshots, dirty_set, catalog_bytes, catalog_extra)
         self._savepoints: list[tuple] = []
         self.fk_enforcement  = True
+        self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
+        self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -133,6 +135,46 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def executescript(self, sql: str) -> "Cursor":
         return self.cursor().executescript(sql)
+
+    def set_authorizer(self, fn) -> None:
+        """Register an authorizer callback invoked before each SQL operation.
+
+        fn(action_code, table, column, db_name, trigger_name) -> int
+        Return SQLITE_OK (0) to allow, SQLITE_DENY (1) to raise an error,
+        or SQLITE_IGNORE (2) to silently skip the operation.
+        Pass None to remove the authorizer.
+        """
+        self._authorizer = fn
+
+    def iterdump(self):
+        """Yield SQL statements that recreate the full database (like sqlite3.iterdump)."""
+        from .schema import deserialize_row
+        from .introspect import _schema_to_sql, _trigger_to_sql
+        from .cursor import _sql_literal
+
+        yield "BEGIN TRANSACTION;"
+
+        for tname, tmeta in self._catalog.tables.items():
+            yield _schema_to_sql(tname, tmeta.schema, tmeta.temporary) + ";"
+            for _, raw in self._table_btree(tmeta).scan():
+                row = deserialize_row(tmeta.schema, raw)
+                cols = [c.name for c in tmeta.schema.columns if not c.is_generated]
+                vals = ", ".join(_sql_literal(row.get(c)) for c in cols)
+                yield f"INSERT INTO \"{tname}\" VALUES ({vals});"
+
+        for iname, imeta in self._catalog.indexes.items():
+            if iname.startswith("_pk_"):
+                continue  # auto-created by CREATE TABLE PRIMARY KEY
+            cols = ", ".join(imeta.columns)
+            yield f"CREATE INDEX \"{iname}\" ON \"{imeta.table_name}\" ({cols});"
+
+        for vname, vsql in self._catalog.views.items():
+            yield f"CREATE VIEW \"{vname}\" AS {vsql};"
+
+        for trig_name, tmeta in self._catalog.triggers.items():
+            yield _trigger_to_sql(trig_name, tmeta) + ";"
+
+        yield "COMMIT;"
 
     # ── Context manager ───────────────────────────────────────────────────────
 

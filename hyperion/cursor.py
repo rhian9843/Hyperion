@@ -109,7 +109,8 @@ _SELECT_OPS = frozenset({"SELECT", "SELECT_NOFROM", "JOIN", "SET_OP",
 # ── Cursor ────────────────────────────────────────────────────────────────────
 
 class Cursor:
-    """PEP 249-compatible cursor. Rows are returned as dicts (key = column name)."""
+    """PEP 249-compatible cursor. Rows are returned as dicts by default;
+    set db.row_factory to change the format."""
 
     def __init__(self, db: "Database") -> None:
         self._db = db
@@ -118,6 +119,7 @@ class Cursor:
         self.description: tuple | None = None
         self.rowcount: int = -1
         self.lastrowid: int | None = None
+        self.row_factory = db.row_factory  # snapshot at creation time
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
@@ -125,10 +127,18 @@ class Cursor:
         from .parser import parse
         from .executor import execute as _exec, _rows_for_stmt
         from .introspect import explain_plan
+        from .auth import check_authorizer, SQLITE_IGNORE
 
         bound = _bind_params(sql, params) if params is not None else sql
         stmt = parse(bound)
         op = stmt.get("op", "")
+
+        # SELECT ops bypass executor.execute, so authorizer must be checked here
+        if op in _SELECT_OPS and self._db._authorizer is not None:
+            if check_authorizer(self._db._authorizer, stmt) == SQLITE_IGNORE:
+                self._result = []; self._pos = 0
+                self.description = None; self.rowcount = -1
+                return self
 
         if op in _SELECT_OPS:
             rows = _rows_for_stmt(stmt, self._db)
@@ -174,22 +184,22 @@ class Cursor:
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
-    def fetchone(self) -> dict | None:
+    def fetchone(self) -> Any:
         if self._pos >= len(self._result):
             return None
         row = self._result[self._pos]
         self._pos += 1
-        return row
+        return self._apply_factory(row)
 
-    def fetchmany(self, size: int = 1) -> list[dict]:
+    def fetchmany(self, size: int = 1) -> list:
         chunk = self._result[self._pos:self._pos + size]
         self._pos += len(chunk)
-        return chunk
+        return [self._apply_factory(r) for r in chunk]
 
-    def fetchall(self) -> list[dict]:
+    def fetchall(self) -> list:
         remaining = self._result[self._pos:]
         self._pos = len(self._result)
-        return remaining
+        return [self._apply_factory(r) for r in remaining]
 
     def close(self) -> None:
         self._result = []
@@ -198,13 +208,18 @@ class Cursor:
     def __iter__(self) -> "Cursor":
         return self
 
-    def __next__(self) -> dict:
+    def __next__(self) -> Any:
         row = self.fetchone()
         if row is None:
             raise StopIteration
         return row
 
     # ── Internal ──────────────────────────────────────────────────────────────
+
+    def _apply_factory(self, row: dict) -> Any:
+        if self.row_factory is None:
+            return row
+        return self.row_factory(self, row)
 
     def _set_select_result(self, rows: list[dict]) -> None:
         self._result = rows

@@ -718,6 +718,12 @@ _ANALYZE_NULL_SENTINEL = object()
 def execute(stmt: dict, db: Database) -> str:
     op = stmt["op"]
 
+    # Authorizer check (DML/DDL ops; SELECT ops are checked in Cursor.execute)
+    if db._authorizer is not None:
+        from .auth import check_authorizer, SQLITE_IGNORE
+        if check_authorizer(db._authorizer, stmt) == SQLITE_IGNORE:
+            return ""
+
     # Transaction control — never auto-wrapped
     if op == "BEGIN":
         db.begin()

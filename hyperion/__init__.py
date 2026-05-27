@@ -17,6 +17,14 @@ from .encoding import (
 )
 from .database import Database
 from .cursor import Cursor, _bind_params, _sql_literal
+from .row import Row, dict_factory, tuple_factory
+from .auth import (
+    SQLITE_OK, SQLITE_DENY, SQLITE_IGNORE,
+    SQLITE_SELECT, SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE,
+    SQLITE_CREATE_TABLE, SQLITE_DROP_TABLE,
+    SQLITE_CREATE_INDEX, SQLITE_DROP_INDEX,
+    SQLITE_READ, SQLITE_TRANSACTION,
+)
 from .expr import eval_expr, is_expr
 from .where import (
     WhereClause,
