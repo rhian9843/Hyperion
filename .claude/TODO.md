@@ -137,9 +137,9 @@
 
 ## Python DB-API / Convenience Layer
 
-- [ ] PEP 249 cursor interface — `db.execute(sql)` / `db.executemany(sql, params)` / `db.executescript(sql)` returning cursor objects with `.fetchone()`, `.fetchall()`, `.fetchmany(n)`, `.rowcount`, `.description` (column name/type metadata)
-- [ ] Parameter binding — positional `?` and named `:name` / `$name` placeholders so values are passed safely without string formatting (`db.execute("SELECT * FROM t WHERE id = ?", (1,))`)
-- [ ] Context manager — `with Database(":memory:") as db:` auto-closes; `with db:` wraps an implicit transaction (commit on exit, rollback on exception)
+- [x] PEP 249 cursor interface — `db.execute(sql)` / `db.executemany(sql, params)` / `db.executescript(sql)` returning cursor objects with `.fetchone()`, `.fetchall()`, `.fetchmany(n)`, `.rowcount`, `.description` (column name/type metadata)
+- [x] Parameter binding — positional `?` and named `:name` / `$name` placeholders so values are passed safely without string formatting (`db.execute("SELECT * FROM t WHERE id = ?", (1,))`)
+- [x] Context manager — `with Database(":memory:") as db:` auto-closes; `with db:` wraps an implicit transaction (commit on exit, rollback on exception)
 - [ ] `db.row_factory` — pluggable row format; default tuple, built-ins for `dict` and named-access rows; user-assignable callable
 - [ ] `db.set_authorizer(fn)` — callback invoked per SQL operation; return allow/deny/ignore to gate access (security hook, mirrors sqlite3)
 - [ ] `db.iterdump()` — yield SQL statements that recreate the full database; useful for backup, migration, and test fixtures

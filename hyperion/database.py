@@ -1,6 +1,9 @@
 import struct
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from .cursor import Cursor
 
 from .constants import PAGE_SIZE
 from .btree import BTree
@@ -115,6 +118,37 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         """
         from .expr import _USER_AGGS
         _USER_AGGS[name.upper()] = (n_args, aggregate_class)
+
+    # ── PEP 249 DB-API ────────────────────────────────────────────────────────
+
+    def cursor(self) -> "Cursor":
+        from .cursor import Cursor
+        return Cursor(self)
+
+    def execute(self, sql: str, params=None) -> "Cursor":
+        return self.cursor().execute(sql, params)
+
+    def executemany(self, sql: str, params_seq) -> "Cursor":
+        return self.cursor().executemany(sql, params_seq)
+
+    def executescript(self, sql: str) -> "Cursor":
+        return self.cursor().executescript(sql)
+
+    # ── Context manager ───────────────────────────────────────────────────────
+
+    def __enter__(self) -> "Database":
+        if not self.in_transaction:
+            self.begin()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb) -> bool:
+        if exc_type is None:
+            if self.in_transaction:
+                self.commit()
+        else:
+            if self.in_transaction:
+                self.rollback()
+        return False
 
     def _find_savepoint(self, name: str) -> int:
         for i in range(len(self._savepoints) - 1, -1, -1):
