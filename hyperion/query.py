@@ -2,6 +2,8 @@ import re
 import struct
 from typing import Any
 
+from .where import WhereClause
+
 from .schema import deserialize_row
 from .constants import TEXT
 from .encoding import (

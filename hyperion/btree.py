@@ -1,6 +1,8 @@
 import struct
 from typing import Callable, Iterator
 
+from .pager import Pager
+
 from .constants import PAGE_SIZE
 
 

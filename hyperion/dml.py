@@ -1,6 +1,8 @@
 import struct
 from typing import Any
 
+from .where import WhereClause
+
 from .schema import Schema, serialize_row, deserialize_row
 from .constants import INTEGER, REAL
 from .encoding import _encode_composite_key, _make_index_key
