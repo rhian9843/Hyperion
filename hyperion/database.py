@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from .cursor import Cursor
 
-from .constants import (PAGE_SIZE, ROW_CELL_SIZE, ROW_INLINE_CAP,
+from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
@@ -20,11 +20,11 @@ from .query import QueryMixin
 # Page-0 header: [next_schema_pn: 4][schema_chunk_len: 4][ops_pn: 4][magic: 4]
 _CAT0_HDR    = 16
 _CAT0_MAGIC  = 0xCAFEBABE           # distinguishes split format from old format
-_CAT0_CHUNK  = PAGE_SIZE - _CAT0_HDR
+_CAT0_CHUNK  = PAGE_SIZE - _CAT0_HDR - PAGE_CKSUM_SZ  # 4076
 
 # Extra schema/ops pages share the same compact header
 _CAT_HDR     = 8                    # [next_pn: 4][chunk_len: 4]
-_CAT_CHUNK   = PAGE_SIZE - _CAT_HDR
+_CAT_CHUNK   = PAGE_SIZE - _CAT_HDR - PAGE_CKSUM_SZ    # 4084
 
 
 class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):

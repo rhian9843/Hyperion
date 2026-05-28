@@ -3,7 +3,7 @@ from typing import Callable, Iterator
 
 from .pager import Pager
 
-from .constants import PAGE_SIZE
+from .constants import PAGE_SIZE, PAGE_CKSUM_SZ
 
 
 class BTree:
@@ -20,9 +20,10 @@ class BTree:
         self._rs       = row_size
         self._key_sz   = key_sz
         self._int_cell = key_sz + self.CHILD_SZ
-        self._int_max  = (PAGE_SIZE - self.HDR) // self._int_cell
+        _body          = PAGE_SIZE - PAGE_CKSUM_SZ   # usable area excl. CRC footer
+        self._int_max  = (_body - self.HDR) // self._int_cell
         self._lcs      = key_sz + row_size
-        self._lmax     = (PAGE_SIZE - self.HDR) // self._lcs
+        self._lmax     = (_body - self.HDR) // self._lcs
         self._lmin     = self._lmax // 2
         self._imin     = self._int_max // 2
         self._alloc    = alloc

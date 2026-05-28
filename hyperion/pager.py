@@ -2,6 +2,7 @@ import struct
 from pathlib import Path
 
 from .constants import PAGE_SIZE
+from .checksum import stamp_page, verify_page
 from .wal import WAL
 
 try:
@@ -38,6 +39,7 @@ class Pager:
             self._file.seek(num * PAGE_SIZE)
             chunk = self._file.read(PAGE_SIZE)
             page[: len(chunk)] = chunk
+            verify_page(page, num)
             self._cache[num] = page
         return self._cache[num]
 
@@ -86,6 +88,8 @@ class Pager:
         if not self._in_txn:
             raise RuntimeError("No active transaction")
         assert self._wal is not None
+        for page in self._working.values():
+            stamp_page(page)
         self._wal.commit_txn(self._working)
         self._cache.update(self._working)
         self._working.clear()

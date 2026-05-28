@@ -1,6 +1,8 @@
 # ── Storage constants ──────────────────────────────────────────────────────────
 
-PAGE_SIZE = 4096
+PAGE_SIZE      = 4096
+PAGE_CKSUM_SZ  = 4               # CRC-32 stored in last 4 bytes of every page
+PAGE_CKSUM_OFF = PAGE_SIZE - PAGE_CKSUM_SZ  # = 4092
 
 # ── Row cell format ────────────────────────────────────────────────────────────
 # Every table B-tree leaf stores a fixed ROW_CELL_SIZE-byte value per row.
@@ -16,7 +18,7 @@ ROW_CELL_SIZE  = 200           # 9-byte header + 191 bytes inline data
 
 PAGE_OVERFLOW    = 0x02
 OVERFLOW_HDR     = 9
-OVERFLOW_DATA_SZ = PAGE_SIZE - OVERFLOW_HDR   # 4087 bytes of payload per page
+OVERFLOW_DATA_SZ = PAGE_SIZE - OVERFLOW_HDR - PAGE_CKSUM_SZ  # 4083 bytes of payload per page
 
 # ── Column types ───────────────────────────────────────────────────────────────
 

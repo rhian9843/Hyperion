@@ -3,6 +3,7 @@ import struct
 from pathlib import Path
 
 from .constants import PAGE_SIZE
+from .checksum import verify_page
 
 
 class WAL:
@@ -91,6 +92,7 @@ class WAL:
             pn = struct.unpack_from("<I", frame)[0]
             if pn == self.COMMIT_PN:
                 for ppn, data in pending:
+                    verify_page(data, ppn)
                     db_file.seek(ppn * PAGE_SIZE)
                     db_file.write(data)
                 pending.clear()
@@ -145,6 +147,7 @@ class WAL:
                         pn = struct.unpack_from("<I", frame)[0]
                         if pn == cls.COMMIT_PN:
                             for ppn, data in pending:
+                                verify_page(data, ppn)
                                 db_file.seek(ppn * PAGE_SIZE)
                                 db_file.write(data)
                             pending.clear()

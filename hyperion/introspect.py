@@ -121,8 +121,16 @@ def hyperion_master_rows(db: "Database") -> list[dict]:
 # ── integrity_check ───────────────────────────────────────────────────────────
 
 def integrity_check(db: "Database") -> list[str]:
-    """Scan all B-trees for structural integrity. Returns ['ok'] or a list of errors."""
+    """Scan all B-trees for structural integrity and page checksums.
+    Returns ['ok'] or a list of error strings.
+    """
+    from .checksum import verify_page, CorruptPageError
+    from .encoding import _IDX_KEY_SZ
+    from .catalog import Catalog
+
     errors: list[str] = []
+
+    # ── B-tree structural checks ──────────────────────────────────────────────
 
     for tname, meta in db._catalog.tables.items():
         prev_key: int | None = None
@@ -158,6 +166,27 @@ def integrity_check(db: "Database") -> list[str]:
                 prev_ikey = ikey
         except Exception as exc:
             errors.append(f"index '{iname}': B-tree scan failed: {exc}")
+
+    # ── Page checksum scan ────────────────────────────────────────────────────
+    # Collect every known non-free page and verify its CRC.
+
+    known: set[int] = {Catalog.CATALOG_PAGE}
+    known.update(db._catalog_extra)
+    if db._catalog_ops_pn:
+        known.add(db._catalog_ops_pn)
+    known.update(db._catalog_ops_extra)
+    for tmeta in db._catalog.tables.values():
+        known.update(db._collect_tree_pages(tmeta.root_page))
+    for imeta in db._catalog.indexes.values():
+        known.update(db._collect_tree_pages(imeta.root_page, key_sz=_IDX_KEY_SZ))
+    free = set(db._catalog.free_pages)
+
+    for pn in sorted(known - free):
+        try:
+            page = db._pager.read_page(pn)
+            verify_page(page, pn)
+        except CorruptPageError as exc:
+            errors.append(str(exc))
 
     return errors if errors else ["ok"]
 
