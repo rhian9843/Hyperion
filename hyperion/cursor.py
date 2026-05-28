@@ -255,6 +255,11 @@ class Cursor:
     # ── Execution ─────────────────────────────────────────────────────────────
 
     def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
+        with self._db._lock:
+            return self._execute_inner(sql, params, timeout_ms)
+
+    def _execute_inner(self, sql: str, params=None,
+                       timeout_ms: int | None = None) -> "Cursor":
         from .parser import parse
         from .executor import execute as _exec, _iter_rows_for_stmt, QueryTimeoutError
         from .introspect import explain_plan
@@ -304,60 +309,65 @@ class Cursor:
         return self
 
     def executemany(self, sql: str, params_seq) -> "Cursor":
-        total = 0
-        for params in params_seq:
-            self.execute(sql, params)
-            if self.rowcount >= 0:
-                total += self.rowcount
-        self.rowcount = total
-        return self
+        with self._db._lock:
+            total = 0
+            for params in params_seq:
+                self._execute_inner(sql, params)
+                if self.rowcount >= 0:
+                    total += self.rowcount
+            self.rowcount = total
+            return self
 
     def executescript(self, sql: str) -> "Cursor":
-        from .repl import _split_statements
-        from .parser import parse
-        from .executor import execute as _exec
+        with self._db._lock:
+            from .repl import _split_statements
+            from .parser import parse
+            from .executor import execute as _exec
 
-        if self._db.in_transaction:
-            self._db.commit()
-        for part in _split_statements(sql):
-            part = part.strip()
-            if part:
-                _exec(parse(part), self._db)
-        self._result = []
-        self._pos = 0
-        self.description = None
-        self.rowcount = -1
-        return self
+            if self._db.in_transaction:
+                self._db.commit()
+            for part in _split_statements(sql):
+                part = part.strip()
+                if part:
+                    _exec(parse(part), self._db)
+            self._result = []
+            self._pos = 0
+            self.description = None
+            self.rowcount = -1
+            return self
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
     def fetchone(self) -> Any:
-        if self._iter is None:
-            return None
-        try:
-            return self._apply_factory(next(self._iter))
-        except StopIteration:
-            self._iter = None
-            return None
-
-    def fetchmany(self, size: int = 1) -> list:
-        if self._iter is None:
-            return []
-        rows: list = []
-        for _ in range(size):
+        with self._db._lock:
+            if self._iter is None:
+                return None
             try:
-                rows.append(self._apply_factory(next(self._iter)))
+                return self._apply_factory(next(self._iter))
             except StopIteration:
                 self._iter = None
-                break
-        return rows
+                return None
+
+    def fetchmany(self, size: int = 1) -> list:
+        with self._db._lock:
+            if self._iter is None:
+                return []
+            rows: list = []
+            for _ in range(size):
+                try:
+                    rows.append(self._apply_factory(next(self._iter)))
+                except StopIteration:
+                    self._iter = None
+                    break
+            return rows
 
     def fetchall(self) -> list:
-        if self._iter is None:
-            return []
-        rows = [self._apply_factory(r) for r in self._iter]
-        self._iter = None
-        return rows
+        with self._db._lock:
+            if self._iter is None:
+                return []
+            rows = [self._apply_factory(r) for r in self._iter]
+            self._iter = None
+            return rows
 
     def close(self) -> None:
         self._iter = None

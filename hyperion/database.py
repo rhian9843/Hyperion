@@ -1,4 +1,5 @@
 import struct
+import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -47,6 +48,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # Schema bytes cache: skip page writes when structure hasn't changed.
         # Ops are always written (they're small and change on every INSERT).
         self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
+        # Coarse-grained reentrant lock: serialises all public API calls so that
+        # two threads sharing one Database object don't corrupt _catalog,
+        # _txn_depth, _savepoints, _plan_cache, or pager state.
+        self._lock = threading.RLock()
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -55,65 +60,71 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         return self._txn_depth > 0
 
     def begin(self) -> None:
-        if self._txn_depth > 0:
-            raise RuntimeError("Transaction already active")
-        self._pager.begin()
-        self._txn_depth = 1
+        with self._lock:
+            if self._txn_depth > 0:
+                raise RuntimeError("Transaction already active")
+            self._pager.begin()
+            self._txn_depth = 1
 
     def commit(self) -> None:
-        if self._txn_depth == 0:
-            raise RuntimeError("No active transaction")
-        self._flush_catalog()
-        self._pager.commit()
-        self._txn_depth = 0
+        with self._lock:
+            if self._txn_depth == 0:
+                raise RuntimeError("No active transaction")
+            self._flush_catalog()
+            self._pager.commit()
+            self._txn_depth = 0
 
     def rollback(self) -> None:
-        if self._txn_depth == 0:
-            raise RuntimeError("No active transaction")
-        self._savepoints.clear()
-        self._pager.rollback()
-        self._reload_catalog()
-        self._txn_depth = 0
+        with self._lock:
+            if self._txn_depth == 0:
+                raise RuntimeError("No active transaction")
+            self._savepoints.clear()
+            self._pager.rollback()
+            self._reload_catalog()
+            self._txn_depth = 0
 
     # ── Savepoints ─────────────────────────────────────────────────────────────
 
     def savepoint(self, name: str) -> None:
-        if self._txn_depth == 0:
-            self._pager.begin()
-            self._txn_depth = 1
-        pages_snap = {n: bytes(self._pager._working[n])
-                      for n in self._pager._dirty if n in self._pager._working}
-        dirty_snap  = set(self._pager._dirty)
-        cat_bytes   = self._catalog.to_bytes()
-        cat_extra   = list(self._catalog_extra)
-        ops_pn      = self._catalog_ops_pn
-        ops_extra   = list(self._catalog_ops_extra)
-        self._savepoints.append(
-            (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
+        with self._lock:
+            if self._txn_depth == 0:
+                self._pager.begin()
+                self._txn_depth = 1
+            pages_snap = {n: bytes(self._pager._working[n])
+                          for n in self._pager._dirty if n in self._pager._working}
+            dirty_snap  = set(self._pager._dirty)
+            cat_bytes   = self._catalog.to_bytes()
+            cat_extra   = list(self._catalog_extra)
+            ops_pn      = self._catalog_ops_pn
+            ops_extra   = list(self._catalog_ops_extra)
+            self._savepoints.append(
+                (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
 
     def release_savepoint(self, name: str) -> None:
-        idx = self._find_savepoint(name)
-        del self._savepoints[idx:]
+        with self._lock:
+            idx = self._find_savepoint(name)
+            del self._savepoints[idx:]
 
     def rollback_to_savepoint(self, name: str) -> None:
-        idx = self._find_savepoint(name)
-        _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
-            self._savepoints[idx]
-        del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
-        # Evict pages added after the savepoint
-        for pn in set(self._pager._dirty) - dirty_snap:
-            self._pager._working.pop(pn, None)
-        # Restore snapshotted working pages to savepoint state
-        for pn, content in pages_snap.items():
-            self._pager._working[pn] = bytearray(content)
-        self._pager._dirty = set(dirty_snap)
-        # Restore catalog and page-chain metadata
-        self._catalog           = Catalog.from_bytes(cat_bytes)
-        self._catalog_extra     = list(cat_extra)
-        self._catalog_ops_pn    = ops_pn
-        self._catalog_ops_extra = list(ops_extra)
-        # Invalidate schema cache so the next commit forces a full schema write.
-        self._schema_flushed_bytes = b""
+        with self._lock:
+            idx = self._find_savepoint(name)
+            _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
+                self._savepoints[idx]
+            del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
+            # Evict pages added after the savepoint
+            for pn in set(self._pager._dirty) - dirty_snap:
+                self._pager._working.pop(pn, None)
+            # Restore snapshotted working pages to savepoint state
+            for pn, content in pages_snap.items():
+                self._pager._working[pn] = bytearray(content)
+            self._pager._dirty = set(dirty_snap)
+            # Restore catalog and page-chain metadata
+            self._catalog           = Catalog.from_bytes(cat_bytes)
+            self._catalog_extra     = list(cat_extra)
+            self._catalog_ops_pn    = ops_pn
+            self._catalog_ops_extra = list(ops_extra)
+            # Invalidate schema cache so the next commit forces a full schema write.
+            self._schema_flushed_bytes = b""
 
     # ── Application-defined functions ──────────────────────────────────────────
 
@@ -125,8 +136,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             n_args: Number of expected arguments, or -1 for variadic.
             fn:     Callable invoked with evaluated SQL arguments.
         """
-        from .expr import _USER_FUNCS
-        _USER_FUNCS[name.upper()] = (n_args, fn)
+        with self._lock:
+            from .expr import _USER_FUNCS
+            _USER_FUNCS[name.upper()] = (n_args, fn)
 
     def create_aggregate(self, name: str, n_args: int, aggregate_class) -> None:
         """Register a custom aggregate function callable from SQL GROUP BY.
@@ -141,8 +153,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             n_args:          Number of per-row arguments, or -1 for variadic.
             aggregate_class: Class implementing the aggregate protocol.
         """
-        from .expr import _USER_AGGS
-        _USER_AGGS[name.upper()] = (n_args, aggregate_class)
+        with self._lock:
+            from .expr import _USER_AGGS
+            _USER_AGGS[name.upper()] = (n_args, aggregate_class)
 
     # ── PEP 249 DB-API ────────────────────────────────────────────────────────
 
@@ -167,10 +180,16 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         or SQLITE_IGNORE (2) to silently skip the operation.
         Pass None to remove the authorizer.
         """
-        self._authorizer = fn
+        with self._lock:
+            self._authorizer = fn
 
     def iterdump(self):
         """Yield SQL statements that recreate the full database (like sqlite3.iterdump)."""
+        with self._lock:
+            lines = list(self._iterdump_inner())
+        yield from lines
+
+    def _iterdump_inner(self):
         from .schema import deserialize_row
         from .introspect import _schema_to_sql, _trigger_to_sql
         from .cursor import _sql_literal
@@ -581,33 +600,40 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def create_view(self, name: str, sql: str,
                     if_not_exists: bool = False,
                     or_replace: bool = False) -> None:
-        if name in self._catalog.views:
-            if or_replace:
-                pass  # overwrite below
-            elif if_not_exists:
-                return
-            else:
-                raise RuntimeError(f"View '{name}' already exists")
-        self._catalog.views[name] = sql
+        with self._lock:
+            if name in self._catalog.views:
+                if or_replace:
+                    pass  # overwrite below
+                elif if_not_exists:
+                    return
+                else:
+                    raise RuntimeError(f"View '{name}' already exists")
+            self._catalog.views[name] = sql
 
     def drop_view(self, name: str, if_exists: bool = False) -> None:
-        if name not in self._catalog.views:
-            if if_exists:
-                return
-            raise RuntimeError(f"No such view: '{name}'")
-        del self._catalog.views[name]
+        with self._lock:
+            if name not in self._catalog.views:
+                if if_exists:
+                    return
+                raise RuntimeError(f"No such view: '{name}'")
+            del self._catalog.views[name]
 
     def close(self) -> None:
-        temp_tables = [n for n, m in self._catalog.tables.items() if m.temporary]
-        if temp_tables:
-            self.begin()
-            for name in temp_tables:
-                self.drop_table(name)
-            self.commit()
-        self._pager.close()
+        with self._lock:
+            temp_tables = [n for n, m in self._catalog.tables.items() if m.temporary]
+            if temp_tables:
+                self.begin()
+                for name in temp_tables:
+                    self.drop_table(name)
+                self.commit()
+            self._pager.close()
 
     def vacuum(self) -> str:
         """Rebuild the database file compactly, reclaiming space from deleted rows."""
+        with self._lock:
+            return self._vacuum_inner()
+
+    def _vacuum_inner(self) -> str:
         import tempfile, shutil
         from .schema import deserialize_row
 
