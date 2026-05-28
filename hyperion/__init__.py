@@ -139,6 +139,7 @@ from .errors import (
     DataError, TransactionError, AuthorizationError, InternalError,
 )
 from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError
+from .async_db import AsyncDatabase, AsyncCursor
 from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
