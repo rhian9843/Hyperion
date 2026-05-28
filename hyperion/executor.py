@@ -13,6 +13,10 @@ class ReadOnlyError(RuntimeError):
     """Raised when a write operation is attempted on a read-only Database."""
 
 
+class TooManyRowsError(RuntimeError):
+    """Raised when a query result exceeds the configured max_rows limit."""
+
+
 _WRITE_OPS = frozenset({
     "INSERT", "INSERT_SELECT", "UPDATE", "DELETE", "TRUNCATE",
     "CREATE_TABLE", "CREATE_TABLE_AS_SELECT", "DROP_TABLE",

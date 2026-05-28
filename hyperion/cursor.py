@@ -238,6 +238,20 @@ def _infer_col_names(stmt: dict | None, db: "Database") -> list[str] | None:
     return None
 
 
+# ── Row guard ─────────────────────────────────────────────────────────────────
+
+def _guarded_iter(it, max_rows: int):
+    """Yield rows from *it*, raising TooManyRowsError on the (max_rows+1)-th row."""
+    from .executor import TooManyRowsError
+    for n, row in enumerate(it):
+        if n >= max_rows:
+            raise TooManyRowsError(
+                f"Query returned more than {max_rows} row{'s' if max_rows != 1 else ''} "
+                f"(max_rows={max_rows})"
+            )
+        yield row
+
+
 # ── Cursor ────────────────────────────────────────────────────────────────────
 
 class Cursor:
@@ -254,12 +268,14 @@ class Cursor:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
+    def execute(self, sql: str, params=None, timeout_ms: int | None = None,
+               max_rows: int | None = None) -> "Cursor":
         with self._db._lock:
-            return self._execute_inner(sql, params, timeout_ms)
+            return self._execute_inner(sql, params, timeout_ms, max_rows)
 
     def _execute_inner(self, sql: str, params=None,
-                       timeout_ms: int | None = None) -> "Cursor":
+                       timeout_ms: int | None = None,
+                       max_rows: int | None = None) -> "Cursor":
         from .parser import parse
         from .executor import execute as _exec, _iter_rows_for_stmt, QueryTimeoutError
         from .introspect import explain_plan
@@ -281,6 +297,9 @@ class Cursor:
         else:
             self._db._query_deadline = None
 
+        # Per-query max_rows overrides connection-level; None means no limit.
+        effective_max_rows = max_rows if max_rows is not None else self._db.max_rows
+
         try:
             # SELECT ops bypass executor.execute, so authorizer must be checked here
             if op in _SELECT_OPS and self._db._authorizer is not None:
@@ -290,7 +309,9 @@ class Cursor:
                     return self
 
             if op in _SELECT_OPS:
-                self._set_select_result(_iter_rows_for_stmt(stmt, self._db), stmt)
+                self._set_select_result(
+                    _iter_rows_for_stmt(stmt, self._db), stmt, effective_max_rows
+                )
             elif op == "EXPLAIN":
                 rows = explain_plan(stmt["stmt"], self._db)
                 self._set_select_result(iter(rows))
@@ -388,8 +409,12 @@ class Cursor:
             return row
         return self.row_factory(self, row)
 
-    def _set_select_result(self, row_iter, stmt: dict | None = None) -> None:
+    def _set_select_result(self, row_iter,
+                           stmt: dict | None = None,
+                           max_rows: int | None = None) -> None:
         """Store a row iterator; peek one row to populate description."""
+        from .executor import TooManyRowsError
+
         it = iter(row_iter)
         try:
             first = next(it)
@@ -407,4 +432,7 @@ class Cursor:
             (k, None, None, None, None, None, None) for k in col_names
         )
         self.rowcount = -1
-        self._iter = itertools.chain([first], it)
+        if max_rows is not None:
+            self._iter = _guarded_iter(itertools.chain([first], it), max_rows)
+        else:
+            self._iter = itertools.chain([first], it)

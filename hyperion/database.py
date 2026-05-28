@@ -50,6 +50,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         else:
             self._pager = Pager(Path(path))
         self._readonly = readonly
+        self.max_rows: int | None = None
         (self._catalog,
          self._catalog_extra,
          self._catalog_ops_pn,
@@ -202,8 +203,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         from .cursor import Cursor
         return Cursor(self)
 
-    def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
-        return self.cursor().execute(sql, params, timeout_ms=timeout_ms)
+    def execute(self, sql: str, params=None, timeout_ms: int | None = None,
+               max_rows: int | None = None) -> "Cursor":
+        return self.cursor().execute(sql, params, timeout_ms=timeout_ms, max_rows=max_rows)
 
     def executemany(self, sql: str, params_seq) -> "Cursor":
         return self.cursor().executemany(sql, params_seq)
