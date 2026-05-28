@@ -16,8 +16,14 @@ from .ddl import DDLMixin
 from .dml import DMLMixin
 from .query import QueryMixin
 
-_CAT_HDR   = 8
-_CAT_CHUNK = PAGE_SIZE - _CAT_HDR
+# Page-0 header: [next_schema_pn: 4][schema_chunk_len: 4][ops_pn: 4][magic: 4]
+_CAT0_HDR    = 16
+_CAT0_MAGIC  = 0xCAFEBABE           # distinguishes split format from old format
+_CAT0_CHUNK  = PAGE_SIZE - _CAT0_HDR
+
+# Extra schema/ops pages share the same compact header
+_CAT_HDR     = 8                    # [next_pn: 4][chunk_len: 4]
+_CAT_CHUNK   = PAGE_SIZE - _CAT_HDR
 
 
 class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
@@ -26,17 +32,21 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._pager: Pager | MemoryPager = MemoryPager()
         else:
             self._pager = Pager(Path(path))
-        self._catalog, self._catalog_extra = self._load_catalog()
+        (self._catalog,
+         self._catalog_extra,
+         self._catalog_ops_pn,
+         self._catalog_ops_extra) = self._load_catalog()
         self._txn_depth      = 0
-        # Each entry: (name, page_snapshots, dirty_set, catalog_bytes, catalog_extra)
+        # Each entry: (name, pages_snap, dirty_set, cat_bytes, cat_extra,
+        #              ops_pn, ops_extra)
         self._savepoints: list[tuple] = []
         self.fk_enforcement  = True
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
         self._plan_cache: dict[str, dict] = {}  # raw SQL template → parsed AST
-        # Catalog scalability: cache the last-flushed serialization so that
-        # commits where the catalog did not change skip all catalog page writes.
-        self._catalog_flushed_bytes: bytes = self._catalog.to_bytes()
+        # Schema bytes cache: skip page writes when structure hasn't changed.
+        # Ops are always written (they're small and change on every INSERT).
+        self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -73,10 +83,13 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._txn_depth = 1
         pages_snap = {n: bytes(self._pager._working[n])
                       for n in self._pager._dirty if n in self._pager._working}
-        dirty_snap = set(self._pager._dirty)
-        cat_bytes  = self._catalog.to_bytes()
-        cat_extra  = list(self._catalog_extra)
-        self._savepoints.append((name, pages_snap, dirty_snap, cat_bytes, cat_extra))
+        dirty_snap  = set(self._pager._dirty)
+        cat_bytes   = self._catalog.to_bytes()
+        cat_extra   = list(self._catalog_extra)
+        ops_pn      = self._catalog_ops_pn
+        ops_extra   = list(self._catalog_ops_extra)
+        self._savepoints.append(
+            (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
 
     def release_savepoint(self, name: str) -> None:
         idx = self._find_savepoint(name)
@@ -84,7 +97,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def rollback_to_savepoint(self, name: str) -> None:
         idx = self._find_savepoint(name)
-        _, pages_snap, dirty_snap, cat_bytes, cat_extra = self._savepoints[idx]
+        _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
+            self._savepoints[idx]
         del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
         # Evict pages added after the savepoint
         for pn in set(self._pager._dirty) - dirty_snap:
@@ -93,13 +107,13 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for pn, content in pages_snap.items():
             self._pager._working[pn] = bytearray(content)
         self._pager._dirty = set(dirty_snap)
-        # Restore catalog
-        self._catalog      = Catalog.from_bytes(cat_bytes)
-        self._catalog_extra = list(cat_extra)
-        # The catalog was restored to a prior state; _flush_catalog must not
-        # skip the write on the next commit even if the bytes match the last
-        # successfully flushed payload — so invalidate the cache.
-        self._catalog_flushed_bytes = b""
+        # Restore catalog and page-chain metadata
+        self._catalog           = Catalog.from_bytes(cat_bytes)
+        self._catalog_extra     = list(cat_extra)
+        self._catalog_ops_pn    = ops_pn
+        self._catalog_ops_extra = list(ops_extra)
+        # Invalidate schema cache so the next commit forces a full schema write.
+        self._schema_flushed_bytes = b""
 
     # ── Application-defined functions ──────────────────────────────────────────
 
@@ -207,12 +221,67 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 return i
         raise RuntimeError(f"No such savepoint: '{name}'")
 
-    def _load_catalog(self) -> tuple["Catalog", list[int]]:
-        data   = b""
+    def _load_catalog(self) -> "tuple[Catalog, list[int], int, list[int]]":
+        """Load catalog from pages.  Returns (catalog, schema_extras, ops_pn, ops_extras).
+
+        Detects old (combined-JSON) vs. new (split schema+ops) on-disk format via
+        a magic constant at bytes 12-15 of page 0.
+        """
+        page0 = self._pager.read_page(Catalog.CATALOG_PAGE)
+        magic = struct.unpack_from("I", page0, 12)[0]
+
+        if magic == _CAT0_MAGIC:
+            return self._load_catalog_split(page0)
+        else:
+            return self._load_catalog_legacy()
+
+    def _load_catalog_split(self, page0: bytearray) \
+            -> "tuple[Catalog, list[int], int, list[int]]":
+        """Load new split-format catalog from page 0."""
+        next_schema_pn = struct.unpack_from("I", page0, 0)[0]
+        schema_len     = struct.unpack_from("I", page0, 4)[0]
+        ops_pn         = struct.unpack_from("I", page0, 8)[0]
+
+        # Schema chain
+        schema_data    = bytes(page0[_CAT0_HDR: _CAT0_HDR + schema_len])
+        schema_extras: list[int] = []
+        pn = next_schema_pn
+        while pn:
+            page      = self._pager.read_page(pn)
+            next_pn   = struct.unpack_from("I", page, 0)[0]
+            chunk_len = struct.unpack_from("I", page, 4)[0]
+            if chunk_len:
+                schema_data += bytes(page[_CAT_HDR: _CAT_HDR + chunk_len])
+            schema_extras.append(pn)
+            pn = next_pn
+
+        # Ops chain
+        ops_data    = b""
+        ops_extras: list[int] = []
+        if ops_pn:
+            pn = ops_pn
+            first = True
+            while pn:
+                page      = self._pager.read_page(pn)
+                next_pn   = struct.unpack_from("I", page, 0)[0]
+                chunk_len = struct.unpack_from("I", page, 4)[0]
+                if chunk_len:
+                    ops_data += bytes(page[_CAT_HDR: _CAT_HDR + chunk_len])
+                if not first:
+                    ops_extras.append(pn)
+                first = False
+                pn = next_pn
+
+        cat = Catalog.from_schema_and_ops_bytes(schema_data, ops_data)
+        return cat, schema_extras, ops_pn, ops_extras
+
+    def _load_catalog_legacy(self) -> "tuple[Catalog, list[int], int, list[int]]":
+        """Load old combined-JSON catalog (backward compatibility)."""
+        data: bytes = b""
         extras: list[int] = []
-        pn     = Catalog.CATALOG_PAGE
+        pn = Catalog.CATALOG_PAGE
         while True:
-            page      = self._pager.get_page(pn)
+            page      = self._pager.read_page(pn)
             next_pn   = struct.unpack_from("I", page, 0)[0]
             chunk_len = struct.unpack_from("I", page, 4)[0]
             if chunk_len:
@@ -221,23 +290,60 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 break
             extras.append(next_pn)
             pn = next_pn
-        return Catalog.from_bytes(data), extras
+        return Catalog.from_bytes(data), extras, 0, []
 
     def _reload_catalog(self) -> None:
-        self._catalog, self._catalog_extra = self._load_catalog()
-        # Keep the flushed-bytes cache in sync with the reloaded on-disk state.
-        self._catalog_flushed_bytes = self._catalog.to_bytes()
+        (self._catalog,
+         self._catalog_extra,
+         self._catalog_ops_pn,
+         self._catalog_ops_extra) = self._load_catalog()
+        self._schema_flushed_bytes = self._catalog.schema_to_bytes()
+
+    # ── Catalog flush — schema and ops written independently ──────────────────
 
     def _flush_catalog(self) -> None:
-        payload = self._catalog.to_bytes()
-        # Skip all page writes when the catalog hasn't changed since the last flush.
-        # This is the common case for pure DML (INSERT/UPDATE/DELETE) commits where
-        # no DDL or page allocation has occurred.
-        if payload == self._catalog_flushed_bytes:
-            return
+        """Flush catalog to pages.
 
+        Schema pages: written only when structural definitions changed (DDL).
+        Ops pages: written on every commit — small regardless of schema size.
+        """
+        # Ensure ops page is allocated before writing page 0 (schema flush
+        # writes page 0, which must carry the correct ops_pn).
+        if self._catalog_ops_pn == 0:
+            self._catalog_ops_pn = self._alloc_page()
+
+        new_schema = self._catalog.schema_to_bytes()
+        if new_schema != self._schema_flushed_bytes:
+            self._flush_schema(new_schema)
+            self._schema_flushed_bytes = new_schema
+        else:
+            # Schema unchanged; still need to refresh page 0 when ops_pn was
+            # just allocated above (its value changed from 0).
+            if self._pager._in_txn:
+                page0 = self._pager._working.get(Catalog.CATALOG_PAGE)
+                if page0 is None or struct.unpack_from("I", page0, 8)[0] != self._catalog_ops_pn:
+                    self._write_page0_header()
+
+        # Always flush ops (cheap — proportional to n_tables, not schema depth)
+        self._flush_ops()
+
+    def _write_page0_header(self) -> None:
+        """Write page 0's 16-byte header without touching the schema JSON chunk."""
+        page           = self._pager.get_page(Catalog.CATALOG_PAGE)
+        next_schema_pn = self._catalog_extra[0] if self._catalog_extra else 0
+        # Preserve the existing schema chunk length in the header
+        schema_len = struct.unpack_from("I", page, 4)[0]
+        struct.pack_into("I", page, 0, next_schema_pn)
+        struct.pack_into("I", page, 4, schema_len)
+        struct.pack_into("I", page, 8, self._catalog_ops_pn)
+        struct.pack_into("I", page, 12, _CAT0_MAGIC)
+        self._pager.flush(Catalog.CATALOG_PAGE)
+
+    def _flush_schema(self, payload: bytes) -> None:
+        """Write schema JSON to the schema page chain (page 0 + schema_extras)."""
         for _ in range(4):
-            n_needed = max(1, (len(payload) + _CAT_CHUNK - 1) // _CAT_CHUNK)
+            # Page 0 holds _CAT0_CHUNK bytes; extra pages hold _CAT_CHUNK each
+            n_needed = 1 + max(0, (len(payload) - _CAT0_CHUNK + _CAT_CHUNK - 1) // _CAT_CHUNK)
             n_have   = 1 + len(self._catalog_extra)
             if n_needed == n_have:
                 break
@@ -249,13 +355,65 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 self._catalog_extra = self._catalog_extra[:n_needed - 1]
                 for pn in freed:
                     self._free_page(pn)
-            payload = self._catalog.to_bytes()  # recompute after alloc/free
+            payload = self._catalog.schema_to_bytes()  # recompute after alloc/free
 
-        all_pns  = [Catalog.CATALOG_PAGE] + self._catalog_extra
-        chunks   = [payload[i: i + _CAT_CHUNK]
-                    for i in range(0, len(payload), _CAT_CHUNK)]
+        # Build chunk list: first chunk is _CAT0_CHUNK, rest are _CAT_CHUNK
+        chunks: list[bytes] = []
+        if payload:
+            chunks.append(payload[:_CAT0_CHUNK])
+            rest = payload[_CAT0_CHUNK:]
+            chunks += [rest[i: i + _CAT_CHUNK]
+                       for i in range(0, len(rest), _CAT_CHUNK)]
+        else:
+            chunks = [b""]
+
+        all_pns = [Catalog.CATALOG_PAGE] + self._catalog_extra
         while len(chunks) < len(all_pns):
             chunks.append(b"")
+
+        for i, (pn, chunk) in enumerate(zip(all_pns, chunks)):
+            page    = self._pager.get_page(pn)
+            next_pn = all_pns[i + 1] if i + 1 < len(all_pns) else 0
+            if pn == Catalog.CATALOG_PAGE:
+                # 16-byte header on page 0
+                struct.pack_into("I", page, 0,  next_pn)
+                struct.pack_into("I", page, 4,  len(chunk))
+                struct.pack_into("I", page, 8,  self._catalog_ops_pn)
+                struct.pack_into("I", page, 12, _CAT0_MAGIC)
+                page[_CAT0_HDR: _CAT0_HDR + len(chunk)] = chunk
+                page[_CAT0_HDR + len(chunk):]            = bytearray(PAGE_SIZE - _CAT0_HDR - len(chunk))
+            else:
+                # 8-byte header on extra schema pages
+                struct.pack_into("I", page, 0, next_pn)
+                struct.pack_into("I", page, 4, len(chunk))
+                page[_CAT_HDR: _CAT_HDR + len(chunk)] = chunk
+                page[_CAT_HDR + len(chunk):]           = bytearray(PAGE_SIZE - _CAT_HDR - len(chunk))
+            self._pager.flush(pn)
+
+    def _flush_ops(self) -> None:
+        """Write operational-state JSON to the ops page chain."""
+        payload = self._catalog.ops_to_bytes()
+        for _ in range(4):
+            n_needed = max(1, (len(payload) + _CAT_CHUNK - 1) // _CAT_CHUNK)
+            n_have   = 1 + len(self._catalog_ops_extra)
+            if n_needed == n_have:
+                break
+            if n_needed > n_have:
+                for _ in range(n_needed - n_have):
+                    self._catalog_ops_extra.append(self._alloc_page())
+            else:
+                freed = self._catalog_ops_extra[n_needed - 1:]
+                self._catalog_ops_extra = self._catalog_ops_extra[:n_needed - 1]
+                for pn in freed:
+                    self._free_page(pn)
+            payload = self._catalog.ops_to_bytes()
+
+        all_pns = [self._catalog_ops_pn] + self._catalog_ops_extra
+        chunks  = [payload[i: i + _CAT_CHUNK]
+                   for i in range(0, len(payload), _CAT_CHUNK)]
+        while len(chunks) < len(all_pns):
+            chunks.append(b"")
+
         for i, (pn, chunk) in enumerate(zip(all_pns, chunks)):
             page    = self._pager.get_page(pn)
             next_pn = all_pns[i + 1] if i + 1 < len(all_pns) else 0
@@ -264,7 +422,6 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             page[_CAT_HDR: _CAT_HDR + len(chunk)] = chunk
             page[_CAT_HDR + len(chunk):]           = bytearray(PAGE_SIZE - _CAT_HDR - len(chunk))
             self._pager.flush(pn)
-        self._catalog_flushed_bytes = payload
 
     # ── Internal helpers (used by all mixins via self) ─────────────────────────
 
@@ -485,7 +642,11 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         shutil.move(str(tmp_path), str(path))
 
         self._pager = Pager(path)
-        self._catalog, self._catalog_extra = self._load_catalog()
+        (self._catalog,
+         self._catalog_extra,
+         self._catalog_ops_pn,
+         self._catalog_ops_extra) = self._load_catalog()
+        self._schema_flushed_bytes = self._catalog.schema_to_bytes()
         self._txn_depth = 0
         self._savepoints.clear()
         return "Database vacuumed."

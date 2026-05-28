@@ -289,21 +289,22 @@ def test_catalog_written_on_ddl():
 
 
 def test_catalog_flushed_bytes_tracks_state():
-    """_catalog_flushed_bytes should always equal the last committed catalog."""
+    """_schema_flushed_bytes should always equal the last committed schema blob."""
     db = Database(":memory:")
     db.execute("CREATE TABLE t (id INTEGER)")
 
-    # After CREATE TABLE (auto-committed), flushed_bytes should be current
-    assert db._catalog_flushed_bytes == db._catalog.to_bytes()
+    # After CREATE TABLE (auto-committed), schema bytes should be current
+    assert db._schema_flushed_bytes == db._catalog.schema_to_bytes()
 
-    # After an INSERT (auto-committed), flushed_bytes should still be current
+    # After an INSERT (auto-committed), schema bytes should still be current
+    # (INSERT doesn't change the schema blob, only the ops blob)
     db.execute("INSERT INTO t VALUES (1)")
-    assert db._catalog_flushed_bytes == db._catalog.to_bytes()
+    assert db._schema_flushed_bytes == db._catalog.schema_to_bytes()
 
 
 def test_catalog_flushed_bytes_reset_on_rollback():
-    """After rollback_to_savepoint, flushed_bytes is invalidated so the next
-    commit forces a catalog write even if bytes happen to match."""
+    """After rollback_to_savepoint, _schema_flushed_bytes is invalidated so the
+    next commit forces a schema write even if bytes happen to match."""
     db = Database(":memory:")
     db.execute("CREATE TABLE t (id INTEGER)")
     db.begin()
@@ -311,11 +312,11 @@ def test_catalog_flushed_bytes_reset_on_rollback():
     db.savepoint("sp")
     db.execute("INSERT INTO t VALUES (2)")
     db.rollback_to_savepoint("sp")
-    # flushed_bytes is invalidated by rollback_to_savepoint
-    assert db._catalog_flushed_bytes == b""
+    # _schema_flushed_bytes is invalidated by rollback_to_savepoint
+    assert db._schema_flushed_bytes == b""
     db.commit()
     # After commit, it's back in sync
-    assert db._catalog_flushed_bytes == db._catalog.to_bytes()
+    assert db._schema_flushed_bytes == db._catalog.schema_to_bytes()
 
 
 # ── WAL unit tests ────────────────────────────────────────────────────────────
