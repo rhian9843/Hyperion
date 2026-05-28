@@ -192,7 +192,7 @@
 
 - [x] Query timeout / cancellation — no mechanism to abort a query after a deadline; LLM-generated SQL can produce accidental cartesian joins or deep recursive CTEs that run indefinitely; needs a `timeout_ms` parameter on `execute()` and a cooperative check inside the execution loop
 - [ ] Max result rows guard — no built-in limit on rows returned; an agent issuing `SELECT * FROM large_table` will materialise the entire table in memory with no warning; needs a configurable `max_rows` on the `Database` or cursor level that raises before fetching
-- [ ] Read-only connection mode — no way to open a `Database` that is guaranteed never to write; LLM query agents should be able to operate in a mode where any INSERT / UPDATE / DELETE / DDL raises immediately rather than relying on the authorizer hook
+- [x] Read-only connection mode — no way to open a `Database` that is guaranteed never to write; LLM query agents should be able to operate in a mode where any INSERT / UPDATE / DELETE / DDL raises immediately rather than relying on the authorizer hook
 
 ### Usability for agents
 

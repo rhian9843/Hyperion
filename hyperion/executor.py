@@ -9,6 +9,22 @@ class QueryTimeoutError(RuntimeError):
     """Raised when a query exceeds its allotted execution time."""
 
 
+class ReadOnlyError(RuntimeError):
+    """Raised when a write operation is attempted on a read-only Database."""
+
+
+_WRITE_OPS = frozenset({
+    "INSERT", "INSERT_SELECT", "UPDATE", "DELETE", "TRUNCATE",
+    "CREATE_TABLE", "CREATE_TABLE_AS_SELECT", "DROP_TABLE",
+    "CREATE_INDEX", "DROP_INDEX",
+    "CREATE_VIEW", "DROP_VIEW",
+    "CREATE_TRIGGER", "DROP_TRIGGER",
+    "ALTER_ADD_COLUMN", "ALTER_DROP_COLUMN",
+    "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE",
+    "ANALYZE", "VACUUM",
+})
+
+
 def _check_timeout(db: "Database") -> None:
     deadline = getattr(db, "_query_deadline", None)
     if deadline is not None and time.monotonic() > deadline:
@@ -970,6 +986,12 @@ def execute(stmt: dict, db: Database) -> str:
         from .auth import check_authorizer, SQLITE_IGNORE
         if check_authorizer(db._authorizer, stmt) == SQLITE_IGNORE:
             return ""
+
+    # Read-only guard
+    if db._readonly and op in _WRITE_OPS:
+        raise ReadOnlyError(
+            f"Cannot execute {op} on a read-only database connection"
+        )
 
     # Transaction control — never auto-wrapped
     if op == "BEGIN":

@@ -27,12 +27,29 @@ _CAT_HDR     = 8                    # [next_pn: 4][chunk_len: 4]
 _CAT_CHUNK   = PAGE_SIZE - _CAT_HDR - PAGE_CKSUM_SZ    # 4084
 
 
+class _ReadOnlyContext:
+    __slots__ = ("_db", "_prev")
+
+    def __init__(self, db: "Database") -> None:
+        self._db = db
+
+    def __enter__(self) -> "Database":
+        self._prev = self._db._readonly
+        self._db._readonly = True
+        return self._db
+
+    def __exit__(self, *_) -> bool:
+        self._db._readonly = self._prev
+        return False
+
+
 class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
-    def __init__(self, path: "Path | str"):
+    def __init__(self, path: "Path | str", *, readonly: bool = False):
         if str(path) == ":memory:":
             self._pager: Pager | MemoryPager = MemoryPager()
         else:
             self._pager = Pager(Path(path))
+        self._readonly = readonly
         (self._catalog,
          self._catalog_extra,
          self._catalog_ops_pn,
@@ -52,6 +69,28 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # two threads sharing one Database object don't corrupt _catalog,
         # _txn_depth, _savepoints, _plan_cache, or pager state.
         self._lock = threading.RLock()
+
+    # ── Read-only toggle ──────────────────────────────────────────────────────
+
+    @property
+    def readonly(self) -> bool:
+        return self._readonly
+
+    @readonly.setter
+    def readonly(self, value: bool) -> None:
+        self._readonly = value
+
+    def as_readonly(self):
+        """Context manager: enforce read-only mode for the duration of the block.
+
+        Restores the previous readonly state on exit regardless of exceptions.
+
+        Usage::
+            with db.as_readonly():
+                agent.query(db)   # only SELECT allowed here
+            db.execute("INSERT ...")  # writes allowed again
+        """
+        return _ReadOnlyContext(self)
 
     # ── Transaction control ────────────────────────────────────────────────────
 
