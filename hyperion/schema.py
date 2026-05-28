@@ -115,12 +115,20 @@ class Schema:
 
 
 def serialize_row(schema: Schema, row: dict[str, Any]) -> bytes:
+    """Serialize a row to variable-length bytes (TLV format).
+
+    Format: [null_bitmap] then for each stored non-null column:
+      INTEGER/REAL: 8 bytes (struct 'q' or 'd')
+      TEXT/BLOB/other: [uint32 length][length bytes]
+    NULL columns contribute 0 bytes (bit set in null_bitmap).
+    """
     from .expr import eval_expr
-    from .constants import INTEGER, REAL
-    bitmap = bytearray(schema.null_bitmap_size)
-    packed = []
+    from .constants import INTEGER, REAL, _FIXED_FMTS
     stored = schema.stored_columns
-    # Build a typed copy of the row so eval_expr sees numeric types, not strings
+    bitmap = bytearray(schema.null_bitmap_size)
+    parts: list[bytes] = []
+
+    # Build typed copy so eval_expr sees numeric types
     typed_row: dict[str, Any] = {}
     for c in stored:
         if c.is_generated:
@@ -135,65 +143,86 @@ def serialize_row(schema: Schema, row: dict[str, Any]) -> bytes:
             except (ValueError, TypeError):
                 pass
         typed_row[c.name] = v
+
     for i, col in enumerate(stored):
-        # For STORED generated columns, compute the value from the expression
         if col.is_generated and col.generated_stored:
             val = eval_expr(col.generated_expr, typed_row)  # type: ignore[arg-type]
         else:
             val = row.get(col.name)
+
         if val is None:
             if not col.nullable:
                 raise RuntimeError(f"Column '{col.name}' is NOT NULL")
             bitmap[i // 8] |= 1 << (i % 8)
-            if col.type == INTEGER: packed.append(0)
-            elif col.type == REAL:  packed.append(0.0)
-            else:                   packed.append(b"")
+            # NULL columns occupy no bytes in the payload
+        elif col.type == INTEGER:
+            try:
+                parts.append(struct.pack("q", int(val)))
+            except struct.error as e:
+                raise RuntimeError(str(e)) from e
+        elif col.type == REAL:
+            parts.append(struct.pack("d", float(val)))
         else:
-            if col.type == INTEGER:
-                packed.append(int(val))
-            elif col.type == REAL:
-                packed.append(float(val))
+            # TEXT, BLOB, VARCHAR, and any other type: length-prefixed bytes
+            if isinstance(val, (bytes, bytearray)):
+                b = bytes(val)
             elif col.type == BLOB:
-                b = val if isinstance(val, (bytes, bytearray)) else str(val).encode()
-                if len(b) > col.size:
-                    raise RuntimeError(
-                        f"Value for '{col.name}' is {len(b)} bytes, "
-                        f"exceeds BLOB({col.size})"
-                    )
-                packed.append(bytes(b))
+                s = str(val)
+                if s.startswith("X'") and s.endswith("'"):
+                    b = bytes.fromhex(s[2:-1])
+                else:
+                    b = s.encode()
             else:
-                encoded = str(val).encode()
-                if len(encoded) > col.size:
-                    raise RuntimeError(
-                        f"Value for '{col.name}' is {len(encoded)} bytes, "
-                        f"exceeds VARCHAR({col.size})"
-                    )
-                packed.append(encoded)
-    try:
-        return bytes(bitmap) + struct.pack(schema.row_format, *packed)
-    except struct.error as e:
-        raise RuntimeError(str(e)) from e
+                b = str(val).encode()
+            # Enforce explicitly declared size limits (smaller than the default).
+            # TEXT / VARCHAR without an explicit size allow unlimited storage.
+            if col.size < DEFAULT_TEXT_SIZE and len(b) > col.size:
+                raise RuntimeError(
+                    f"Value for '{col.name}' is {len(b)} bytes, "
+                    f"exceeds {col.type}({col.size})"
+                )
+            parts.append(struct.pack("I", len(b)))
+            parts.append(b)
+
+    return bytes(bitmap) + b"".join(parts)
 
 
 def deserialize_row(schema: Schema, data: bytes) -> dict[str, Any]:
+    """Deserialize variable-length row bytes into a column dict."""
     from .expr import eval_expr
-    bm   = data[:schema.null_bitmap_size]
-    vals = struct.unpack(schema.row_format, data[schema.null_bitmap_size:])
+    from .constants import INTEGER, REAL, TEXT, BLOB
+    stored  = schema.stored_columns
+    bm_size = schema.null_bitmap_size
+    bm      = data[:bm_size]
+    offset  = bm_size
     row: dict[str, Any] = {}
-    for i, (col, val) in enumerate(zip(schema.stored_columns, vals)):
+
+    for i, col in enumerate(stored):
         if bm[i // 8] & (1 << (i % 8)):
             row[col.name] = None
-        elif col.type == BLOB:
-            row[col.name] = val.rstrip(b"\x00")
-        elif col.type == TEXT:
-            row[col.name] = val.rstrip(b"\x00").decode()
+        elif col.type == INTEGER:
+            row[col.name] = struct.unpack_from("q", data, offset)[0]
+            offset += 8
+        elif col.type == REAL:
+            row[col.name] = struct.unpack_from("d", data, offset)[0]
+            offset += 8
         else:
-            row[col.name] = val
-    # Inject VIRTUAL generated column values computed from the stored row
+            # TEXT, BLOB, VARCHAR, etc.
+            length = struct.unpack_from("I", data, offset)[0]
+            offset += 4
+            raw = data[offset: offset + length]
+            offset += length
+            if col.type == BLOB:
+                row[col.name] = bytes(raw)
+            else:
+                row[col.name] = raw.decode()
+
+    # Inject VIRTUAL generated column values
     for col in schema.columns:
         if col.is_generated and not col.generated_stored:
             try:
                 row[col.name] = eval_expr(col.generated_expr, row)  # type: ignore[arg-type]
             except Exception:
                 row[col.name] = None
+
     return row

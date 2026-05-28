@@ -460,7 +460,7 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
                 and _find_eq_index(db, right_table, rcol) is not None)
 
     if not use_inlj:
-        right_rows = [deserialize_row(rmeta.schema, r)
+        right_rows = [deserialize_row(rmeta.schema, db._unpack_row_cell(r))
                       for _, r in db._table_btree(rmeta).scan()]
 
     result: list[dict] = []
@@ -567,7 +567,7 @@ def _materialize_table(tname: str, db: "Database", ctes: dict,
         raw = []
         for _, r in db._table_btree(meta).scan():
             _check_timeout(db)
-            raw.append(deserialize_row(meta.schema, r))
+            raw.append(deserialize_row(meta.schema, db._unpack_row_cell(r)))
     if alias:
         return [{f"{alias}.{k}": v for k, v in row.items()} for row in raw]
     return raw
@@ -874,7 +874,7 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
         distinct: dict[str, set] = {c: set() for c in col_names}
 
         for _, raw in db._table_btree(meta).scan():
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, db._unpack_row_cell(raw))
             row_count += 1
             for c in col_names:
                 val = row.get(c)
@@ -1373,7 +1373,7 @@ def _remove_conflicting_rows(db: "Database", meta, new_row: dict) -> None:
     schema = meta.schema
     victims: list[tuple[int, dict]] = []
     for rowid, raw in db._table_btree(meta).scan():
-        existing = deserialize_row(schema, raw)
+        existing = deserialize_row(schema, db._unpack_row_cell(raw))
         if _would_conflict(schema, existing, new_row):
             victims.append((rowid, existing))
     if not victims:
@@ -1397,7 +1397,7 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
     import struct
     schema = meta.schema
     for rowid, raw in db._table_btree(meta).scan():
-        existing = deserialize_row(schema, raw)
+        existing = deserialize_row(schema, db._unpack_row_cell(raw))
         if not _would_conflict(schema, existing, new_row):
             continue
         updated = dict(existing)
@@ -1415,7 +1415,7 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
                     except (ValueError, TypeError): updated[col_name] = val
                 else:
                     updated[col_name] = val
-        db._table_btree(meta).update({rowid: serialize_row(schema, updated)})
+        db._table_btree(meta).update({rowid: db._pack_row_cell(serialize_row(schema, updated))})
         for im in db._indexes_for(schema.name):
             if not any(c in assignments for c in im.columns):
                 continue

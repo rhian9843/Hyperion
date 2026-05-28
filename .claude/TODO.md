@@ -172,7 +172,7 @@
 
 ### Storage
 
-- [ ] Variable-length row storage — TEXT and BLOB columns have a hard fixed maximum size (TEXT defaults to 255 bytes, page size is 4 096 bytes); rows that overflow a page cannot exist; this blocks storing large documents, JSON payloads, or any binary payload above ~4 000 bytes; requires an overflow-page mechanism (linked extra pages per row)
+- [x] Variable-length row storage — TEXT and BLOB columns have a hard fixed maximum size (TEXT defaults to 255 bytes, page size is 4 096 bytes); rows that overflow a page cannot exist; this blocks storing large documents, JSON payloads, or any binary payload above ~4 000 bytes; requires an overflow-page mechanism (linked extra pages per row)
 - [ ] Streaming / iterator query results — all queries fully materialise `list[dict]` in memory before the first row is returned; a generator-based execution path is needed so large result sets can be consumed row-by-row without holding everything in RAM
 - [ ] MVCC / snapshot isolation — today reads are blocked by the exclusive flock held during writes (single-writer model); concurrent readers inside the same process see mid-transaction state; a proper snapshot or copy-on-write read path is needed for multi-connection safety
 - [ ] WAL checkpointing — the WAL file is deleted immediately after every commit so there is no multi-transaction WAL efficiency; a checkpoint strategy (write-back on threshold, not per-commit) would reduce fsync pressure under write-heavy workloads

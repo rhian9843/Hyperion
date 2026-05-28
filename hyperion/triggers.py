@@ -189,7 +189,7 @@ def scan_matching_rows(db: Any, table: str, where: Any,
     for _, raw in db._table_btree(meta).scan():
         if limit is not None and count >= limit:
             break
-        row = deserialize_row(schema, raw)
+        row = deserialize_row(schema, db._unpack_row_cell(raw))
         if not where or where.evaluate(row, db):
             rows.append(row)
             count += 1

@@ -135,7 +135,7 @@ def integrity_check(db: "Database") -> list[str]:
                     )
                 prev_key = key
                 try:
-                    deserialize_row(meta.schema, raw)
+                    deserialize_row(meta.schema, db._unpack_row_cell(raw))
                 except Exception as exc:
                     errors.append(f"table '{tname}': corrupt row at key {key}: {exc}")
         except Exception as exc:

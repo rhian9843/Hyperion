@@ -56,7 +56,7 @@ class DMLMixin:
                 if col.autoincrement and col.type == INTEGER and row.get(col.name) is None:
                     max_val = 0
                     for _, raw in self._table_btree(meta).scan():
-                        v = deserialize_row(schema, raw).get(col.name)
+                        v = deserialize_row(schema, self._unpack_row_cell(raw)).get(col.name)
                         if v is not None and int(v) > max_val:
                             max_val = int(v)
                     row = {**row, col.name: max_val + 1}
@@ -66,7 +66,7 @@ class DMLMixin:
         self._check_unique(meta, row)
         self._check_constraints(meta.schema, row)
         self._check_fk_child(meta.schema, row)
-        data  = serialize_row(meta.schema, row)
+        data  = self._pack_row_cell(serialize_row(meta.schema, row))
         self._table_btree(meta).insert(rowid, data)
         _set_last_insert_rowid(rowid)
         schema = meta.schema
@@ -91,11 +91,12 @@ class DMLMixin:
         idx_ops:      list[tuple]      = []
         updated_rows: list[dict]       = []
 
+        old_overflow: list[int] = []  # first_page of overflow chains to free after update
         count = 0
         for rowid, raw in tree.scan():
             if limit is not None and count >= limit:
                 break
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
             new_row = dict(row)
@@ -127,7 +128,9 @@ class DMLMixin:
                 ref_cols_set = {c for fk in fks_ref for c in fk.ref_columns}
                 if ref_cols_set & assignments.keys():
                     self._check_fk_parent(table, row, is_delete=False, new_row=new_row)
-            updates[rowid] = serialize_row(schema, new_row)
+            if self._cell_is_overflow(raw):
+                old_overflow.append(struct.unpack_from("I", raw, 5)[0])
+            updates[rowid] = self._pack_row_cell(serialize_row(schema, new_row))
             updated_rows.append(new_row)
             count += 1
             for im in idxs:
@@ -147,6 +150,8 @@ class DMLMixin:
                     idx_ops.append((im, old_k, new_k, rowid))
 
         tree.update(updates)
+        for fp in old_overflow:
+            self._free_overflow(fp)
         for im, old_k, new_k, rowid in idx_ops:
             itree = self._index_btree(im)
             if old_k is not None:
@@ -162,13 +167,16 @@ class DMLMixin:
         tree   = self._table_btree(meta)
         idxs   = self._indexes_for(table)
         victims: list[tuple[int, dict]] = []
+        overflow_to_free: list[int] = []
         count = 0
         for rowid, raw in tree.scan():
             if limit is not None and count >= limit:
                 break
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if not where or where.evaluate(row, self):
                 victims.append((rowid, row))
+                if self._cell_is_overflow(raw):
+                    overflow_to_free.append(struct.unpack_from("I", raw, 5)[0])
                 count += 1
         if not victims:
             return []
@@ -176,6 +184,8 @@ class DMLMixin:
             self._check_fk_parent(table, row, is_delete=True)
         rowids = {r for r, _ in victims}
         tree.delete(rowids)
+        for fp in overflow_to_free:
+            self._free_overflow(fp)
         for im in idxs:
             col_types = _index_col_types(im.columns, schema.columns)
             itree     = self._index_btree(im)

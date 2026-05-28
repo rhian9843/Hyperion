@@ -101,7 +101,7 @@ def probe_index(db, right_table: str, right_col: str, val) -> list[dict] | None:
         rowid = struct.unpack("q", rowid_raw)[0]
         raw   = ptree.lookup(rowid)
         if raw is not None:
-            rows.append(deserialize_row(schema, raw))
+            rows.append(deserialize_row(schema, db._unpack_row_cell(raw)))
     return rows
 
 

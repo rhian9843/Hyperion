@@ -33,7 +33,7 @@ class ConstraintsMixin:
         for rowid, raw in self._table_btree(meta).scan():
             if rowid == exclude_rowid:
                 continue
-            existing = deserialize_row(schema, raw)
+            existing = deserialize_row(schema, self._unpack_row_cell(raw))
             for col in unique_cols:
                 v = typed[col.name]
                 if v is not None and existing.get(col.name) == v:
@@ -143,7 +143,7 @@ class ConstraintsMixin:
             if found is None:  # no usable index — fall back to full scan
                 found = False
                 for _, raw in self._table_btree(parent_meta).scan():
-                    parent_row = deserialize_row(parent_schema, raw)
+                    parent_row = deserialize_row(parent_schema, self._unpack_row_cell(raw))
                     if all(parent_row.get(rc) == v
                            for rc, v in zip(fk.ref_columns, vals)):
                         found = True
@@ -175,7 +175,7 @@ class ConstraintsMixin:
                 child_schema = tmeta.schema
                 matching: list[tuple[int, dict]] = []
                 for rowid, raw in self._table_btree(tmeta).scan():
-                    child_row = deserialize_row(child_schema, raw)
+                    child_row = deserialize_row(child_schema, self._unpack_row_cell(raw))
                     if all(child_row.get(cc) == rv
                            for cc, rv in zip(fk.columns, ref_vals)):
                         matching.append((rowid, child_row))
@@ -211,7 +211,8 @@ class ConstraintsMixin:
                                 updated = dict(child_row)
                                 for cc, nv in zip(fk.columns, new_ref_vals):
                                     updated[cc] = nv
-                                upd[rowid] = serialize_row(child_schema, updated)
+                                upd[rowid] = self._pack_row_cell(
+                                    serialize_row(child_schema, updated))
                             self._table_btree(tmeta).update(upd)
                 elif action == "SET NULL":
                     upd_null: dict[int, bytes] = {}
@@ -219,5 +220,6 @@ class ConstraintsMixin:
                         updated = dict(child_row)
                         for cc in fk.columns:
                             updated[cc] = None
-                        upd_null[rowid] = serialize_row(child_schema, updated)
+                        upd_null[rowid] = self._pack_row_cell(
+                            serialize_row(child_schema, updated))
                     self._table_btree(tmeta).update(upd_null)

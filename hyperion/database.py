@@ -5,7 +5,8 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from .cursor import Cursor
 
-from .constants import PAGE_SIZE
+from .constants import (PAGE_SIZE, ROW_CELL_SIZE, ROW_INLINE_CAP,
+                        PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
 from .pager import Pager, MemoryPager
@@ -158,7 +159,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for tname, tmeta in self._catalog.tables.items():
             yield _schema_to_sql(tname, tmeta.schema, tmeta.temporary) + ";"
             for _, raw in self._table_btree(tmeta).scan():
-                row = deserialize_row(tmeta.schema, raw)
+                row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
                 cols = [c.name for c in tmeta.schema.columns if not c.is_generated]
                 vals = ", ".join(_sql_literal(row.get(c)) for c in cols)
                 yield f"INSERT INTO \"{tname}\" VALUES ({vals});"
@@ -291,7 +292,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         return pages
 
     def _table_btree(self, meta: TableMeta) -> BTree:
-        return BTree(self._pager, meta.root_page, meta.schema.row_size,
+        return BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
                      self._make_alloc(meta))
 
     def _index_btree(self, idx: IndexMeta) -> BTree:
@@ -313,6 +314,79 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             idx.next_page = pn + 1
             return pn
         return alloc
+
+    # ── Overflow page management ──────────────────────────────────────────────
+
+    def _write_overflow(self, data: bytes) -> int:
+        """Write data to a linked overflow page chain. Returns first page number."""
+        first_page = 0
+        prev_pn: int | None = None
+        offset = 0
+        while offset < len(data) or first_page == 0:
+            pn = self._alloc_page()
+            if first_page == 0:
+                first_page = pn
+            if prev_pn is not None:
+                pg = self._pager.get_page(prev_pn)
+                struct.pack_into("I", pg, 1, pn)
+            chunk = data[offset: offset + OVERFLOW_DATA_SZ]
+            pg = self._pager.get_page(pn)
+            pg[0] = PAGE_OVERFLOW
+            struct.pack_into("I", pg, 1, 0)             # next page = 0 (last for now)
+            struct.pack_into("I", pg, 5, len(chunk))
+            pg[OVERFLOW_HDR: OVERFLOW_HDR + len(chunk)] = chunk
+            prev_pn = pn
+            offset += OVERFLOW_DATA_SZ
+            if offset >= len(data):
+                break
+        return first_page
+
+    def _read_overflow(self, first_page: int, total_len: int) -> bytes:
+        """Reassemble data from an overflow page chain."""
+        result = bytearray()
+        pn = first_page
+        while pn and len(result) < total_len:
+            pg       = self._pager.read_page(pn)
+            data_len = struct.unpack_from("I", pg, 5)[0]
+            result  += pg[OVERFLOW_HDR: OVERFLOW_HDR + data_len]
+            pn       = struct.unpack_from("I", pg, 1)[0]
+        return bytes(result[:total_len])
+
+    def _free_overflow(self, first_page: int) -> None:
+        """Free all pages in an overflow chain."""
+        pn = first_page
+        while pn:
+            pg  = self._pager.read_page(pn)
+            nxt = struct.unpack_from("I", pg, 1)[0]
+            self._free_page(pn)
+            pn  = nxt
+
+    def _pack_row_cell(self, varlen: bytes) -> bytes:
+        """Wrap variable-length row bytes into a fixed ROW_CELL_SIZE B-tree cell."""
+        cell = bytearray(ROW_CELL_SIZE)
+        if len(varlen) <= ROW_INLINE_CAP:
+            cell[0] = 0                                  # inline
+            struct.pack_into("I", cell, 1, len(varlen))
+            struct.pack_into("I", cell, 5, 0)
+            cell[9: 9 + len(varlen)] = varlen
+        else:
+            first_page = self._write_overflow(varlen)
+            cell[0] = 1                                  # overflow
+            struct.pack_into("I", cell, 1, len(varlen))
+            struct.pack_into("I", cell, 5, first_page)
+        return bytes(cell)
+
+    def _unpack_row_cell(self, cell: bytes) -> bytes:
+        """Extract variable-length row bytes from a ROW_CELL_SIZE B-tree cell."""
+        is_overflow = cell[0]
+        total_len   = struct.unpack_from("I", cell, 1)[0]
+        if not is_overflow:
+            return bytes(cell[9: 9 + total_len])
+        first_page = struct.unpack_from("I", cell, 5)[0]
+        return self._read_overflow(first_page, total_len)
+
+    def _cell_is_overflow(self, cell: bytes) -> bool:
+        return bool(cell[0])
 
     def _indexes_for(self, table: str) -> list[IndexMeta]:
         return [m for m in self._catalog.indexes.values()
@@ -380,7 +454,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for tname, tmeta in list(self._catalog.tables.items()):
             new_db.create_table(tmeta.schema)
             for _, raw in self._table_btree(tmeta).scan():
-                row = deserialize_row(tmeta.schema, raw)
+                row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
                 new_db.insert(tname, row)
         for idx_name, idx_meta in list(self._catalog.indexes.items()):
             if idx_name not in new_db._catalog.indexes:

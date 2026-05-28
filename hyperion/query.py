@@ -150,7 +150,7 @@ class QueryMixin:
         results = []
         seen: set[tuple] = set()
         for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
             projected = _project_row(row, columns) if columns else row
@@ -221,7 +221,7 @@ class QueryMixin:
         schema = meta.schema
         rows: list[dict] = []
         for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
             rows.append(row)
@@ -236,7 +236,7 @@ class QueryMixin:
         schema = meta.schema
         all_rows: list[dict] = []
         for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
             all_rows.append(row)
@@ -271,9 +271,9 @@ class QueryMixin:
              offset: int | None = None,
              on_clause: "WhereClause | None" = None) -> list[dict[str, Any]]:
         lmeta, rmeta = self._meta(left_table), self._meta(right_table)
-        left_rows  = [deserialize_row(lmeta.schema, r)
+        left_rows  = [deserialize_row(lmeta.schema, self._unpack_row_cell(r))
                       for _, r in self._table_btree(lmeta).scan()]
-        right_rows = [deserialize_row(rmeta.schema, r)
+        right_rows = [deserialize_row(rmeta.schema, self._unpack_row_cell(r))
                       for _, r in self._table_btree(rmeta).scan()]
 
         la = left_alias  or left_table
@@ -422,7 +422,7 @@ class QueryMixin:
             raw   = ptree.lookup(rowid)
             if raw is None:
                 continue
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             match = True
             for col_name, val in eq_cols.items():
                 if is_expr(col_name):
@@ -530,7 +530,7 @@ class QueryMixin:
             raw   = ptree.lookup(rowid)
             if raw is None:
                 continue
-            row = deserialize_row(schema, raw)
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
             results.append(_project_row(row, columns) if columns else row)

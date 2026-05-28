@@ -36,6 +36,10 @@ class DDLMixin:
 
     def drop_table(self, name: str) -> None:
         meta = self._meta(name)
+        import struct as _s
+        for _, raw in self._table_btree(meta).scan():
+            if self._cell_is_overflow(raw):
+                self._free_overflow(_s.unpack_from("I", raw, 5)[0])
         for pn in self._collect_tree_pages(meta.root_page):
             self._free_page(pn)
         to_drop = [n for n, m in self._catalog.indexes.items()
@@ -100,10 +104,17 @@ class DDLMixin:
     def _rewrite_table(self, meta: TableMeta, old_schema: Schema,
                        new_schema: Schema) -> None:
         """Scan old tree, reserialize rows with new_schema, rebuild on a fresh root."""
-        old_tree  = BTree(self._pager, meta.root_page, old_schema.row_size,
-                          self._make_alloc(meta))
-        saved     = [(rowid, deserialize_row(old_schema, raw))
-                     for rowid, raw in old_tree.scan()]
+        from .constants import ROW_CELL_SIZE
+        old_tree   = BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
+                           self._make_alloc(meta))
+        old_scanned = list(old_tree.scan())
+        old_overflow_pages: list[int] = []
+        saved: list[tuple] = []
+        for rowid, raw in old_scanned:
+            if self._cell_is_overflow(raw):
+                import struct as _s
+                old_overflow_pages.append(_s.unpack_from("I", raw, 5)[0])
+            saved.append((rowid, deserialize_row(old_schema, self._unpack_row_cell(raw))))
         old_pages = self._collect_tree_pages(meta.root_page)
 
         new_root = self._alloc_page()
@@ -113,7 +124,7 @@ class DDLMixin:
         new_tree = self._table_btree(meta)
         for rowid, old_row in saved:
             new_row = {c.name: old_row.get(c.name) for c in new_schema.columns}
-            new_tree.insert(rowid, serialize_row(new_schema, new_row))
+            new_tree.insert(rowid, self._pack_row_cell(serialize_row(new_schema, new_row)))
 
         old_idx_pages: list[int] = []
         for idx in self._catalog.indexes.values():
@@ -139,6 +150,8 @@ class DDLMixin:
 
         for pn in old_pages + old_idx_pages:
             self._free_page(pn)
+        for fp in old_overflow_pages:
+            self._free_overflow(fp)
 
     def create_index(self, idx_name: str, table: str, cols: list[str]) -> None:
         if idx_name in self._catalog.indexes:
@@ -158,7 +171,7 @@ class DDLMixin:
         schema    = meta.schema
         col_types = _index_col_types(cols, schema.columns)
         for rowid, raw in tree.scan():
-            row  = deserialize_row(schema, raw)
+            row  = deserialize_row(schema, self._unpack_row_cell(raw))
             vals = [eval_expr(n, row) if is_expr(n) else row.get(n) for n in cols]
             if all(v is not None for v in vals):
                 itree.insert(
