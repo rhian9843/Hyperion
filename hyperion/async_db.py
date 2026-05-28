@@ -31,6 +31,10 @@ class AsyncCursor:
     def lastrowid(self):
         return self._cursor.lastrowid
 
+    @property
+    def script_results(self) -> list:
+        return self._cursor.script_results
+
     async def fetchone(self) -> Any:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, self._cursor.fetchone)

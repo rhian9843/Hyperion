@@ -264,6 +264,7 @@ class Cursor:
         self.description: tuple | None = None
         self.rowcount: int = -1
         self.lastrowid: int | None = None
+        self.script_results: list[list] = []  # populated by executescript; one list per SELECT
         self.row_factory = db.row_factory  # snapshot at creation time
 
     # ── Execution ─────────────────────────────────────────────────────────────
@@ -343,18 +344,34 @@ class Cursor:
         with self._db._lock:
             from .repl import _split_statements
             from .parser import parse
-            from .executor import execute as _exec
+            from .executor import execute as _exec, _rows_for_stmt
 
             if self._db.in_transaction:
                 self._db.commit()
+
+            self.script_results = []
+            last_select_rows: list | None = None
+            last_select_stmt: dict | None = None
+
             for part in _split_statements(sql):
                 part = part.strip()
-                if part:
-                    _exec(parse(part), self._db)
-            self._result = []
-            self._pos = 0
-            self.description = None
-            self.rowcount = -1
+                if not part:
+                    continue
+                stmt = parse(part)
+                if stmt.get("op", "") in _SELECT_OPS:
+                    rows = list(_rows_for_stmt(stmt, self._db))
+                    self.script_results.append(rows)
+                    last_select_rows = rows
+                    last_select_stmt = stmt
+                else:
+                    _exec(stmt, self._db)
+
+            if last_select_rows is not None:
+                self._set_select_result(iter(last_select_rows), last_select_stmt)
+            else:
+                self._iter = None
+                self.description = None
+                self.rowcount = -1
             return self
 
     # ── Fetch ─────────────────────────────────────────────────────────────────
