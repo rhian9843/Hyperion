@@ -215,7 +215,8 @@ class QueryMixin:
              join_type: str = "INNER",
              left_alias: str | None = None,
              right_alias: str | None = None,
-             offset: int | None = None) -> list[dict[str, Any]]:
+             offset: int | None = None,
+             on_clause: "WhereClause | None" = None) -> list[dict[str, Any]]:
         lmeta, rmeta = self._meta(left_table), self._meta(right_table)
         left_rows  = [deserialize_row(lmeta.schema, r)
                       for _, r in self._table_btree(lmeta).scan()]
@@ -265,19 +266,28 @@ class QueryMixin:
                         results.append(row)
             return _apply_order_limit(results, order_by, limit)
 
-        lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
-        rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
+        # Determine effective match function
+        if on_clause is not None and on_left is None:
+            # Multi-condition ON: evaluate WhereClause on merged row
+            use_inlj = False
+            lcol = rcol = None
+        else:
+            lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
+            rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
+            use_inlj = (join_type == "INNER"
+                        and find_eq_index(self, right_table, rcol) is not None)
 
-        # Use INLJ for INNER joins when the right side has an index on the join column
-        use_inlj = (join_type == "INNER"
-                    and find_eq_index(self, right_table, rcol) is not None)
+        def _on_match(lr: dict, rr: dict) -> bool:
+            if on_clause is not None and on_left is None:
+                return on_clause.evaluate(_merge(lr, rr), self)
+            return lr.get(lcol) == rr.get(rcol)  # type: ignore[arg-type]
 
         if use_inlj:
             for lr in left_rows:
-                val = lr.get(lcol)
+                val = lr.get(lcol)  # type: ignore[arg-type]
                 if val is None:
                     continue  # INNER JOIN: NULL never matches
-                probed = _probe_index(self, right_table, rcol, val)
+                probed = _probe_index(self, right_table, rcol, val)  # type: ignore[arg-type]
                 if not probed:
                     continue
                 for rr in probed:
@@ -289,7 +299,7 @@ class QueryMixin:
             for lr in left_rows:
                 on_matched = False
                 for j, rr in enumerate(right_rows):
-                    if lr.get(lcol) != rr.get(rcol):
+                    if not _on_match(lr, rr):
                         continue
                     on_matched = True
                     matched_right.add(j)

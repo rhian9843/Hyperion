@@ -127,8 +127,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         from .cursor import Cursor
         return Cursor(self)
 
-    def execute(self, sql: str, params=None) -> "Cursor":
-        return self.cursor().execute(sql, params)
+    def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
+        return self.cursor().execute(sql, params, timeout_ms=timeout_ms)
 
     def executemany(self, sql: str, params_seq) -> "Cursor":
         return self.cursor().executemany(sql, params_seq)

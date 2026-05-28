@@ -129,7 +129,7 @@ from .parser import (
     _parse_where_expr, _parse_where, _parse_group_having, _parse_order_limit,
     parse, _parse_tokens,
 )
-from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows
+from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError
 from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)

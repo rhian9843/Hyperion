@@ -1,11 +1,31 @@
 import struct
 from typing import Any
 
-from .schema import serialize_row, deserialize_row
+from .schema import Schema, serialize_row, deserialize_row
 from .constants import INTEGER, REAL
 from .encoding import _encode_composite_key, _make_index_key
-from .expr import eval_expr, is_expr
+from .expr import eval_expr, is_expr, _set_last_insert_rowid
 from .ddl import _index_col_types
+
+
+def _integer_pk_col(schema: Schema) -> str | None:
+    """Return the single INTEGER PRIMARY KEY column name, or None.
+
+    Returns None for composite PKs, non-integer PKs, or tables with no PK.
+    When non-None, the column's value is used directly as the B-tree rowid
+    (SQLite rowid-table aliasing semantics).
+
+    Handles both inline syntax (id INTEGER PRIMARY KEY) and table-level
+    syntax (PRIMARY KEY (id)) by checking col.primary_key or primary_key_columns.
+    """
+    # Collect all PK columns from either source
+    pk_cols = [c for c in schema.columns if c.primary_key]
+    if not pk_cols and schema.primary_key_columns:
+        pk_cols = [c for c in schema.columns
+                   if c.name in schema.primary_key_columns]
+    if len(pk_cols) == 1 and pk_cols[0].type == INTEGER:
+        return pk_cols[0].name
+    return None
 
 
 class DMLMixin:
@@ -14,22 +34,41 @@ class DMLMixin:
     def insert(self, table: str, row: dict[str, Any]) -> dict[str, Any]:
         meta   = self._meta(table)
         schema = meta.schema
-        # Resolve AUTOINCREMENT columns: assign MAX(col)+1 when value is absent
-        for col in schema.columns:
-            if col.autoincrement and col.type == INTEGER and row.get(col.name) is None:
-                max_val = 0
-                for _, raw in self._table_btree(meta).scan():
-                    v = deserialize_row(schema, raw).get(col.name)
-                    if v is not None and int(v) > max_val:
-                        max_val = int(v)
-                row = {**row, col.name: max_val + 1}
+        ipk    = _integer_pk_col(schema)
+
+        if ipk:
+            # INTEGER PRIMARY KEY: use the column value as the B-tree rowid.
+            pk_val = row.get(ipk)
+            if pk_val is None:
+                # Auto-assign: next_key tracks max(pk)+1 across all inserts.
+                pk_val = meta.next_key
+                row = {**row, ipk: pk_val}
+            else:
+                pk_val = int(pk_val)
+                row = {**row, ipk: pk_val}
+            rowid = pk_val
+            # Keep next_key ahead of the largest key ever inserted.
+            if pk_val >= meta.next_key:
+                meta.next_key = pk_val + 1
+        else:
+            # Non-IPK tables: resolve AUTOINCREMENT columns by scanning for MAX.
+            for col in schema.columns:
+                if col.autoincrement and col.type == INTEGER and row.get(col.name) is None:
+                    max_val = 0
+                    for _, raw in self._table_btree(meta).scan():
+                        v = deserialize_row(schema, raw).get(col.name)
+                        if v is not None and int(v) > max_val:
+                            max_val = int(v)
+                    row = {**row, col.name: max_val + 1}
+            rowid = meta.next_key
+            meta.next_key += 1
+
         self._check_unique(meta, row)
         self._check_constraints(meta.schema, row)
         self._check_fk_child(meta.schema, row)
-        rowid = meta.next_key
-        meta.next_key += 1
         data  = serialize_row(meta.schema, row)
         self._table_btree(meta).insert(rowid, data)
+        _set_last_insert_rowid(rowid)
         schema = meta.schema
         for idx_meta in self._indexes_for(table):
             vals = [eval_expr(n, row) if is_expr(n) else row.get(n)

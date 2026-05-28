@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import re
+import time
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -106,6 +107,31 @@ _SELECT_OPS = frozenset({"SELECT", "SELECT_NOFROM", "JOIN", "SET_OP",
                          "RECURSIVE_CTE", "INLINE_ROWS"})
 
 
+# ── Column name inference for empty result sets ───────────────────────────────
+
+def _infer_col_names(stmt: dict | None, db: "Database") -> list[str] | None:
+    """Return column names from a SELECT AST when the result set is empty."""
+    if stmt is None:
+        return None
+    op = stmt.get("op", "")
+    cols = stmt.get("columns") or []
+    aliases = stmt.get("col_aliases") or {}
+
+    if op == "SELECT_NOFROM":
+        return [aliases.get(c, c) for c in cols] or None
+
+    if cols and cols != ["*"]:
+        return [aliases.get(c, c) for c in cols] or None
+
+    if cols == ["*"] or not cols:
+        table = stmt.get("table")
+        if table and hasattr(db, "_catalog") and table in db._catalog.tables:
+            schema = db._catalog.tables[table].schema
+            return [c.name for c in schema.columns]
+
+    return None
+
+
 # ── Cursor ────────────────────────────────────────────────────────────────────
 
 class Cursor:
@@ -123,36 +149,48 @@ class Cursor:
 
     # ── Execution ─────────────────────────────────────────────────────────────
 
-    def execute(self, sql: str, params=None) -> "Cursor":
+    def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
         from .parser import parse
-        from .executor import execute as _exec, _rows_for_stmt
+        from .executor import execute as _exec, _rows_for_stmt, QueryTimeoutError
         from .introspect import explain_plan
         from .auth import check_authorizer, SQLITE_IGNORE
+        from .expr import get_last_insert_rowid
 
         bound = _bind_params(sql, params) if params is not None else sql
         stmt = parse(bound)
         op = stmt.get("op", "")
 
-        # SELECT ops bypass executor.execute, so authorizer must be checked here
-        if op in _SELECT_OPS and self._db._authorizer is not None:
-            if check_authorizer(self._db._authorizer, stmt) == SQLITE_IGNORE:
-                self._result = []; self._pos = 0
-                self.description = None; self.rowcount = -1
-                return self
-
-        if op in _SELECT_OPS:
-            rows = _rows_for_stmt(stmt, self._db)
-            self._set_select_result(rows)
-        elif op == "EXPLAIN":
-            rows = explain_plan(stmt["stmt"], self._db)
-            self._set_select_result(rows)
+        if timeout_ms is not None:
+            self._db._query_deadline = time.monotonic() + timeout_ms / 1000.0
         else:
-            result_str = _exec(stmt, self._db)
-            self._result = []
-            self._pos = 0
-            self.description = None
-            self.rowcount = _rowcount_from_result(result_str)
-            self.lastrowid = None
+            self._db._query_deadline = None
+
+        try:
+            # SELECT ops bypass executor.execute, so authorizer must be checked here
+            if op in _SELECT_OPS and self._db._authorizer is not None:
+                if check_authorizer(self._db._authorizer, stmt) == SQLITE_IGNORE:
+                    self._result = []; self._pos = 0
+                    self.description = None; self.rowcount = -1
+                    return self
+
+            if op in _SELECT_OPS:
+                rows = _rows_for_stmt(stmt, self._db)
+                self._set_select_result(rows, stmt)
+            elif op == "EXPLAIN":
+                rows = explain_plan(stmt["stmt"], self._db)
+                self._set_select_result(rows)
+            else:
+                result_str = _exec(stmt, self._db)
+                self._result = []
+                self._pos = 0
+                self.description = None
+                self.rowcount = _rowcount_from_result(result_str)
+                if op in ("INSERT", "INSERT_SELECT", "UPSERT"):
+                    self.lastrowid = get_last_insert_rowid()
+                else:
+                    self.lastrowid = None
+        finally:
+            self._db._query_deadline = None
 
         return self
 
@@ -221,13 +259,17 @@ class Cursor:
             return row
         return self.row_factory(self, row)
 
-    def _set_select_result(self, rows: list[dict]) -> None:
+    def _set_select_result(self, rows: list[dict], stmt: dict | None = None) -> None:
         self._result = rows
         self._pos = 0
         self.rowcount = -1
         if rows:
+            col_names = list(rows[0].keys())
+        else:
+            col_names = _infer_col_names(stmt, self._db) if stmt is not None else None
+        if col_names is not None:
             self.description = tuple(
-                (k, None, None, None, None, None, None) for k in rows[0]
+                (k, None, None, None, None, None, None) for k in col_names
             )
         else:
             self.description = None

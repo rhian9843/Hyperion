@@ -137,13 +137,16 @@ class TestPrimaryKey(unittest.TestCase):
         ], self.db)
         self.assertTrue(any("UNIQUE" in l or "Error" in l for l in lines))
 
-    def test_primary_key_enforces_not_null(self):
-        """NULL PRIMARY KEY value is rejected."""
-        _, lines = db_run([
-            "INSERT INTO users VALUES (NULL, Dave)",
-            ".exit",
-        ], self.db)
-        self.assertTrue(any("NOT NULL" in l or "Error" in l for l in lines))
+    def test_primary_key_null_auto_assigns(self):
+        """NULL into INTEGER PRIMARY KEY auto-assigns the next rowid (SQLite rowid-alias semantics)."""
+        from hyperion import Database
+        db = Database(":memory:")
+        db.execute("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT)")
+        db.execute("INSERT INTO u VALUES (NULL, 'Dave')")
+        rows = db.execute("SELECT id, name FROM u").fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0]["id"])
+        self.assertEqual(rows[0]["name"], "Dave")
 
     def test_primary_key_allows_select(self):
         """Rows with PRIMARY KEY can be selected normally."""

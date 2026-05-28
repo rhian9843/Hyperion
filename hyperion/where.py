@@ -15,6 +15,7 @@ class WhereClause:
     or_clause:    "WhereClause | None" = None
     subquery_ast: "dict | None"        = None
     group_clause: "WhereClause | None" = None  # set when op == "GROUP"
+    row_cols:     "list[str] | None"   = None  # multi-column (a,b) IN / = / !=
     _subq_cache:  dict = field(default_factory=dict, init=False,
                                repr=False, compare=False)
 
@@ -42,6 +43,10 @@ class WhereClause:
         if self.op in ("EXISTS", "NOT EXISTS"):
             sub_rows = _exec_correlated_subquery(self.subquery_ast, db, row)
             return bool(sub_rows) if self.op == "EXISTS" else not bool(sub_rows)
+
+        # Multi-column row comparison: (col1, col2) IN/NOT IN (subquery) or (col1,col2) =/!= (v1,v2)
+        if self.row_cols is not None:
+            return self._eval_row_cmp(row, db)
 
         # col lookup — strip table/alias prefix when exact key absent, or evaluate as expr
         if self.col in row:
@@ -158,6 +163,69 @@ class WhereClause:
                 return bool(re.fullmatch(regex, str(cell)))  # case-sensitive
         return False
 
+    def _resolve_col_val(self, col: str, row: dict) -> Any:
+        """Resolve a column name (possibly table-qualified) from a row dict."""
+        if col in row:
+            return row[col]
+        if "." in col:
+            bare = col.split(".", 1)[1]
+            if bare in row:
+                return row[bare]
+            matches = [v for k, v in row.items() if k.split(".")[-1] == bare]
+            if matches:
+                return matches[0]
+        else:
+            matches = [v for k, v in row.items() if k.split(".")[-1] == col]
+            if matches:
+                return matches[0]
+        return None
+
+    def _eval_row_cmp(self, row: dict, db: Any) -> bool:
+        """Evaluate (col1, col2, ...) IN/NOT IN/=/!= right-side."""
+        cols = self.row_cols  # type: ignore[assignment]
+        lvals = tuple(self._resolve_col_val(c, row) for c in cols)  # type: ignore[union-attr]
+        op = self.op
+
+        if op in ("IN", "NOT IN"):
+            if self.subquery_ast is not None:
+                sub_rows = _exec_correlated_subquery(self.subquery_ast, db, row)
+                if not sub_rows:
+                    return op == "NOT IN"
+                fkeys = list(sub_rows[0].keys())
+                rvals_set = {tuple(r.get(k) for k in fkeys) for r in sub_rows}
+                return (lvals in rvals_set) if op == "IN" else (lvals not in rvals_set)
+            # Literal list: val = "v1,v2,..."  (single-tuple IN for = form)
+            rvals = tuple(v.strip().strip("'") for v in self.val.split("\x1f"))
+            return (lvals == rvals) if op == "IN" else (lvals != rvals)
+
+        # Literal tuple: val encoded as v1\x1fv2\x1f...
+        rvals_raw = self.val.split("\x1f")
+
+        def _coerce(cell: Any, raw: str) -> Any:
+            if cell is None:
+                return None
+            if isinstance(cell, int):
+                try:
+                    return int(raw)
+                except ValueError:
+                    return raw
+            if isinstance(cell, float):
+                try:
+                    return float(raw)
+                except ValueError:
+                    return raw
+            return raw
+
+        rvals = tuple(_coerce(lvals[i], rvals_raw[i]) for i in range(len(lvals)))
+        match op:
+            case "=":  return lvals == rvals
+            case "!=": return lvals != rvals
+            case "<":  return lvals < rvals  # type: ignore[operator]
+            case ">":  return lvals > rvals  # type: ignore[operator]
+            case "<=": return lvals <= rvals  # type: ignore[operator]
+            case ">=": return lvals >= rvals  # type: ignore[operator]
+        return False
+
 
 # ── Correlated subquery helpers ────────────────────────────────────────────────
 
@@ -204,6 +272,7 @@ def _instantiate_correlated(where: "WhereClause | None",
     return WhereClause(
         col=new_col, op=new_op, val=new_val,
         subquery_ast=where.subquery_ast,
+        row_cols=where.row_cols,
         group_clause=_instantiate_correlated(where.group_clause, outer_row),
         and_clause=_instantiate_correlated(where.and_clause, outer_row),
         or_clause=_instantiate_correlated(where.or_clause, outer_row),

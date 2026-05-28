@@ -26,7 +26,7 @@ _AGG_RE = re.compile(
 # Keywords that cannot be bare table aliases
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
-    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING",
+    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW",
     "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM",
 })
 
@@ -224,6 +224,15 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
                            val=_unquote_token(tokens[j + 1])), j + 2
 
     col = tokens[pos]
+
+    # Bare boolean literal: TRUE / FALSE with no following operator
+    if col.upper() in ("TRUE", "FALSE"):
+        _next = tokens[pos + 1].upper() if pos + 1 < len(tokens) else ""
+        _is_op = _next in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB",
+                            "IN", "NOT", "IS", "BETWEEN"}
+        if not _is_op:
+            return WhereClause(col=col, op="=", val="1" if col.upper() == "TRUE" else "0"), pos + 1
+
     op  = tokens[pos + 1].upper()
 
     if op == "IS":
@@ -303,10 +312,52 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
     return WhereClause(col=col, op=op, val=val), pos + 3
 
 
+_ROW_CMP_OPS = frozenset({"IN", "NOT", "=", "!=", "<", ">", "<=", ">="})
+
+
 def _parse_atom(tokens: list[str], pos: int) -> tuple["WhereClause", int]:
     """Parse a single condition or a parenthesized group `(expr)`."""
     if pos < len(tokens) and tokens[pos] == "(":
         inner, new_pos = _extract_paren_tokens(tokens, pos)
+        # Detect row expression: (col1, col2, ...) IN/=/!= ...
+        # Heuristic: inner contains at least one top-level comma and no SELECT
+        has_comma = "," in inner
+        has_select = any(t.upper() == "SELECT" for t in inner)
+        next_op = tokens[new_pos].upper() if new_pos < len(tokens) else ""
+        if has_comma and not has_select and next_op in _ROW_CMP_OPS:
+            row_cols = [_unquote_token(t) for t in inner if t != ","]
+            rpos = new_pos
+            op = tokens[rpos].upper(); rpos += 1
+            if op == "NOT":
+                # NOT IN
+                if rpos < len(tokens) and tokens[rpos].upper() == "IN":
+                    rpos += 1
+                    op = "NOT IN"
+                else:
+                    raise ParseError("Expected IN after NOT in row comparison")
+            if op in ("IN", "NOT IN"):
+                if rpos >= len(tokens) or tokens[rpos] != "(":
+                    raise ParseError("Expected ( after IN in row comparison")
+                in_inner, rpos = _extract_paren_tokens(tokens, rpos)
+                if in_inner and in_inner[0].upper() == "SELECT":
+                    return WhereClause(col="", op=op, val="",
+                                       row_cols=row_cols,
+                                       subquery_ast=_parse_tokens(in_inner)), rpos
+                # Literal value list (single tuple): (1, 'a') IN ((1,'a'), (2,'b'))
+                # For simplicity, treat as single tuple matching using \x1f encoding
+                vals = [_unquote_token(t) for t in in_inner if t != ","]
+                return WhereClause(col="", op=op,
+                                   val="\x1f".join(vals),
+                                   row_cols=row_cols), rpos
+            else:
+                # (col1, col2) = (v1, v2) or != etc.
+                if rpos >= len(tokens) or tokens[rpos] != "(":
+                    raise ParseError(f"Expected ( after {op} in row comparison")
+                rhs_inner, rpos = _extract_paren_tokens(tokens, rpos)
+                vals = [_unquote_token(t) for t in rhs_inner if t != ","]
+                return WhereClause(col="", op=op,
+                                   val="\x1f".join(vals),
+                                   row_cols=row_cols), rpos
         inner_clause, _ = _parse_where_expr(inner, 0)
         return WhereClause(col="", op="GROUP", val="",
                            group_clause=inner_clause), new_pos
@@ -383,6 +434,28 @@ def _parse_fk_ref_actions(t: list[str], i: int) -> tuple[str, str, int]:
         else:
             on_update = action
     return on_delete, on_update, i
+
+
+def _parse_window_defs(tokens: list[str], pos: int) -> tuple[dict, int]:
+    """Parse optional WINDOW w AS (...) [, w2 AS (...)] clause."""
+    if pos >= len(tokens) or tokens[pos].upper() != "WINDOW":
+        return {}, pos
+    pos += 1
+    named: dict[str, str] = {}
+    while pos < len(tokens) and tokens[pos].upper() not in ("ORDER", "LIMIT", "OFFSET"):
+        win_name = tokens[pos]; pos += 1
+        if pos >= len(tokens) or tokens[pos].upper() != "AS":
+            break
+        pos += 1
+        if pos >= len(tokens) or tokens[pos] != "(":
+            break
+        inner, pos = _extract_paren_tokens(tokens, pos)
+        named[win_name.upper()] = " ".join(inner)
+        if pos < len(tokens) and tokens[pos] == ",":
+            pos += 1
+        else:
+            break
+    return named, pos
 
 
 def _parse_group_having(tokens: list[str], pos: int
@@ -1121,32 +1194,62 @@ def _parse_select(t: list[str]) -> dict:
     left_alias, i = _parse_table_alias(t, i, table)
 
     from_tables = [(table, left_alias)]
+    extra_implicit: list[dict] = []
     while i < len(t) and t[i] == ",":
         i += 1
-        nxt_tbl = t[i]; i += 1
-        nxt_alias, i = _parse_table_alias(t, i, nxt_tbl)
-        from_tables.append((nxt_tbl, nxt_alias))
-    if len(from_tables) > 1:
-        extra_implicit = [
-            {"join_type": "CROSS", "right_table": tbl, "right_alias": ali,
-             "on_left": None, "on_right": None}
-            for tbl, ali in from_tables[2:]
-        ]
+        if i < len(t) and t[i].upper() == "LATERAL" and i + 1 < len(t) and t[i + 1] == "(":
+            i += 1  # skip LATERAL
+            lat_inner, i = _extract_paren_tokens(t, i)
+            lat_ast = _parse_tokens(lat_inner)
+            lat_alias, i = _parse_table_alias(t, i, "sub")
+            extra_implicit.append({"join_type": "INNER", "right_table": "__lateral__",
+                                    "right_alias": lat_alias, "lateral_subquery": lat_ast,
+                                    "on_left": None, "on_right": None, "on_clause": None})
+        else:
+            nxt_tbl = t[i]; i += 1
+            nxt_alias, i = _parse_table_alias(t, i, nxt_tbl)
+            from_tables.append((nxt_tbl, nxt_alias))
+    if len(from_tables) > 1 or extra_implicit:
+        # Build the right-side of the first join
+        if len(from_tables) >= 2:
+            first_right_tbl   = from_tables[1][0]
+            first_right_alias = from_tables[1][1]
+            first_join_type   = "CROSS"
+            first_on_l = first_on_r = None
+            tail_extra = [
+                {"join_type": "CROSS", "right_table": tbl, "right_alias": ali,
+                 "on_left": None, "on_right": None}
+                for tbl, ali in from_tables[2:]
+            ] + extra_implicit
+        else:
+            # Only lateral(s) in extra_implicit; promote first one
+            first_ej = extra_implicit[0]
+            first_right_tbl   = first_ej["right_table"]
+            first_right_alias = first_ej["right_alias"]
+            first_join_type   = first_ej.get("join_type", "INNER")
+            first_on_l = first_ej.get("on_left")
+            first_on_r = first_ej.get("on_right")
+            tail_extra = extra_implicit[1:]
         where, i          = _parse_where(t, i)
         group_by, having, i = _parse_group_having(t, i)
         order_by, limit, offset = _parse_order_limit(t, i)
-        return {
-            "op": "JOIN", "join_type": "CROSS",
+        base = {
+            "op": "JOIN", "join_type": first_join_type,
             "left_table":  from_tables[0][0], "left_alias":  from_tables[0][1],
-            "right_table": from_tables[1][0], "right_alias": from_tables[1][1],
-            "on_left": None, "on_right": None,
+            "right_table": first_right_tbl,   "right_alias": first_right_alias,
+            "on_left": first_on_l, "on_right": first_on_r, "on_clause": None,
             "columns": None if cols == ["*"] else cols,
             "col_aliases": col_aliases,
             "where": where, "group_by": group_by or None,
             "having": having, "order_by": order_by,
             "limit": limit, "offset": offset, "distinct": distinct,
-            "extra_joins": extra_implicit,
+            "extra_joins": tail_extra,
         }
+        if len(from_tables) < 2:
+            # Copy lateral_subquery from the promoted first extra join
+            if "lateral_subquery" in extra_implicit[0]:
+                base["lateral_subquery"] = extra_implicit[0]["lateral_subquery"]
+        return base
 
     join_type: str | None = None
     if i < len(t):
@@ -1174,20 +1277,34 @@ def _parse_select(t: list[str]) -> dict:
             join_type = "INNER"; i += 1
     if join_type is not None:
         right_table = t[i]; i += 1
-        if right_table.upper() in _TABLE_VALUED_FUNCS:
+        lateral_subquery: "dict | None" = None
+        if right_table.upper() == "LATERAL" and i < len(t) and t[i] == "(":
+            lat_inner, i = _extract_paren_tokens(t, i)
+            lateral_subquery = _parse_tokens(lat_inner)
+            right_table = "__lateral__"
+            right_alias, i = _parse_table_alias(t, i, "sub")
+        elif right_table.upper() in _TABLE_VALUED_FUNCS:
             right_table, i = _collect_func_call(t, right_table, i)
-        right_alias, i = _parse_table_alias(t, i, right_table)
+            right_alias, i = _parse_table_alias(t, i, right_table)
+        else:
+            right_alias, i = _parse_table_alias(t, i, right_table)
         on_left = on_right = None
+        on_clause = None
         _is_tvf = _JSON_EACH_RE_PARSER.match(right_table) is not None
-        if join_type not in ("CROSS", "NATURAL") and not _is_tvf:
+        _is_lateral = lateral_subquery is not None
+        if join_type not in ("CROSS", "NATURAL") and not _is_tvf and not _is_lateral:
             if i >= len(t) or t[i].upper() != "ON":
                 raise ParseError(f"Expected ON after {right_table} for {join_type} JOIN")
             i += 1
-            on_left = t[i]; i += 1
-            if i >= len(t) or t[i] != "=":
-                raise ParseError("Expected = in ON clause")
+            on_clause, i = _parse_where_expr(t, i)
+            # Extract simple equality for optimizer backward compatibility
+            if (on_clause and on_clause.op == "="
+                    and on_clause.and_clause is None and on_clause.or_clause is None):
+                on_left  = on_clause.col
+                on_right = on_clause.val
+        elif _is_lateral and i < len(t) and t[i].upper() == "ON":
             i += 1
-            on_right = t[i]; i += 1
+            on_clause, i = _parse_where_expr(t, i)  # e.g. ON true — parsed but ignored
         _JOIN_KWS = frozenset({"INNER", "LEFT", "RIGHT", "FULL", "CROSS",
                                "NATURAL", "JOIN"})
         extra_joins: list[dict] = []
@@ -1219,24 +1336,37 @@ def _parse_select(t: list[str]) -> dict:
             else:
                 ej_type = "INNER"; i += 1
             ej_right = t[i]; i += 1
-            ej_alias, i = _parse_table_alias(t, i, ej_right)
-            ej_on_l = ej_on_r = None
-            if ej_type not in ("CROSS", "NATURAL"):
+            ej_lat_sub = None
+            if ej_right.upper() == "LATERAL" and i < len(t) and t[i] == "(":
+                ej_lat_inner, i = _extract_paren_tokens(t, i)
+                ej_lat_sub = _parse_tokens(ej_lat_inner)
+                ej_right = "__lateral__"
+                ej_alias, i = _parse_table_alias(t, i, "sub")
+            else:
+                ej_alias, i = _parse_table_alias(t, i, ej_right)
+            ej_on_l = ej_on_r = ej_on_clause = None
+            if ej_type not in ("CROSS", "NATURAL") and ej_lat_sub is None:
                 if i >= len(t) or t[i].upper() != "ON":
                     raise ParseError(f"Expected ON after {ej_right}")
                 i += 1
-                ej_on_l = t[i]; i += 1
-                if i >= len(t) or t[i] != "=":
-                    raise ParseError("Expected = in ON clause")
+                ej_on_clause, i = _parse_where_expr(t, i)
+                if (ej_on_clause and ej_on_clause.op == "="
+                        and ej_on_clause.and_clause is None
+                        and ej_on_clause.or_clause is None):
+                    ej_on_l = ej_on_clause.col
+                    ej_on_r = ej_on_clause.val
+            elif ej_lat_sub is not None and i < len(t) and t[i].upper() == "ON":
                 i += 1
-                ej_on_r = t[i]; i += 1
+                ej_on_clause, i = _parse_where_expr(t, i)  # ON true etc — parsed but not used
             extra_joins.append({"join_type": ej_type, "right_table": ej_right,
                                 "right_alias": ej_alias,
-                                "on_left": ej_on_l, "on_right": ej_on_r})
+                                "on_left": ej_on_l, "on_right": ej_on_r,
+                                "on_clause": ej_on_clause,
+                                **({"lateral_subquery": ej_lat_sub} if ej_lat_sub else {})})
         where, i                = _parse_where(t, i)
         group_by, having, i     = _parse_group_having(t, i)
         order_by, limit, offset = _parse_order_limit(t, i)
-        return {
+        base_join: dict = {
             "op":           "JOIN",
             "join_type":    join_type,
             "left_table":   table,
@@ -1245,6 +1375,7 @@ def _parse_select(t: list[str]) -> dict:
             "right_alias":  right_alias,
             "on_left":      on_left,
             "on_right":     on_right,
+            "on_clause":    on_clause,
             "columns":      None if cols == ["*"] else cols,
             "col_aliases":  col_aliases,
             "where":        where,
@@ -1255,21 +1386,26 @@ def _parse_select(t: list[str]) -> dict:
             "offset":       offset,
             "extra_joins":  extra_joins,
         }
+        if lateral_subquery is not None:
+            base_join["lateral_subquery"] = lateral_subquery
+        return base_join
     where, i                    = _parse_where(t, i)
     group_by, having, i         = _parse_group_having(t, i)
+    named_windows, i            = _parse_window_defs(t, i)
     order_by, limit, offset     = _parse_order_limit(t, i)
     return {
-        "op":         "SELECT",
-        "table":      table,
-        "columns":    None if cols == ["*"] else cols,
-        "col_aliases": col_aliases,
-        "where":      where,
-        "group_by":   group_by or None,
-        "having":     having,
-        "order_by":   order_by,
-        "limit":      limit,
-        "offset":     offset,
-        "distinct":   distinct,
+        "op":             "SELECT",
+        "table":          table,
+        "columns":        None if cols == ["*"] else cols,
+        "col_aliases":    col_aliases,
+        "where":          where,
+        "group_by":       group_by or None,
+        "having":         having,
+        "named_windows":  named_windows or None,
+        "order_by":       order_by,
+        "limit":          limit,
+        "offset":         offset,
+        "distinct":       distinct,
     }
 
 

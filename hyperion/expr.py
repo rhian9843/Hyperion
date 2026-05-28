@@ -13,6 +13,18 @@ from .json_funcs import eval_json_func as _eval_json_func
 _USER_FUNCS: dict[str, tuple[int, Any]] = {}   # name → (n_args, callable)
 _USER_AGGS:  dict[str, tuple[int, Any]] = {}   # name → (n_args, aggregate_class)
 
+# ── Last insert rowid tracking ─────────────────────────────────────────────────
+_LAST_INSERT_ROWID: int | None = None
+
+
+def _set_last_insert_rowid(rowid: int) -> None:
+    global _LAST_INSERT_ROWID
+    _LAST_INSERT_ROWID = rowid
+
+
+def get_last_insert_rowid() -> int | None:
+    return _LAST_INSERT_ROWID
+
 _ARITH_OPS = frozenset({"+", "-", "*", "/", "%", "||"})
 _COMP_OPS  = frozenset({"=", "!=", "<", ">", "<=", ">="})
 
@@ -206,6 +218,9 @@ def _split_args(args_str: str) -> list[str]:
 
 
 def _eval_func(fname: str, args_str: str, row: dict) -> Any:
+    if fname == "LAST_INSERT_ROWID":
+        return _LAST_INSERT_ROWID
+
     if fname == "CAST":
         m = re.match(r'(.+?)\s+AS\s+(\w+)\s*$', args_str, re.IGNORECASE)
         if not m:

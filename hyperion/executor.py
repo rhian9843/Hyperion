@@ -1,7 +1,18 @@
 import re
 import struct
+import time
 from collections import defaultdict
 from typing import Any
+
+
+class QueryTimeoutError(RuntimeError):
+    """Raised when a query exceeds its allotted execution time."""
+
+
+def _check_timeout(db: "Database") -> None:
+    deadline = getattr(db, "_query_deadline", None)
+    if deadline is not None and time.monotonic() > deadline:
+        raise QueryTimeoutError("Query timed out")
 
 from .database import Database
 from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, _make_index_key
@@ -17,6 +28,7 @@ from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
 from .query import _project_row, _parse_agg as _q_parse_agg
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
+from .where import _instantiate_correlated
 
 def _is_single_string_literal(val: str) -> bool:
     """True iff val is exactly one single-quoted SQL string (not a concat expression)."""
@@ -36,11 +48,58 @@ def _is_single_string_literal(val: str) -> bool:
 
 # ── Window function helpers ────────────────────────────────────────────────────
 
-_WINDOW_RE = re.compile(r'\bOVER\s*\(', re.IGNORECASE)
+_WINDOW_RE       = re.compile(r'\bOVER\s*\(',      re.IGNORECASE)
+_WINDOW_NAMED_RE = re.compile(r'\bOVER\s+(\w+)\s*$', re.IGNORECASE)
+
+
+def _parse_bound(s: str) -> tuple:
+    s = s.strip().upper()
+    if s == "UNBOUNDED PRECEDING": return ("UNBOUNDED", "PRECEDING")
+    if s == "UNBOUNDED FOLLOWING": return ("UNBOUNDED", "FOLLOWING")
+    if s == "CURRENT ROW":         return ("CURRENT",   "ROW")
+    m = re.match(r'(\d+)\s+(PRECEDING|FOLLOWING)', s)
+    if m: return (int(m.group(1)), m.group(2))
+    return ("UNBOUNDED", "PRECEDING")
+
+
+def _parse_frame_spec(text: str) -> dict:
+    """Parse ROWS/RANGE BETWEEN X AND Y (or ROWS/RANGE X)."""
+    uc = text.strip().upper()
+    mode_m = re.match(r'(ROWS|RANGE|GROUPS)\s+', uc)
+    mode = mode_m.group(1) if mode_m else "ROWS"
+    rest = uc[mode_m.end():] if mode_m else uc
+    if rest.startswith("BETWEEN"):
+        rest = rest[len("BETWEEN"):].strip()
+        and_pos = re.search(r'\bAND\b', rest)
+        if and_pos:
+            lo_str = rest[:and_pos.start()].strip()
+            hi_str = rest[and_pos.end():].strip()
+        else:
+            lo_str = rest; hi_str = "CURRENT ROW"
+    else:
+        lo_str = rest; hi_str = "CURRENT ROW"
+    return {"mode": mode, "lo": _parse_bound(lo_str), "hi": _parse_bound(hi_str)}
+
+
+def _frame_slice(indices: list[int], pos: int, frame: dict) -> list[int]:
+    """Return indices within the frame for the row at sorted position `pos`."""
+    n = len(indices)
+
+    def _to_pos(spec: tuple) -> int:
+        kind = spec[0]
+        if kind == "UNBOUNDED": return 0 if spec[1] == "PRECEDING" else n - 1
+        if kind == "CURRENT":   return pos
+        offset = kind  # numeric
+        return max(0, pos - offset) if spec[1] == "PRECEDING" else min(n - 1, pos + offset)
+
+    lo = _to_pos(frame["lo"])
+    hi = _to_pos(frame["hi"])
+    return indices[lo: hi + 1]
 
 
 def _parse_window_col(expr: str) -> dict | None:
-    """Parse 'fn(args) OVER (PARTITION BY … ORDER BY …)'. Returns None if not a window expr."""
+    """Parse 'fn(args) OVER (PARTITION BY … ORDER BY … [frame])'.
+    Returns None if not a window expr."""
     m = _WINDOW_RE.search(expr)
     if not m:
         return None
@@ -62,6 +121,7 @@ def _parse_window_col(expr: str) -> dict | None:
 
     partition_by: list[str] = []
     order_by:     list[dict] = []
+    frame:        dict | None = None
     uc = over_content.upper()
     pb_m = re.search(r'\bPARTITION\s+BY\b', uc)
     ob_m = re.search(r'\bORDER\s+BY\b',     uc)
@@ -69,13 +129,19 @@ def _parse_window_col(expr: str) -> dict | None:
         pb_end = ob_m.start() if ob_m else len(over_content)
         partition_by = [c.strip() for c in over_content[pb_m.end():pb_end].split(",") if c.strip()]
     if ob_m:
-        for spec in over_content[ob_m.end():].split(","):
+        ob_content = over_content[ob_m.end():]
+        uc_ob = ob_content.upper()
+        frame_m = re.search(r'\b(ROWS|RANGE|GROUPS)\b', uc_ob)
+        ob_str = ob_content[:frame_m.start()].strip() if frame_m else ob_content.strip()
+        if frame_m:
+            frame = _parse_frame_spec(ob_content[frame_m.start():])
+        for spec in ob_str.split(","):
             parts = spec.strip().split()
             if parts:
                 desc = len(parts) > 1 and parts[1].upper() == "DESC"
                 order_by.append({"col": parts[0], "desc": desc})
     return {"fn": fn_name, "args": fn_args,
-            "partition_by": partition_by, "order_by": order_by}
+            "partition_by": partition_by, "order_by": order_by, "frame": frame}
 
 
 def _get_col_val(row: dict, col: str) -> Any:
@@ -151,23 +217,43 @@ def _apply_one_window(rows: list[dict], col: str, wf: dict) -> None:
                 rows[idx][col] = (pos * n) // total + 1
 
         elif fn == "FIRST_VALUE":
-            tcol = fn_args[0].strip() if fn_args else None
+            tcol  = fn_args[0].strip() if fn_args else None
+            frame = wf.get("frame")
             if tcol:
-                fv = _get_col_val(p_rows[0], tcol)
-                for idx in indices:
+                for pos, idx in enumerate(indices):
+                    fr = _frame_slice(indices, pos, frame) if frame else indices
+                    fv = _get_col_val(rows[fr[0]], tcol) if fr else None
                     rows[idx][col] = fv
 
         elif fn == "LAST_VALUE":
-            tcol = fn_args[0].strip() if fn_args else None
+            tcol  = fn_args[0].strip() if fn_args else None
+            frame = wf.get("frame")
             if tcol:
-                lv = _get_col_val(p_rows[-1], tcol)
-                for idx in indices:
+                for pos, idx in enumerate(indices):
+                    fr = _frame_slice(indices, pos, frame) if frame else indices
+                    lv = _get_col_val(rows[fr[-1]], tcol) if fr else None
                     rows[idx][col] = lv
 
         elif fn in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
-            tcol   = fn_args[0].strip() if fn_args else None
+            tcol    = fn_args[0].strip() if fn_args else None
             is_star = not tcol or tcol == "*"
-            if fn == "COUNT" and is_star:
+            frame   = wf.get("frame")
+            if frame is not None:
+                # Per-row frame: each row gets its own aggregate over its frame window
+                for pos, idx in enumerate(indices):
+                    fr_idxs = _frame_slice(indices, pos, frame)
+                    fr_rows = [rows[i] for i in fr_idxs]
+                    if fn == "COUNT" and is_star:
+                        rows[idx][col] = len(fr_rows)
+                    elif tcol:
+                        nn = [v for r in fr_rows
+                              if (v := _get_col_val(r, tcol)) is not None]
+                        if fn == "SUM":   rows[idx][col] = sum(nn) if nn else None
+                        elif fn == "MIN": rows[idx][col] = min(nn) if nn else None
+                        elif fn == "MAX": rows[idx][col] = max(nn) if nn else None
+                        elif fn == "AVG": rows[idx][col] = sum(nn)/len(nn) if nn else None
+                        else:             rows[idx][col] = len(nn)
+            elif fn == "COUNT" and is_star:
                 agg = len(indices)
                 for idx in indices:
                     rows[idx][col] = agg
@@ -183,11 +269,25 @@ def _apply_one_window(rows: list[dict], col: str, wf: dict) -> None:
                     rows[idx][col] = agg
 
 
-def _apply_window_functions(rows: list[dict], cols: list[str]) -> list[dict]:
+def _expand_named_window(col: str, named_windows: dict) -> str:
+    """Replace 'fn() OVER w' with 'fn() OVER (window_spec)' for a named window ref."""
+    m = _WINDOW_NAMED_RE.search(col)
+    if m:
+        name = m.group(1).upper()
+        if name in named_windows:
+            return col[:m.start()] + f"OVER ({named_windows[name]})"
+    return col
+
+
+def _apply_window_functions(rows: list[dict], cols: list[str],
+                            named_windows: dict | None = None) -> list[dict]:
     """Compute any window-function columns and inject them into each row."""
     if not rows or not cols:
         return rows
-    defs = [(c, _parse_window_col(c)) for c in cols if c != "*"]
+    nw = named_windows or {}
+    expanded = [_expand_named_window(c, nw) if c != "*" else c for c in cols]
+    defs = [(orig, _parse_window_col(exp))
+            for orig, exp in zip(cols, expanded) if orig != "*"]
     defs = [(c, w) for c, w in defs if w is not None]
     if not defs:
         return rows
@@ -325,20 +425,38 @@ def _apply_groupby_agg(rows: list[dict], columns: list[str] | None,
 
 
 def _exec_extra_join(rows: list[dict], join_info: dict,
-                     db: "Database") -> list[dict]:
+                     db: "Database", ctes: dict | None = None) -> list[dict]:
     """Apply one additional JOIN step in-memory against an already-joined row set."""
     right_table = join_info["right_table"]
     right_alias = join_info.get("right_alias") or right_table
     join_type   = join_info.get("join_type", "INNER")
+    on_clause   = join_info.get("on_clause")
     on_left     = join_info.get("on_left")
     on_right    = join_info.get("on_right")
     rcol        = on_right.split(".")[-1] if on_right else None
+    lat_sub     = join_info.get("lateral_subquery")
+
+    # LATERAL: for each left row, re-execute the subquery with outer context
+    if lat_sub is not None:
+        result: list[dict] = []
+        for lr in rows:
+            inst = {**lat_sub, "where": _instantiate_correlated(lat_sub.get("where"), lr)}
+            lat_rows = _rows_for_stmt(inst, db, ctes or {})
+            if lat_rows:
+                for rr in lat_rows:
+                    merged = dict(lr)
+                    merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
+                    result.append(merged)
+            elif join_type in ("LEFT", "FULL"):
+                result.append(dict(lr))
+        return result
 
     rmeta      = db._meta(right_table)
     right_null = {f"{right_alias}.{c.name}": None for c in rmeta.schema.columns}
 
-    # Use INLJ for INNER joins when the right side has an index on the join column
-    use_inlj = (join_type == "INNER" and rcol is not None
+    # INLJ only for simple single-equality ON with an index on the right column
+    use_inlj = (join_type == "INNER" and rcol is not None and on_clause is not None
+                and on_clause.and_clause is None and on_clause.or_clause is None
                 and _find_eq_index(db, right_table, rcol) is not None)
 
     if not use_inlj:
@@ -349,18 +467,17 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     matched_right: set[int] = set()
 
     for lr in rows:
-        if rcol is None:            # CROSS JOIN
+        if on_clause is None and on_left is None:   # CROSS JOIN
             for rr in right_rows:  # type: ignore[possibly-undefined]
                 merged = dict(lr)
                 merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
                 result.append(merged)
             continue
 
-        lval = lr.get(on_left) if on_left else None
-        if lval is None and on_left:
-            lval = lr.get(on_left.split(".")[-1])
-
         if use_inlj:
+            lval = lr.get(on_left) if on_left else None
+            if lval is None and on_left:
+                lval = lr.get(on_left.split(".")[-1])
             if lval is None:
                 continue  # INNER JOIN: NULL never matches
             probed = _probe_index(db, right_table, rcol, lval)
@@ -370,13 +487,20 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
                 result.append(merged)
         else:
             on_matched = False
+            lcol = on_left.split(".")[-1] if on_left else None
             for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
-                if lval != rr.get(rcol):
-                    continue
-                on_matched = True
-                matched_right.add(j)
                 merged = dict(lr)
                 merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
+                if on_clause is not None:
+                    if not on_clause.evaluate(merged, db):
+                        continue
+                else:
+                    lval = lr.get(on_left) or lr.get(lcol)  # type: ignore[arg-type]
+                    rval = rr.get(rcol)
+                    if lval != rval:
+                        continue
+                on_matched = True
+                matched_right.add(j)
                 result.append(merged)
             if not on_matched and join_type in ("LEFT", "FULL"):
                 merged = dict(lr)
@@ -440,7 +564,10 @@ def _materialize_table(tname: str, db: "Database", ctes: dict,
     else:
         from .schema import deserialize_row
         meta = db._meta(tname)
-        raw = [deserialize_row(meta.schema, r) for _, r in db._table_btree(meta).scan()]
+        raw = []
+        for _, r in db._table_btree(meta).scan():
+            _check_timeout(db)
+            raw.append(deserialize_row(meta.schema, r))
     if alias:
         return [{f"{alias}.{k}": v for k, v in row.items()} for row in raw]
     return raw
@@ -450,32 +577,22 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
     """Nested-loop join when one or both tables are CTEs or views."""
     ltbl   = stmt["left_table"]
     rtbl   = stmt["right_table"]
-    lalias = stmt.get("left_alias") or ltbl
-    ralias = stmt.get("right_alias") or rtbl
-    on_left  = stmt.get("on_left")
-    on_right = stmt.get("on_right")
+    lalias    = stmt.get("left_alias") or ltbl
+    ralias    = stmt.get("right_alias") or rtbl
+    on_clause = stmt.get("on_clause")
     join_type = stmt.get("join_type", "INNER")
 
     left_rows = _materialize_table(ltbl, db, ctes)
+    _lat_sub = stmt.get("lateral_subquery")
     # Detect lateral TVF: right side may be correlated (e.g. json_each(t.col))
     _rtbl_is_tvf = bool(_JSON_EACH_RE.match(rtbl))
-    right_rows_static = None if _rtbl_is_tvf else _materialize_table(rtbl, db, ctes)
-
-    # Prefix keys with alias so ON and WHERE can find them via both alias.col and col
-    def _key(row: dict, col: str | None) -> object:
-        if col is None:
-            return None
-        if col in row:
-            return row[col]
-        bare = col.split(".")[-1]
-        if bare in row:
-            return row[bare]
-        for k, v in row.items():
-            if k.split(".")[-1] == bare:
-                return v
-        return None
+    right_rows_static = (None if (_rtbl_is_tvf or _lat_sub)
+                         else _materialize_table(rtbl, db, ctes))
 
     def _right_rows_for(lr: dict) -> list[dict]:
+        if _lat_sub is not None:
+            inst = {**_lat_sub, "where": _instantiate_correlated(_lat_sub.get("where"), lr)}
+            return _rows_for_stmt(inst, db, ctes)
         if not _rtbl_is_tvf:
             return right_rows_static  # type: ignore[return-value]
         # Lateral TVF: substitute column references in the TVF call from lr
@@ -488,18 +605,17 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
     result: list[dict] = []
     matched_right: set[int] = set()
     for lr in left_rows:
+        _check_timeout(db)
         matched = False
-        lval = _key(lr, on_left)
         right_rows = _right_rows_for(lr)
         for ri, rr in enumerate(right_rows):
-            rval = _key(rr, on_right)
-            if on_left is None or lval == rval:
-                merged = {**lr, **rr}
-                # Also add alias-prefixed keys for each side
-                for k, v in lr.items():
-                    merged[f"{lalias}.{k.split('.')[-1]}"] = v
-                for k, v in rr.items():
-                    merged[f"{ralias}.{k.split('.')[-1]}"] = v
+            # Build the merged row (with alias-prefixed keys) before evaluating ON
+            merged = {**lr, **rr}
+            for k, v in lr.items():
+                merged[f"{lalias}.{k.split('.')[-1]}"] = v
+            for k, v in rr.items():
+                merged[f"{ralias}.{k.split('.')[-1]}"] = v
+            if on_clause is None or on_clause.evaluate(merged, db):
                 result.append(merged)
                 matched = True
                 matched_right.add(ri)
@@ -507,6 +623,10 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
             merged = dict(lr)
             for k, v in lr.items():
                 merged[f"{lalias}.{k.split('.')[-1]}"] = v
+            r_ref = right_rows_static[0] if right_rows_static else {}
+            for k in r_ref:
+                merged.setdefault(k, None)
+                merged.setdefault(f"{ralias}.{k.split('.')[-1]}", None)
             result.append(merged)
 
     if join_type in ("RIGHT", "RIGHT OUTER") and right_rows_static is not None:
@@ -532,6 +652,7 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     This is the single authoritative SELECT execution path.  _execute_inner
     delegates all SELECT/JOIN/SET_OP ops here and just formats the result.
     """
+    _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     op = stmt["op"]
     if op == "INLINE_ROWS":
@@ -545,7 +666,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     if op == "SELECT":
         s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
         stmt_cols = stmt.get("columns") or []
-        has_window    = any(_WINDOW_RE.search(c) for c in stmt_cols if c != "*")
+        nw = stmt.get("named_windows") or {}
+        has_window    = any(_WINDOW_RE.search(c) or _WINDOW_NAMED_RE.search(c)
+                            for c in stmt_cols if c != "*")
         has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
         tbl = s.get("table") or ""
         if s.get("subquery_from"):
@@ -589,9 +712,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
                     augmented.append(r)
                 all_rows = augmented
             if has_window:
-                all_rows = _apply_window_functions(all_rows, stmt_cols)
+                all_rows = _apply_window_functions(all_rows, stmt_cols, nw)
+            all_rows = _apply_order_limit(all_rows, s.get("order_by"), s.get("limit"), s.get("offset"))
             rows = [_project_row(r, stmt_cols) for r in all_rows] if stmt_cols else all_rows
-            rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
         else:
             col_aliases = stmt.get("col_aliases") or {}
             raw = db.select(s["table"], s["columns"], s["where"],
@@ -610,10 +733,16 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         group_by = s.get("group_by")
         has_agg  = (group_by or (s.get("having") is not None) or any(
             _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*"))
+        multi_cond_on = s.get("on_clause") is not None and s.get("on_left") is None
+        has_lateral = (rtbl == "__lateral__" or s.get("lateral_subquery") is not None
+                       or any(ej.get("lateral_subquery") for ej in (s.get("extra_joins") or [])))
         if (ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views
-                or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl) or has_agg):
+                or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl)
+                or has_agg or multi_cond_on or has_lateral):
             raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
             raw_rows = _exec_in_memory_join(raw_stmt, db, ctes)
+            for ej in (s.get("extra_joins") or []):
+                raw_rows = _exec_extra_join(raw_rows, ej, db, ctes)
             if has_agg:
                 raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
                                               group_by, s.get("having"), db)
@@ -632,7 +761,7 @@ def _rows_for_stmt(stmt: dict, db: "Database",
                            left_alias=s.get("left_alias"),
                            right_alias=s.get("right_alias"))
             for ej in extra:
-                rows = _exec_extra_join(rows, ej, db)
+                rows = _exec_extra_join(rows, ej, db, ctes)
             if s.get("where"):
                 rows = [r for r in rows if s["where"].evaluate(r, db)]
             if s.get("columns"):

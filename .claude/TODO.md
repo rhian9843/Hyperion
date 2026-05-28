@@ -149,3 +149,74 @@
 - [x] Refactor `_parse_tokens` (1,420 lines) into per-statement parser functions — the monolithic function makes it hard to isolate bugs and the expressions-in-VALUES bug is a direct consequence of it
 - [x] Unify `_execute_inner` and `_rows_for_stmt` execution paths — JOIN+aggregation, CTE resolution, and GROUP BY fixes applied to one path must be manually mirrored to the other; the divergence is the root cause of the JOIN+GROUP BY and CTE+JOIN bugs
 - [x] Update module docstring — currently missing joins, aggregates, transactions, constraints, set operations, subqueries
+
+## SQL Layer Gaps
+
+### Query / Parser
+
+- [x] Multi-condition JOIN ON — `ON a.x = b.y AND a.z = b.w`; today the parser enforces a single `left = right` token pair and raises a parse error on anything more complex
+- [x] Window function frame bounds — `ROWS BETWEEN N PRECEDING AND CURRENT ROW` / `RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`; today only the default unbounded frame is supported
+- [x] Named WINDOW clause — `SELECT ROW_NUMBER() OVER w ... WINDOW w AS (PARTITION BY x ORDER BY y)`; today every OVER must be fully inline
+- [x] `LATERAL` join — `FROM t, LATERAL (SELECT ... WHERE s.id = t.id) AS sub`; needed for correlated table-valued subqueries in FROM
+- [x] Multi-column row comparison — `WHERE (col1, col2) IN (SELECT a, b FROM t)` and `WHERE (col1, col2) = (val1, val2)`
+
+### Indexes / Optimizer
+
+- [ ] Text index ordering — TEXT/VARCHAR index keys are FNV-1a hashes; range predicates (`WHERE name > 'M'`), `BETWEEN`, and `ORDER BY` with index all produce wrong or suboptimal results; text B-tree keys need to be prefix-encoded byte strings so sort order is preserved
+- [ ] Outer join optimisation — the cost-based join reorderer only runs on chains of INNER equijoins; LEFT / RIGHT / FULL OUTER joins are never reordered regardless of table sizes
+- [ ] Range predicate index use — `WHERE int_col > 100` never uses an index today; the optimizer only probes indexes for equality (`=`); `scan_range` exists on BTree but is never invoked from the query planner
+- [ ] True prepared statements — the current `_bind_params` substitutes values into the SQL string *before* parsing, so every call with different parameter values produces a different string and a guaranteed cache miss; a plan cache keyed on the raw template string (`"SELECT ... WHERE id = ?"`) is therefore a no-op for all parameterised queries; fix requires two-phase execution: (1) parse and plan the SQL with `?` placeholders intact and cache that plan, (2) bind actual values at execution time against the already-parsed plan; this also unblocks vector parameter binding — passing a float list as `?` currently serialises it to a string literal `'[0.1, 0.2, 0.3]'` that must be re-parsed at query time
+
+### Storage
+
+- [ ] Variable-length row storage — TEXT and BLOB columns have a hard fixed maximum size (TEXT defaults to 255 bytes, page size is 4 096 bytes); rows that overflow a page cannot exist; this blocks storing large documents, JSON payloads, or any binary payload above ~4 000 bytes; requires an overflow-page mechanism (linked extra pages per row)
+- [ ] Streaming / iterator query results — all queries fully materialise `list[dict]` in memory before the first row is returned; a generator-based execution path is needed so large result sets can be consumed row-by-row without holding everything in RAM
+- [ ] MVCC / snapshot isolation — today reads are blocked by the exclusive flock held during writes (single-writer model); concurrent readers inside the same process see mid-transaction state; a proper snapshot or copy-on-write read path is needed for multi-connection safety
+- [ ] WAL checkpointing — the WAL file is deleted immediately after every commit so there is no multi-transaction WAL efficiency; a checkpoint strategy (write-back on threshold, not per-commit) would reduce fsync pressure under write-heavy workloads
+- [ ] Catalog scalability — the entire catalog (all table schemas, index metadata, ANALYZE stats, trigger definitions) is serialised as a single JSON blob and rewritten on every commit; this degrades linearly with the number of objects and is unsuitable once the schema grows large
+- [ ] Thread safety — `Database._cache`, `_dirty`, `_txn_depth`, `_catalog`, and `_savepoints` are unsynchronised mutable state; two threads sharing one `Database` object will corrupt each other silently; Python async frameworks (FastAPI, LangChain, asyncio thread pool executors) routinely call synchronous I/O from worker threads — every agent that does this is a data corruption risk; requires a `threading.RLock` per `Database` instance at minimum
+- [ ] Page checksums — no CRC or hash is stored on individual pages; a single bad write from an OS bug, disk firmware issue, or partial flush goes undetected; `PRAGMA integrity_check` catches structural B-tree violations but not bit-level corruption within a structurally-valid page; for a database storing embeddings and LLM outputs, silent corruption produces wrong answers with no signal
+
+## LLM / Agent Layer Prerequisites
+
+### Bugs that break agent workflows today
+
+- [x] `cursor.description` is `None` on empty result sets — when a SELECT returns zero rows, `description` is set to `None` instead of the column metadata; an agent checking the schema of a table via a zero-row query gets nothing back (verified: `db.execute("SELECT * FROM t WHERE 1=0").description` returns `None`)
+- [x] `cursor.lastrowid` is never populated — always `None` after INSERT regardless of `AUTOINCREMENT`; an agent that inserts a row and needs the generated key has no way to retrieve it without a separate `SELECT` call; `last_insert_rowid()` is also not implemented as a SQL function
+- [x] `INTEGER PRIMARY KEY` does not alias the B-tree rowid — `lastrowid` returned the internal sequence counter (1, 2, 3…) instead of the user-supplied PK value; `last_insert_rowid()` was equally wrong; also wasted storage serialising the PK both as a column and as a separate B-tree key; fixed by using the column value directly as the rowid and keeping `next_key` as the high-water mark for auto-assignment
+
+### Safety
+
+- [x] Query timeout / cancellation — no mechanism to abort a query after a deadline; LLM-generated SQL can produce accidental cartesian joins or deep recursive CTEs that run indefinitely; needs a `timeout_ms` parameter on `execute()` and a cooperative check inside the execution loop
+- [ ] Max result rows guard — no built-in limit on rows returned; an agent issuing `SELECT * FROM large_table` will materialise the entire table in memory with no warning; needs a configurable `max_rows` on the `Database` or cursor level that raises before fetching
+- [ ] Read-only connection mode — no way to open a `Database` that is guaranteed never to write; LLM query agents should be able to operate in a mode where any INSERT / UPDATE / DELETE / DDL raises immediately rather than relying on the authorizer hook
+
+### Usability for agents
+
+- [ ] Structured error types — every error from the engine is a plain `RuntimeError` with a human-readable string; LLM agents need to distinguish parse errors (`ParseError`), constraint violations, type errors, and missing-table errors to self-correct without re-parsing an English message
+- [ ] Async API — no `async def execute()` or asyncio support anywhere; agents built on asyncio/trio frameworks block their entire event loop on every database call; needs an `AsyncDatabase` / `AsyncCursor` wrapper or native coroutine execution path
+- [ ] `executescript` discards SELECT results — when a script contains a SELECT statement the rows are silently dropped; an agent running a multi-statement script that includes a SELECT gets no data back
+- [ ] Schema semantic metadata — no mechanism to attach descriptions or semantic tags to tables and columns; the LLM text-to-SQL layer can only infer meaning from names alone; a `_hyperion_schema_meta` system table with `(object_type, object_name, key, value)` rows would let the LLM layer read column descriptions, embedding model names, tenant boundary markers, and other context needed for accurate SQL generation
+
+## Vector Database Prerequisites
+
+> **Dependency order** — these items have a strict prerequisite chain and cannot be parallelised:
+> `Variable-length row storage` → `VECTOR(n) type` → `ANN index (HNSW)` → `Hybrid search planner`
+> Similarly on the agent side: `Thread safety` → `MVCC` → `Async API` (async safety depends on both).
+
+### Storage
+
+- [ ] `VECTOR(n)` column type — a first-class column type that stores an n-dimensional float32 vector as `n × 4` bytes; declared dimensionality must be enforced on write; dimensionality must be visible in `PRAGMA table_info`; requires the variable-length row storage fix as a prerequisite for `n > ~900`
+- [ ] Bulk vector insert — inserting embeddings individually through the standard INSERT path (B-tree insert + constraint check + trigger + index update per row) is impractical at 100k+ vectors; needs a batch-optimised write path that amortises the per-row overhead across a bulk operation
+
+### Search
+
+- [ ] Vector similarity operators — `<->` (L2 / Euclidean distance), `<=>` (cosine similarity), `<#>` (dot product) as SQL infix operators usable in `ORDER BY` and `WHERE` for exact brute-force similarity scan; e.g. `SELECT id FROM docs ORDER BY embedding <=> query_vec LIMIT 10`
+- [ ] ANN index (HNSW or IVF) — an approximate nearest neighbour index structure for sub-linear vector search; the current B-tree is unsuitable for high-dimensional vectors; HNSW (Hierarchical Navigable Small World) is the standard choice; the index structure needs its own storage format outside the row B-tree
+- [ ] Hybrid search planner — a single query that applies SQL predicate filters AND ranks by vector similarity without materialising the full table; the planner must understand how to combine an ANN probe result set with a WHERE clause pushdown so that filters run before or alongside the ANN scan, not after
+
+### Full-Text Search
+
+- [ ] Inverted index (FTS) — an in-engine inverted index mapping terms to `(rowid, frequency)` posting lists; required for keyword search over text columns; the B-tree index only supports equality and range on raw values, not tokenised term lookup; storage must be efficient for large vocabularies across millions of documents
+- [ ] BM25 / TF-IDF scoring — once an inverted index exists, a `bm25(col, query)` scoring function and `MATCH` operator so queries like `SELECT * FROM docs WHERE body MATCH 'neural network' ORDER BY bm25(body, 'neural network') DESC` work; BM25 is the standard baseline for keyword retrieval in production RAG systems
+- [ ] Hybrid retrieval query — combine FTS BM25 score and vector similarity score in a single query with configurable weighting (`alpha * bm25_score + (1-alpha) * cosine_score`); this is the core retrieval primitive for production RAG and requires the planner to understand both index types simultaneously
