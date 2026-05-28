@@ -68,8 +68,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         if self._txn_depth == 0:
             self._pager.begin()
             self._txn_depth = 1
-        pages_snap = {n: bytes(self._pager._cache[n])
-                      for n in self._pager._dirty if n in self._pager._cache}
+        pages_snap = {n: bytes(self._pager._working[n])
+                      for n in self._pager._dirty if n in self._pager._working}
         dirty_snap = set(self._pager._dirty)
         cat_bytes  = self._catalog.to_bytes()
         cat_extra  = list(self._catalog_extra)
@@ -85,10 +85,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
         # Evict pages added after the savepoint
         for pn in set(self._pager._dirty) - dirty_snap:
-            self._pager._cache.pop(pn, None)
-        # Restore snapshotted page contents
+            self._pager._working.pop(pn, None)
+        # Restore snapshotted working pages to savepoint state
         for pn, content in pages_snap.items():
-            self._pager._cache[pn] = bytearray(content)
+            self._pager._working[pn] = bytearray(content)
         self._pager._dirty = set(dirty_snap)
         # Restore catalog
         self._catalog      = Catalog.from_bytes(cat_bytes)

@@ -24,10 +24,11 @@ class Pager:
         _flock(self._file.fileno(), 2)   # LOCK_EX
         WAL.replay_if_exists(wal_path, self._file)
         _flock(self._file.fileno(), 1)   # LOCK_SH — hold while open
-        self._path  = path
-        self._cache: dict[int, bytearray] = {}
-        self._dirty: set[int] = set()
-        self._wal:   WAL | None = None
+        self._path    = path
+        self._cache:   dict[int, bytearray] = {}  # committed pages (stable snapshot)
+        self._working: dict[int, bytearray] = {}  # in-transaction copy-on-write pages
+        self._dirty:   set[int] = set()
+        self._wal:     WAL | None = None
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -39,11 +40,28 @@ class Pager:
         return self._cache[num]
 
     def read_page(self, num: int) -> bytearray:
-        """Return a cached page without marking it dirty (read-only path)."""
+        """Return the current view of a page without marking it dirty.
+
+        During a write transaction returns the working (in-progress) copy so
+        the writer can read its own writes.  Outside a transaction — including
+        concurrent streaming readers on the same connection — returns the
+        committed snapshot from _cache, preventing dirty reads.
+        """
+        if self._wal is not None and num in self._working:
+            return self._working[num]
         return self._load(num)
 
     def get_page(self, num: int) -> bytearray:
-        """Return a cached page and mark it dirty (write path)."""
+        """Return a writable page and mark it dirty.
+
+        During a transaction the page is copy-on-write'd into _working so
+        that _cache always holds the pre-transaction committed state.
+        """
+        if self._wal is not None:
+            if num not in self._working:
+                self._working[num] = bytearray(self._load(num))
+            self._dirty.add(num)
+            return self._working[num]
         page = self._load(num)
         self._dirty.add(num)
         return page
@@ -55,15 +73,17 @@ class Pager:
         if self._wal is not None:
             raise RuntimeError("Transaction already active")
         _flock(self._file.fileno(), 2)   # LOCK_EX — upgrade from shared
+        self._working.clear()
         self._dirty.clear()
         self._wal = WAL(self._path.with_suffix(".wal"))
 
     def commit(self) -> None:
         if self._wal is None:
             raise RuntimeError("No active transaction")
-        dirty = {n: self._cache[n] for n in self._dirty if n in self._cache}
-        self._wal.commit(dirty, self._file)
+        self._wal.commit(self._working, self._file)
+        self._cache.update(self._working)
         self._wal = None
+        self._working.clear()
         self._dirty.clear()
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
@@ -72,8 +92,7 @@ class Pager:
             raise RuntimeError("No active transaction")
         self._wal.rollback()
         self._wal = None
-        for n in self._dirty:
-            self._cache.pop(n, None)
+        self._working.clear()
         self._dirty.clear()
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after abort
 
@@ -87,14 +106,21 @@ class Pager:
 
 
 class MemoryPager:
-    """Pager backed by an in-memory dict — no file I/O, no WAL, no locking."""
+    """Pager backed by an in-memory dict — no file I/O, no WAL, no locking.
+
+    Uses copy-on-write snapshot isolation: _cache holds the stable committed
+    state; _working holds pages modified by the current write transaction.
+    Readers always see _cache (no dirty reads); the writer sees its own
+    writes via _working.  Rollback is O(1) — just discard _working.
+    """
 
     def __init__(self) -> None:
-        self._path  = Path(":memory:")
-        self._cache: dict[int, bytearray] = {}
-        self._dirty: set[int] = set()
-        self._wal   = None
-        self._snap: dict[int, bytearray] | None = None
+        self._path    = Path(":memory:")
+        self._cache:   dict[int, bytearray] = {}  # committed pages
+        self._working: dict[int, bytearray] = {}  # in-transaction CoW pages
+        self._dirty:   set[int] = set()
+        self._wal      = None  # API compatibility with Pager
+        self._in_txn:  bool = False
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -102,9 +128,27 @@ class MemoryPager:
         return self._cache[num]
 
     def read_page(self, num: int) -> bytearray:
+        """Return the current view of a page (read-only path).
+
+        Returns the working copy when the caller is a writer reading its own
+        writes; otherwise returns the committed snapshot so that concurrent
+        streaming readers never see uncommitted data.
+        """
+        if self._in_txn and num in self._working:
+            return self._working[num]
         return self._load(num)
 
     def get_page(self, num: int) -> bytearray:
+        """Return a writable page and mark it dirty.
+
+        During a transaction the page is copy-on-write'd into _working so
+        that _cache always holds the pre-transaction committed state.
+        """
+        if self._in_txn:
+            if num not in self._working:
+                self._working[num] = bytearray(self._load(num))
+            self._dirty.add(num)
+            return self._working[num]
         page = self._load(num)
         self._dirty.add(num)
         return page
@@ -113,29 +157,27 @@ class MemoryPager:
         self._dirty.add(num)
 
     def begin(self) -> None:
-        if self._snap is not None:
+        if self._in_txn:
             raise RuntimeError("Transaction already active")
-        # Snapshot current pages so rollback can restore them
-        self._snap = {n: bytearray(p) for n, p in self._cache.items()}
+        self._working.clear()
         self._dirty.clear()
+        self._in_txn = True
 
     def commit(self) -> None:
-        if self._snap is None:
+        if not self._in_txn:
             raise RuntimeError("No active transaction")
-        self._snap = None
+        self._cache.update(self._working)
+        self._working.clear()
         self._dirty.clear()
+        self._in_txn = False
 
     def rollback(self) -> None:
-        if self._snap is None:
+        if not self._in_txn:
             raise RuntimeError("No active transaction")
-        # Remove pages added during the transaction
-        for n in set(self._cache) - set(self._snap):
-            del self._cache[n]
-        # Restore pages that existed before the transaction
-        for n, data in self._snap.items():
-            self._cache[n] = data
-        self._snap = None
+        # Discard working pages — _cache is untouched, so no restore needed.
+        self._working.clear()
         self._dirty.clear()
+        self._in_txn = False
 
     def close(self) -> None:
         pass
