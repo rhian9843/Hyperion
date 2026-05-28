@@ -34,6 +34,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
         self._plan_cache: dict[str, dict] = {}  # raw SQL template → parsed AST
+        # Catalog scalability: cache the last-flushed serialization so that
+        # commits where the catalog did not change skip all catalog page writes.
+        self._catalog_flushed_bytes: bytes = self._catalog.to_bytes()
 
     # ── Transaction control ────────────────────────────────────────────────────
 
@@ -93,6 +96,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # Restore catalog
         self._catalog      = Catalog.from_bytes(cat_bytes)
         self._catalog_extra = list(cat_extra)
+        # The catalog was restored to a prior state; _flush_catalog must not
+        # skip the write on the next commit even if the bytes match the last
+        # successfully flushed payload — so invalidate the cache.
+        self._catalog_flushed_bytes = b""
 
     # ── Application-defined functions ──────────────────────────────────────────
 
@@ -218,10 +225,18 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def _reload_catalog(self) -> None:
         self._catalog, self._catalog_extra = self._load_catalog()
+        # Keep the flushed-bytes cache in sync with the reloaded on-disk state.
+        self._catalog_flushed_bytes = self._catalog.to_bytes()
 
     def _flush_catalog(self) -> None:
+        payload = self._catalog.to_bytes()
+        # Skip all page writes when the catalog hasn't changed since the last flush.
+        # This is the common case for pure DML (INSERT/UPDATE/DELETE) commits where
+        # no DDL or page allocation has occurred.
+        if payload == self._catalog_flushed_bytes:
+            return
+
         for _ in range(4):
-            payload  = self._catalog.to_bytes()
             n_needed = max(1, (len(payload) + _CAT_CHUNK - 1) // _CAT_CHUNK)
             n_have   = 1 + len(self._catalog_extra)
             if n_needed == n_have:
@@ -234,7 +249,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 self._catalog_extra = self._catalog_extra[:n_needed - 1]
                 for pn in freed:
                     self._free_page(pn)
-        payload  = self._catalog.to_bytes()
+            payload = self._catalog.to_bytes()  # recompute after alloc/free
+
         all_pns  = [Catalog.CATALOG_PAGE] + self._catalog_extra
         chunks   = [payload[i: i + _CAT_CHUNK]
                     for i in range(0, len(payload), _CAT_CHUNK)]
@@ -248,6 +264,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             page[_CAT_HDR: _CAT_HDR + len(chunk)] = chunk
             page[_CAT_HDR + len(chunk):]           = bytearray(PAGE_SIZE - _CAT_HDR - len(chunk))
             self._pager.flush(pn)
+        self._catalog_flushed_bytes = payload
 
     # ── Internal helpers (used by all mixins via self) ─────────────────────────
 

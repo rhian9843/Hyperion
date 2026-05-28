@@ -28,7 +28,9 @@ class Pager:
         self._cache:   dict[int, bytearray] = {}  # committed pages (stable snapshot)
         self._working: dict[int, bytearray] = {}  # in-transaction copy-on-write pages
         self._dirty:   set[int] = set()
-        self._wal:     WAL | None = None
+        self._wal:     WAL | None = None          # opened lazily on first begin()
+        self._in_txn:  bool = False
+        self._wal_txn_offset: int = 0             # WAL offset at transaction start
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -47,7 +49,7 @@ class Pager:
         concurrent streaming readers on the same connection — returns the
         committed snapshot from _cache, preventing dirty reads.
         """
-        if self._wal is not None and num in self._working:
+        if self._in_txn and num in self._working:
             return self._working[num]
         return self._load(num)
 
@@ -57,7 +59,7 @@ class Pager:
         During a transaction the page is copy-on-write'd into _working so
         that _cache always holds the pre-transaction committed state.
         """
-        if self._wal is not None:
+        if self._in_txn:
             if num not in self._working:
                 self._working[num] = bytearray(self._load(num))
             self._dirty.add(num)
@@ -70,36 +72,52 @@ class Pager:
         self._dirty.add(num)
 
     def begin(self) -> None:
-        if self._wal is not None:
+        if self._in_txn:
             raise RuntimeError("Transaction already active")
         _flock(self._file.fileno(), 2)   # LOCK_EX — upgrade from shared
         self._working.clear()
         self._dirty.clear()
-        self._wal = WAL(self._path.with_suffix(".wal"))
+        if self._wal is None:
+            self._wal = WAL(self._path.with_suffix(".wal"))
+        self._wal_txn_offset = self._wal.begin_offset()
+        self._in_txn = True
 
     def commit(self) -> None:
-        if self._wal is None:
+        if not self._in_txn:
             raise RuntimeError("No active transaction")
-        self._wal.commit(self._working, self._file)
+        assert self._wal is not None
+        self._wal.commit_txn(self._working)
         self._cache.update(self._working)
-        self._wal = None
         self._working.clear()
         self._dirty.clear()
+        self._in_txn = False
+        if self._wal.needs_checkpoint():
+            self._wal.checkpoint(self._file)
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
     def rollback(self) -> None:
-        if self._wal is None:
+        if not self._in_txn:
             raise RuntimeError("No active transaction")
-        self._wal.rollback()
-        self._wal = None
+        assert self._wal is not None
+        self._wal.rollback_txn(self._wal_txn_offset)
         self._working.clear()
         self._dirty.clear()
+        self._in_txn = False
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after abort
 
     def close(self) -> None:
+        if self._in_txn and self._wal is not None:
+            self._wal.rollback_txn(self._wal_txn_offset)
+            self._in_txn = False
         if self._wal is not None:
-            self._wal.rollback()
+            # Final checkpoint: flush accumulated WAL frames to main file.
+            _flock(self._file.fileno(), 2)   # LOCK_EX briefly for checkpoint
+            self._wal.checkpoint(self._file)
+            self._wal.close()
             self._wal = None
+            # WAL file was truncated to header by checkpoint; remove it.
+            wal_path = self._path.with_suffix(".wal")
+            wal_path.unlink(missing_ok=True)
         self._file.flush()
         _flock(self._file.fileno(), 8)   # LOCK_UN
         self._file.close()
