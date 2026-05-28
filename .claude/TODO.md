@@ -162,6 +162,9 @@
 
 ### Indexes / Optimizer
 
+- [x] Index bypass under ORDER BY / LIMIT / DISTINCT — both equality and range index scans are gated behind `not order_by and limit is None and not distinct` in `query.py:89`; a query like `SELECT * FROM t WHERE val = 10 ORDER BY id` skips the index on `val` entirely, scans the full table, then sorts in memory; fix requires the planner to use the index for the WHERE predicate and apply ORDER BY / LIMIT as a post-scan step, or to recognise when the index order satisfies the ORDER BY and skip the sort entirely
+- [x] Index ORDER BY elimination — when the ORDER BY column matches the index column and direction is ASC, the index already delivers rows in sorted order; the post-scan sort is redundant and should be skipped; for DESC, scan the index in reverse order rather than sorting in memory
+- [x] Index LIMIT early termination — when LIMIT is present and there is no ORDER BY on a different column, the index scan should stop as soon as `limit` rows are collected rather than fetching all matching rows first
 - [x] Text index ordering — TEXT/VARCHAR index keys are FNV-1a hashes; range predicates (`WHERE name > 'M'`), `BETWEEN`, and `ORDER BY` with index all produce wrong or suboptimal results; text B-tree keys need to be prefix-encoded byte strings so sort order is preserved
 - [x] Outer join optimisation — the cost-based join reorderer only runs on chains of INNER equijoins; LEFT / RIGHT / FULL OUTER joins are never reordered regardless of table sizes
 - [x] Range predicate index use — `WHERE int_col > 100` never uses an index today; the optimizer only probes indexes for equality (`=`); `scan_range` exists on BTree but is never invoked from the query planner

@@ -63,6 +63,34 @@ class BTree:
                     yield k, self._leaf_val(page, i)
             pn = self._sibling(page)
 
+    def scan_range_reverse(self, lo: int, hi: int) -> Iterator[tuple[int, bytes]]:
+        """Yield (key, value) for lo <= key <= hi in descending key order.
+
+        Leaves are singly linked forward-only, so we collect the relevant leaf
+        page numbers in one forward pass then yield their entries in reverse.
+        """
+        leaf_pages: list[int] = []
+        pn = self._find_leaf(lo)
+        while pn:
+            page = self._p.read_page(pn)
+            n    = self._num_cells(page)
+            if n and self._leaf_key(page, 0) > hi:
+                break  # entirely past hi; no further pages can contribute
+            leaf_pages.append(pn)
+            if n and self._leaf_key(page, n - 1) >= hi:
+                break  # hi is on this page; pages after it exceed hi
+            pn = self._sibling(page)
+        for lpn in reversed(leaf_pages):
+            page = self._p.read_page(lpn)
+            entries: list[tuple[int, bytes]] = []
+            for i in range(self._num_cells(page)):
+                k = self._leaf_key(page, i)
+                if k > hi:
+                    break
+                if k >= lo:
+                    entries.append((k, self._leaf_val(page, i)))
+            yield from reversed(entries)
+
     def update(self, updates: dict[int, bytes]) -> None:
         """In-place update rows by key.  updates = {key: new_value_bytes}."""
         for key, new_val in updates.items():

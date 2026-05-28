@@ -86,13 +86,66 @@ class QueryMixin:
                                          order_by, limit, offset)
         if columns and any(_parse_agg(c) is not None for c in columns):
             return self._aggregate_select(meta, columns, where)
-        if where and not order_by and limit is None and not distinct:
+        idx_satisfies     = False
+        order_is_asc      = False
+        order_is_desc     = False
+        desc_via_rev_scan = False  # range scan already yielded DESC order
+        if where:
             idx, eq_cols = self._find_index_for_where(table, where)
+            idx_results: list[dict] | None = None
             if idx:
-                return self._index_select(meta, idx, eq_cols, columns)
-            idx, range_cond = self._find_index_for_range(table, where)
-            if idx:
-                return self._index_range_select(meta, idx, range_cond, where, columns)
+                idx_col = idx.columns[0] if len(idx.columns) == 1 else None
+                # TEXT keys use 8-byte prefix encoding; strings sharing a prefix are in
+                # rowid order within the same bucket, not lexicographic order.  Skipping
+                # the sort for TEXT would give wrong results on prefix collisions.
+                _idx_col_obj = next((c for c in meta.schema.columns if c.name == idx_col), None) if idx_col else None
+                idx_col_sortable = _idx_col_obj is not None and _idx_col_obj.type != TEXT
+                ob = order_by[0] if order_by and len(order_by) == 1 else None
+                order_is_asc  = bool(ob and ob["col"] == idx_col and idx_col_sortable and not ob["desc"] and not ob.get("collate"))
+                order_is_desc = bool(ob and ob["col"] == idx_col and idx_col_sortable and ob["desc"]     and not ob.get("collate"))
+                idx_satisfies  = order_is_asc or order_is_desc or not order_by
+                # Equality scan has no reverse path; DESC collects all then reverses
+                # DISTINCT must collect all rows before dedup so early-stop is unsafe
+                can_terminate = (order_is_asc or not order_by) and limit is not None and not distinct
+                max_rows = ((limit or 0) + (offset or 0)) if can_terminate else None
+                idx_results = self._index_select(meta, idx, eq_cols, columns, max_rows=max_rows)
+            else:
+                idx, range_cond = self._find_index_for_range(table, where)
+                if idx:
+                    idx_col = idx.columns[0] if len(idx.columns) == 1 else None
+                    _idx_col_obj = next((c for c in meta.schema.columns if c.name == idx_col), None) if idx_col else None
+                    idx_col_sortable = _idx_col_obj is not None and _idx_col_obj.type != TEXT
+                    ob = order_by[0] if order_by and len(order_by) == 1 else None
+                    order_is_asc  = bool(ob and ob["col"] == idx_col and idx_col_sortable and not ob["desc"] and not ob.get("collate"))
+                    order_is_desc = bool(ob and ob["col"] == idx_col and idx_col_sortable and ob["desc"]     and not ob.get("collate"))
+                    idx_satisfies  = order_is_asc or order_is_desc or not order_by
+                    # Range scan supports reverse iteration; DESC can terminate early too
+                    # DISTINCT must collect all rows before dedup so early-stop is unsafe
+                    can_terminate = idx_satisfies and limit is not None and not distinct
+                    max_rows = ((limit or 0) + (offset or 0)) if can_terminate else None
+                    desc_via_rev_scan = order_is_desc
+                    idx_results = self._index_range_select(
+                        meta, idx, range_cond, where, columns, max_rows=max_rows,
+                        reverse=order_is_desc)
+            if idx_results is not None:
+                if distinct:
+                    seen_idx: set[tuple] = set()
+                    deduped: list[dict] = []
+                    for r in idx_results:
+                        key = tuple(r.get(k) for k in (columns or list(r.keys())))
+                        if key not in seen_idx:
+                            seen_idx.add(key); deduped.append(r)
+                    idx_results = deduped
+                if idx_satisfies:
+                    # Reverse only for equality+DESC (range DESC already came out reversed)
+                    if order_is_desc and not desc_via_rev_scan:
+                        idx_results.reverse()
+                    if offset:
+                        idx_results = idx_results[offset:]
+                    if limit is not None:
+                        idx_results = idx_results[:limit]
+                    return idx_results
+                return _apply_order_limit(idx_results, order_by, limit, offset)
         schema  = meta.schema
         results = []
         seen: set[tuple] = set()
@@ -341,8 +394,8 @@ class QueryMixin:
     # ── Index-accelerated select ───────────────────────────────────────────────
 
     def _index_select(self, meta, idx_meta,
-                      eq_cols: dict[str, str], columns: list[str] | None
-                      ) -> list[dict[str, Any]]:
+                      eq_cols: dict[str, str], columns: list[str] | None,
+                      max_rows: int | None = None) -> list[dict[str, Any]]:
         schema    = meta.schema
         col_types = []
         for col_name in idx_meta.columns:
@@ -393,6 +446,8 @@ class QueryMixin:
                         match = False; break
             if match:
                 results.append(_project_row(row, columns) if columns else row)
+                if max_rows is not None and len(results) >= max_rows:
+                    break
         return results
 
     def _find_index_for_where(self, table: str,
@@ -433,7 +488,9 @@ class QueryMixin:
 
     def _index_range_select(self, meta, idx_meta, range_cond,
                             where: "WhereClause | None",
-                            columns: list[str] | None) -> list[dict[str, Any]]:
+                            columns: list[str] | None,
+                            max_rows: int | None = None,
+                            reverse: bool = False) -> list[dict[str, Any]]:
         """Scan an index for range_cond entries, then post-filter with full WHERE."""
         schema   = meta.schema
         col_name = range_cond.col
@@ -467,7 +524,8 @@ class QueryMixin:
         itree   = self._index_btree(idx_meta)
         ptree   = self._table_btree(meta)
         results: list[dict] = []
-        for _, rowid_raw in itree.scan_range(lo, hi):
+        scan_fn = itree.scan_range_reverse if reverse else itree.scan_range
+        for _, rowid_raw in scan_fn(lo, hi):
             rowid = struct.unpack("q", rowid_raw)[0]
             raw   = ptree.lookup(rowid)
             if raw is None:
@@ -476,4 +534,6 @@ class QueryMixin:
             if where and not where.evaluate(row, self):
                 continue
             results.append(_project_row(row, columns) if columns else row)
+            if max_rows is not None and len(results) >= max_rows:
+                break
         return results
