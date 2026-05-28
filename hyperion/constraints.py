@@ -2,6 +2,8 @@ import re
 import struct
 from typing import Any
 
+from .errors import (UniqueConstraintError, CheckConstraintError,
+                     ForeignKeyConstraintError)
 from .schema import Schema, ForeignKey, deserialize_row, serialize_row
 from .constants import INTEGER, REAL
 from .encoding import _encode_composite_key, _make_index_key
@@ -37,7 +39,7 @@ class ConstraintsMixin:
             for col in unique_cols:
                 v = typed[col.name]
                 if v is not None and existing.get(col.name) == v:
-                    raise RuntimeError(
+                    raise UniqueConstraintError(
                         f"UNIQUE constraint failed: {schema.name}.{col.name}"
                     )
             for uc_cols in mc_unique:
@@ -57,7 +59,7 @@ class ConstraintsMixin:
                     continue  # NULL exempts from multi-col unique
                 ex_vals = [existing.get(c) for c in uc_cols]
                 if new_vals == ex_vals:
-                    raise RuntimeError(
+                    raise UniqueConstraintError(
                         f"UNIQUE constraint failed: "
                         f"{schema.name}({', '.join(uc_cols)})"
                     )
@@ -72,9 +74,9 @@ class ConstraintsMixin:
             try:
                 wc, _ = _parse_one_condition(tokens, 0)
             except Exception as e:
-                raise RuntimeError(f"Invalid CHECK expression on '{col.name}': {e}")
+                raise CheckConstraintError(f"Invalid CHECK expression on '{col.name}': {e}")
             if not wc.evaluate(row, self):
-                raise RuntimeError(
+                raise CheckConstraintError(
                     f"CHECK constraint failed: {schema.name}.{col.name} CHECK ({col.check})"
                 )
 
@@ -134,7 +136,7 @@ class ConstraintsMixin:
             if any(v is None for v in vals):
                 continue  # NULL FK values are permitted
             if fk.ref_table not in self.tables:
-                raise RuntimeError(
+                raise ForeignKeyConstraintError(
                     f"Foreign key references unknown table '{fk.ref_table}'"
                 )
             parent_meta = self._meta(fk.ref_table)
@@ -149,7 +151,7 @@ class ConstraintsMixin:
                         found = True
                         break
             if not found:
-                raise RuntimeError(
+                raise ForeignKeyConstraintError(
                     f"FOREIGN KEY constraint failed: "
                     f"{schema.name}({', '.join(fk.columns)}) "
                     f"→ {fk.ref_table}({', '.join(fk.ref_columns)})"
@@ -183,7 +185,7 @@ class ConstraintsMixin:
                     continue
                 action = fk.on_delete if is_delete else fk.on_update
                 if action in ("RESTRICT", "NO ACTION"):
-                    raise RuntimeError(
+                    raise ForeignKeyConstraintError(
                         f"FOREIGN KEY constraint failed: cannot modify '{table}' "
                         f"— row is referenced by '{tname}'"
                     )

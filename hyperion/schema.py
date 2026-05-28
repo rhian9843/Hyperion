@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .constants import INTEGER, REAL, TEXT, BLOB, _FIXED_FMTS, _FIXED_SIZES, DEFAULT_TEXT_SIZE
+from .errors import NotNullConstraintError, DataError
 
 
 @dataclass
@@ -152,14 +153,14 @@ def serialize_row(schema: Schema, row: dict[str, Any]) -> bytes:
 
         if val is None:
             if not col.nullable:
-                raise RuntimeError(f"Column '{col.name}' is NOT NULL")
+                raise NotNullConstraintError(f"Column '{col.name}' is NOT NULL")
             bitmap[i // 8] |= 1 << (i % 8)
             # NULL columns occupy no bytes in the payload
         elif col.type == INTEGER:
             try:
                 parts.append(struct.pack("q", int(val)))
             except struct.error as e:
-                raise RuntimeError(str(e)) from e
+                raise DataError(str(e)) from e
         elif col.type == REAL:
             parts.append(struct.pack("d", float(val)))
         else:
@@ -177,7 +178,7 @@ def serialize_row(schema: Schema, row: dict[str, Any]) -> bytes:
             # Enforce explicitly declared size limits (smaller than the default).
             # TEXT / VARCHAR without an explicit size allow unlimited storage.
             if col.size < DEFAULT_TEXT_SIZE and len(b) > col.size:
-                raise RuntimeError(
+                raise DataError(
                     f"Value for '{col.name}' is {len(b)} bytes, "
                     f"exceeds {col.type}({col.size})"
                 )

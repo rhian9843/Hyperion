@@ -3,6 +3,7 @@ import sys
 from pathlib import Path
 
 from .database import Database
+from .errors import HyperionError
 from .parser import parse, ParseError
 from .executor import execute
 
@@ -134,7 +135,7 @@ def repl(db: Database) -> None:
                 continue
             try:
                 print(execute(parse(part), db))
-            except (ParseError, RuntimeError, KeyError, struct.error) as e:
+            except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
                 print(f"Error: {e}")
 
 

@@ -7,6 +7,7 @@ from hyperion import (
     SQLITE_SELECT, SQLITE_INSERT, SQLITE_UPDATE, SQLITE_DELETE,
     SQLITE_CREATE_TABLE,
 )
+from hyperion.errors import AuthorizationError
 
 
 def _db():
@@ -160,7 +161,7 @@ class TestSetAuthorizer:
     def test_deny_select_raises(self):
         db = _db()
         db.set_authorizer(lambda action, *a: SQLITE_DENY if action == SQLITE_SELECT else SQLITE_OK)
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("SELECT * FROM users").fetchall()
 
     def test_ignore_select_returns_empty(self):
@@ -173,7 +174,7 @@ class TestSetAuthorizer:
     def test_deny_insert_raises(self):
         db = _db()
         db.set_authorizer(lambda action, *a: SQLITE_DENY if action == SQLITE_INSERT else SQLITE_OK)
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("INSERT INTO users VALUES (10, 'X', 1.0)")
 
     def test_ignore_insert_is_noop(self):
@@ -186,19 +187,19 @@ class TestSetAuthorizer:
     def test_deny_update_raises(self):
         db = _db()
         db.set_authorizer(lambda action, *a: SQLITE_DENY if action == SQLITE_UPDATE else SQLITE_OK)
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("UPDATE users SET score = 0 WHERE id = 1")
 
     def test_deny_delete_raises(self):
         db = _db()
         db.set_authorizer(lambda action, *a: SQLITE_DENY if action == SQLITE_DELETE else SQLITE_OK)
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("DELETE FROM users WHERE id = 1")
 
     def test_deny_create_table_raises(self):
         db = _db()
         db.set_authorizer(lambda action, *a: SQLITE_DENY if action == SQLITE_CREATE_TABLE else SQLITE_OK)
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("CREATE TABLE new_t (id INTEGER)")
 
     def test_table_name_passed_to_callback(self):
@@ -229,7 +230,7 @@ class TestSetAuthorizer:
         rows = db.execute("SELECT * FROM users").fetchall()
         assert len(rows) == 3
         # Cannot read secrets
-        with pytest.raises(RuntimeError, match="Access denied"):
+        with pytest.raises(AuthorizationError, match="Access denied"):
             db.execute("SELECT * FROM secrets").fetchall()
 
 

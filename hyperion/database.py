@@ -8,6 +8,7 @@ if TYPE_CHECKING:
 
 from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
+from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
 from .pager import Pager, MemoryPager
@@ -102,14 +103,14 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def begin(self) -> None:
         with self._lock:
             if self._txn_depth > 0:
-                raise RuntimeError("Transaction already active")
+                raise TransactionError("Transaction already active")
             self._pager.begin()
             self._txn_depth = 1
 
     def commit(self) -> None:
         with self._lock:
             if self._txn_depth == 0:
-                raise RuntimeError("No active transaction")
+                raise TransactionError("No active transaction")
             self._flush_catalog()
             self._pager.commit()
             self._txn_depth = 0
@@ -117,7 +118,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def rollback(self) -> None:
         with self._lock:
             if self._txn_depth == 0:
-                raise RuntimeError("No active transaction")
+                raise TransactionError("No active transaction")
             self._savepoints.clear()
             self._pager.rollback()
             self._reload_catalog()
@@ -279,7 +280,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for i in range(len(self._savepoints) - 1, -1, -1):
             if self._savepoints[i][0] == name:
                 return i
-        raise RuntimeError(f"No such savepoint: '{name}'")
+        raise TransactionError(f"No such savepoint: '{name}'")
 
     def _load_catalog(self) -> "tuple[Catalog, list[int], int, list[int]]":
         """Load catalog from pages.  Returns (catalog, schema_extras, ops_pn, ops_extras).
@@ -487,7 +488,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def _meta(self, name: str) -> TableMeta:
         if name not in self._catalog.tables:
-            raise RuntimeError(f"No such table: '{name}'")
+            raise NoSuchTableError(f"No such table: '{name}'")
         return self._catalog.tables[name]
 
     def _alloc_page(self) -> int:
@@ -648,7 +649,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 elif if_not_exists:
                     return
                 else:
-                    raise RuntimeError(f"View '{name}' already exists")
+                    raise SchemaError(f"View '{name}' already exists")
             self._catalog.views[name] = sql
 
     def drop_view(self, name: str, if_exists: bool = False) -> None:
@@ -656,7 +657,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if name not in self._catalog.views:
                 if if_exists:
                     return
-                raise RuntimeError(f"No such view: '{name}'")
+                raise NoSuchTableError(f"No such view: '{name}'")
             del self._catalog.views[name]
 
     def close(self) -> None:
@@ -682,7 +683,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             return "Database vacuumed."
 
         if self._txn_depth > 0:
-            raise RuntimeError("Cannot VACUUM inside a transaction")
+            raise TransactionError("Cannot VACUUM inside a transaction")
 
         path = self._pager._path
 

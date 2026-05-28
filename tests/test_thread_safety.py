@@ -176,7 +176,7 @@ def test_explicit_transaction_serialised():
             db.begin()
             db.execute(f"INSERT INTO t VALUES ({tid})")
             db.commit()
-        except RuntimeError as e:
+        except Exception as e:
             # "Transaction already active" is expected when threads race on begin()
             if "already active" not in str(e):
                 errors.append(e)

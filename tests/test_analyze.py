@@ -6,6 +6,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hyperion.database import Database
+from hyperion.errors import HyperionError
 from hyperion.executor import execute
 from hyperion.optimizer import estimate_rows, get_ndv, optimize_join
 from hyperion.parser import parse
@@ -38,7 +39,7 @@ class TestAnalyzeBasic(unittest.TestCase):
         self.assertIn("t", result)
 
     def test_analyze_unknown_table_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db, "ANALYZE nonexistent")
 
     def test_stats_row_count_correct(self):

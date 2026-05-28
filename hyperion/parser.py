@@ -1,12 +1,9 @@
 import re
 
 from .constants import INTEGER, REAL, TEXT, BLOB, DEFAULT_TEXT_SIZE
+from .errors import ParseError
 from .schema import Column, ForeignKey, Schema
 from .where import WhereClause
-
-
-class ParseError(ValueError):
-    pass
 
 
 _TOKEN_RE = re.compile(

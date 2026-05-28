@@ -5,6 +5,7 @@ import re
 from datetime import datetime
 from typing import Any
 
+from .errors import DataError
 from .json_funcs import eval_json_func as _eval_json_func
 
 # ── Application-defined function registries ────────────────────────────────────
@@ -394,7 +395,7 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
     if upper in _USER_FUNCS:
         n_expected, fn = _USER_FUNCS[upper]
         if n_expected >= 0 and len(args) != n_expected:
-            raise RuntimeError(
+            raise DataError(
                 f"wrong number of arguments to function {fname}(): "
                 f"expected {n_expected}, got {len(args)}"
             )

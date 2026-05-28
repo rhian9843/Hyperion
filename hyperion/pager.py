@@ -1,6 +1,7 @@
 import struct
 from pathlib import Path
 
+from .errors import TransactionError
 from .constants import PAGE_SIZE
 from .checksum import stamp_page, verify_page
 from .wal import WAL
@@ -75,7 +76,7 @@ class Pager:
 
     def begin(self) -> None:
         if self._in_txn:
-            raise RuntimeError("Transaction already active")
+            raise TransactionError("Transaction already active")
         _flock(self._file.fileno(), 2)   # LOCK_EX — upgrade from shared
         self._working.clear()
         self._dirty.clear()
@@ -86,7 +87,7 @@ class Pager:
 
     def commit(self) -> None:
         if not self._in_txn:
-            raise RuntimeError("No active transaction")
+            raise TransactionError("No active transaction")
         assert self._wal is not None
         for page in self._working.values():
             stamp_page(page)
@@ -101,7 +102,7 @@ class Pager:
 
     def rollback(self) -> None:
         if not self._in_txn:
-            raise RuntimeError("No active transaction")
+            raise TransactionError("No active transaction")
         assert self._wal is not None
         self._wal.rollback_txn(self._wal_txn_offset)
         self._working.clear()
@@ -180,14 +181,14 @@ class MemoryPager:
 
     def begin(self) -> None:
         if self._in_txn:
-            raise RuntimeError("Transaction already active")
+            raise TransactionError("Transaction already active")
         self._working.clear()
         self._dirty.clear()
         self._in_txn = True
 
     def commit(self) -> None:
         if not self._in_txn:
-            raise RuntimeError("No active transaction")
+            raise TransactionError("No active transaction")
         self._cache.update(self._working)
         self._working.clear()
         self._dirty.clear()
@@ -195,7 +196,7 @@ class MemoryPager:
 
     def rollback(self) -> None:
         if not self._in_txn:
-            raise RuntimeError("No active transaction")
+            raise TransactionError("No active transaction")
         # Discard working pages — _cache is untouched, so no restore needed.
         self._working.clear()
         self._dirty.clear()

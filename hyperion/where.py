@@ -2,6 +2,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 
+from .errors import NoSuchColumnError, InternalError
 from .encoding import _apply_set_op
 from .expr import eval_expr, is_expr
 
@@ -81,7 +82,7 @@ class WhereClause:
             elif is_expr(self.col):
                 cell = eval_expr(self.col, row)
             else:
-                raise RuntimeError(f"Unknown column: '{self.col}'")
+                raise NoSuchColumnError(f"Unknown column: '{self.col}'")
         else:
             # bare name → scan table-qualified keys
             matches = [v for k, v in row.items() if k.split(".")[-1] == self.col]
@@ -90,7 +91,7 @@ class WhereClause:
             elif is_expr(self.col):
                 cell = eval_expr(self.col, row)
             else:
-                raise RuntimeError(f"Unknown column: '{self.col}'")
+                raise NoSuchColumnError(f"Unknown column: '{self.col}'")
 
         if self.op == "IS NULL":     return cell is None
         if self.op == "IS NOT NULL": return cell is not None
@@ -331,7 +332,7 @@ def _exec_subquery(stmt: "dict | None", db: Any) -> list[dict]:
         left  = _exec_subquery(stmt["left"],  db)
         right = _exec_subquery(stmt["right"], db)
         return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
-    raise RuntimeError(f"Expected SELECT/JOIN/SET_OP in subquery, got '{op}'")
+    raise InternalError(f"Expected SELECT/JOIN/SET_OP in subquery, got '{op}'")
 
 
 def _exec_correlated_subquery(stmt: "dict | None", db: Any,
@@ -361,4 +362,4 @@ def _exec_correlated_subquery(stmt: "dict | None", db: Any,
         left  = _exec_correlated_subquery(stmt["left"],  db, outer_row)
         right = _exec_correlated_subquery(stmt["right"], db, outer_row)
         return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
-    raise RuntimeError(f"Expected SELECT/JOIN/SET_OP in subquery, got '{op}'")
+    raise InternalError(f"Expected SELECT/JOIN/SET_OP in subquery, got '{op}'")

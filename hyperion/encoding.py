@@ -1,6 +1,7 @@
 import struct
 from typing import Any
 
+from .errors import InternalError
 from .constants import INTEGER, REAL, TEXT
 
 
@@ -176,4 +177,4 @@ def _apply_set_op(op: str, all_flag: bool,
                 seen.add(k); out.append(r)
         return out
 
-    raise RuntimeError(f"Unknown set operation: '{op}'")
+    raise InternalError(f"Unknown set operation: '{op}'")

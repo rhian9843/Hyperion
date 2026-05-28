@@ -4,6 +4,9 @@ import time
 from collections import defaultdict
 from typing import Any
 
+from .errors import (HyperionError, NoSuchTableError, NoSuchIndexError, SchemaError,
+                     ParseError, InternalError, DataError, ConstraintError)
+
 
 class QueryTimeoutError(RuntimeError):
     """Raised when a query exceeds its allotted execution time."""
@@ -801,7 +804,7 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         left  = _rows_for_stmt(stmt["left"],  db, ctes)
         right = _rows_for_stmt(stmt["right"], db, ctes)
         return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
-    raise RuntimeError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
+    raise InternalError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
 
 
 def _iter_rows_for_stmt(stmt: dict, db: "Database",
@@ -897,7 +900,7 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
     if name == "table_info":
         tname = stmt.get("arg") or ""
         if tname not in db.tables:
-            raise RuntimeError(f"No such table: '{tname}'")
+            raise NoSuchTableError(f"No such table: '{tname}'")
         schema = db._meta(tname).schema
         pk_cols = set(schema.primary_key_columns or [])
         rows = []
@@ -922,7 +925,7 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
     if name == "index_info":
         idx_name = stmt.get("arg") or ""
         if idx_name not in db.indexes:
-            raise RuntimeError(f"No such index: '{idx_name}'")
+            raise NoSuchIndexError(f"No such index: '{idx_name}'")
         idx_meta = db.indexes[idx_name]
         schema = db._meta(idx_meta.table_name).schema
         col_cids = {c.name: i for i, c in enumerate(schema.columns)}
@@ -935,7 +938,7 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
         rows = [{"integrity_check": msg} for msg in results]
         return _format_rows(rows, ["integrity_check"])
 
-    raise RuntimeError(f"Unknown PRAGMA: '{name}'")
+    raise ParseError(f"Unknown PRAGMA: '{name}'")
 
 
 def _execute_analyze(stmt: dict, db: Database) -> str:
@@ -945,7 +948,7 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
                          else list(db.tables.keys()))
 
     if target and target not in db.tables:
-        raise RuntimeError(f"No such table: '{target}'")
+        raise NoSuchTableError(f"No such table: '{target}'")
 
     for tname in tables_to_analyze:
         meta   = db._meta(tname)
@@ -1074,13 +1077,13 @@ def _exec_instead_of_insert(stmt: dict, db: Database) -> str:
         if rows:
             col_names = list(rows[0].keys())
         else:
-            raise RuntimeError(
+            raise SchemaError(
                 f"Cannot determine columns for INSERT on view '{tname}' "
                 f"— specify column names explicitly")
     count = 0
     for values in stmt["rows"]:
         if len(col_names) != len(values):
-            raise RuntimeError(
+            raise DataError(
                 f"Column/value mismatch: {len(col_names)} columns, {len(values)} values")
         parsed: dict[str, Any] = {
             n: (None if v.upper() == "NULL" else v)
@@ -1221,7 +1224,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
     if op == "DROP_INDEX":
         try:
             db.drop_index(stmt["idx_name"])
-        except RuntimeError:
+        except (NoSuchIndexError, RuntimeError):
             if not stmt.get("if_exists"):
                 raise
         return f"Index '{stmt['idx_name']}' dropped."
@@ -1245,7 +1248,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
     if op == "INSERT":
         if stmt["table"] not in db.tables and stmt["table"] in db.views:
             if not has_instead_of(db, stmt["table"], "INSERT"):
-                raise RuntimeError(
+                raise SchemaError(
                     f"Cannot insert into view '{stmt['table']}' without an INSTEAD OF trigger")
             return _exec_instead_of_insert(stmt, db)
         meta            = db._meta(stmt["table"])
@@ -1286,9 +1289,10 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                         fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                     if returning_cols:
                         returned_rows.append(row_out)
-                except RuntimeError as _e:
-                    if any(kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK",
-                                                     "FOREIGN KEY", "constraint")):
+                except (ConstraintError, RuntimeError) as _e:
+                    if isinstance(_e, ConstraintError) or any(
+                            kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK",
+                                                      "FOREIGN KEY", "constraint")):
                         pass
                     else:
                         raise
@@ -1306,8 +1310,9 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                         fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
                     if returning_cols:
                         returned_rows.append(row_out)
-                except RuntimeError as _e:
-                    if any(kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK")):
+                except (ConstraintError, RuntimeError) as _e:
+                    if isinstance(_e, ConstraintError) or any(
+                            kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK")):
                         _apply_on_conflict_update(db, meta, parsed, on_conflict_set)
                     else:
                         raise
@@ -1369,7 +1374,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         tname = stmt["table"]
         if tname not in db.tables and tname in db.views:
             if not has_instead_of(db, tname, "UPDATE"):
-                raise RuntimeError(
+                raise SchemaError(
                     f"Cannot update view '{tname}' without an INSTEAD OF trigger")
             return _exec_instead_of_update(stmt, db)
         if has_triggers(db, tname, "UPDATE"):
@@ -1395,7 +1400,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         tname = stmt["table"]
         if tname not in db.tables and tname in db.views:
             if not has_instead_of(db, tname, "DELETE"):
-                raise RuntimeError(
+                raise SchemaError(
                     f"Cannot delete from view '{tname}' without an INSTEAD OF trigger")
             return _exec_instead_of_delete(stmt, db)
         if has_triggers(db, tname, "DELETE"):
@@ -1413,7 +1418,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
         return f"{n} row{'s' if n != 1 else ''} deleted."
 
-    raise RuntimeError(f"Unknown op: {op}")
+    raise InternalError(f"Unknown op: {op}")
 
 
 _SCALAR_SQ_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)

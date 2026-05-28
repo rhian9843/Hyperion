@@ -1,6 +1,9 @@
 import struct
 from typing import Any
 
+from .errors import (NoSuchTableError, NoSuchColumnError, NoSuchIndexError,
+                     TableExistsError, ColumnExistsError, IndexExistsError,
+                     SchemaError)
 from .schema import Schema, Column, ForeignKey, serialize_row, deserialize_row
 from .btree import BTree
 from .catalog import TableMeta, IndexMeta, TriggerMeta
@@ -25,7 +28,7 @@ class DDLMixin:
 
     def create_table(self, schema: Schema, temporary: bool = False) -> None:
         if schema.name in self._catalog.tables:
-            raise RuntimeError(f"Table '{schema.name}' already exists")
+            raise TableExistsError(f"Table '{schema.name}' already exists")
         root = self._alloc_page()
         BTree.init_root_leaf(self._pager, root)
         self._catalog.tables[schema.name] = TableMeta(
@@ -54,7 +57,7 @@ class DDLMixin:
     def alter_add_column(self, table: str, col: Column) -> None:
         meta = self._meta(table)
         if any(c.name == col.name for c in meta.schema.columns):
-            raise RuntimeError(f"Column '{col.name}' already exists in '{table}'")
+            raise ColumnExistsError(f"Column '{col.name}' already exists in '{table}'")
         old_schema = meta.schema
         new_schema = Schema(old_schema.name, old_schema.columns + [col])
         self._rewrite_table(meta, old_schema, new_schema)
@@ -63,9 +66,9 @@ class DDLMixin:
         meta = self._meta(table)
         old_schema = meta.schema
         if not any(c.name == col_name for c in old_schema.columns):
-            raise RuntimeError(f"Column '{col_name}' not found in '{table}'")
+            raise NoSuchColumnError(f"Column '{col_name}' not found in '{table}'")
         if len(old_schema.columns) == 1:
-            raise RuntimeError("Cannot drop the only column")
+            raise SchemaError("Cannot drop the only column")
         new_cols = [c for c in old_schema.columns if c.name != col_name]
         new_schema = Schema(old_schema.name, new_cols)
         dead = [n for n, m in self._catalog.indexes.items()
@@ -78,9 +81,9 @@ class DDLMixin:
         meta = self._meta(table)
         old_schema = meta.schema
         if not any(c.name == old_name for c in old_schema.columns):
-            raise RuntimeError(f"Column '{old_name}' not found in '{table}'")
+            raise NoSuchColumnError(f"Column '{old_name}' not found in '{table}'")
         if any(c.name == new_name for c in old_schema.columns):
-            raise RuntimeError(f"Column '{new_name}' already exists in '{table}'")
+            raise ColumnExistsError(f"Column '{new_name}' already exists in '{table}'")
         new_cols = [
             Column(new_name, c.type, c.size, c.nullable) if c.name == old_name else c
             for c in old_schema.columns
@@ -92,7 +95,7 @@ class DDLMixin:
 
     def alter_rename_table(self, old_name: str, new_name: str) -> None:
         if new_name in self._catalog.tables:
-            raise RuntimeError(f"Table '{new_name}' already exists")
+            raise TableExistsError(f"Table '{new_name}' already exists")
         meta = self._meta(old_name)
         meta.schema = Schema(new_name, meta.schema.columns)
         self._catalog.tables[new_name] = meta
@@ -155,11 +158,11 @@ class DDLMixin:
 
     def create_index(self, idx_name: str, table: str, cols: list[str]) -> None:
         if idx_name in self._catalog.indexes:
-            raise RuntimeError(f"Index '{idx_name}' already exists")
+            raise IndexExistsError(f"Index '{idx_name}' already exists")
         meta = self._meta(table)
         for col in cols:
             if not is_expr(col) and not any(c.name == col for c in meta.schema.columns):
-                raise RuntimeError(f"Column '{col}' not found in '{table}'")
+                raise NoSuchColumnError(f"Column '{col}' not found in '{table}'")
         root = self._alloc_page()
         BTree.init_root_leaf(self._pager, root)
         idx_meta = IndexMeta(table_name=table, columns=cols,
@@ -180,25 +183,25 @@ class DDLMixin:
 
     def create_trigger(self, name: str, trigger: TriggerMeta) -> None:
         if name in self._catalog.triggers:
-            raise RuntimeError(f"Trigger '{name}' already exists")
+            raise SchemaError(f"Trigger '{name}' already exists")
         if trigger.timing == "INSTEAD OF":
             if trigger.table not in self._catalog.views:
-                raise RuntimeError(
+                raise SchemaError(
                     f"INSTEAD OF triggers can only be created on views, "
                     f"not '{trigger.table}'")
         else:
             if trigger.table not in self._catalog.tables:
-                raise RuntimeError(f"No such table: '{trigger.table}'")
+                raise NoSuchTableError(f"No such table: '{trigger.table}'")
         self._catalog.triggers[name] = trigger
 
     def drop_trigger(self, name: str) -> None:
         if name not in self._catalog.triggers:
-            raise RuntimeError(f"Trigger '{name}' does not exist")
+            raise SchemaError(f"Trigger '{name}' does not exist")
         del self._catalog.triggers[name]
 
     def drop_index(self, idx_name: str) -> None:
         if idx_name not in self._catalog.indexes:
-            raise RuntimeError(f"Index '{idx_name}' does not exist")
+            raise NoSuchIndexError(f"Index '{idx_name}' does not exist")
         for pn in self._collect_tree_pages(self._catalog.indexes[idx_name].root_page,
                                            key_sz=_IDX_KEY_SZ):
             self._free_page(pn)

@@ -1,6 +1,7 @@
 import struct
 from typing import Any
 
+from .errors import NoSuchColumnError
 from .where import WhereClause
 
 from .schema import Schema, serialize_row, deserialize_row
@@ -105,7 +106,7 @@ class DMLMixin:
             for col, val in assignments.items():
                 col_obj = next((c for c in schema.columns if c.name == col), None)
                 if col_obj is None:
-                    raise RuntimeError(f"Column '{col}' not found")
+                    raise NoSuchColumnError(f"Column '{col}' not found")
                 if val is None or (isinstance(val, str) and val.upper() == "NULL"):
                     new_row[col] = None
                     continue

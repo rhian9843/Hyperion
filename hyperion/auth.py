@@ -3,6 +3,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Callable
 
+from .errors import AuthorizationError
+
 if TYPE_CHECKING:
     pass
 
@@ -60,5 +62,5 @@ def check_authorizer(fn: Callable, stmt: dict) -> int:
         msg = f"Access denied: {op}"
         if table:
             msg += f" on '{table}'"
-        raise RuntimeError(msg)
+        raise AuthorizationError(msg)
     return result if result in (SQLITE_OK, SQLITE_IGNORE) else SQLITE_OK

@@ -121,7 +121,6 @@ from .where import (
     _exec_correlated_subquery,
 )
 from .parser import (
-    ParseError,
     _TOKEN_RE, _AGG_RE, _ALIAS_BLOCKLIST,
     _tokenize, _parse_col_type,
     _parse_table_alias, _parse_agg,
@@ -129,6 +128,15 @@ from .parser import (
     _parse_one_condition, _parse_atom, _parse_and_group,
     _parse_where_expr, _parse_where, _parse_group_having, _parse_order_limit,
     parse, _parse_tokens,
+)
+from .errors import (
+    HyperionError,
+    ParseError,
+    SchemaError, NoSuchTableError, NoSuchColumnError, NoSuchIndexError,
+    TableExistsError, ColumnExistsError, IndexExistsError,
+    ConstraintError, UniqueConstraintError, NotNullConstraintError,
+    CheckConstraintError, ForeignKeyConstraintError,
+    DataError, TransactionError, AuthorizationError, InternalError,
 )
 from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError
 from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv

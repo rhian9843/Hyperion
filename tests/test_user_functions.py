@@ -1,6 +1,7 @@
 """Tests for application-defined scalar and aggregate functions (create_function / create_aggregate)."""
 import pytest
 from hyperion import Database
+from hyperion.errors import DataError
 from hyperion.executor import execute, _rows_for_stmt
 from hyperion.parser import parse
 
@@ -61,7 +62,7 @@ class TestScalarFunctions:
     def test_scalar_wrong_n_args_raises(self):
         db = Database(":memory:")
         db.create_function("inc", 1, lambda x: x + 1)
-        with pytest.raises(RuntimeError, match="wrong number of arguments"):
+        with pytest.raises(DataError, match="wrong number of arguments"):
             rows(db, "SELECT inc(1, 2) AS v")
 
     def test_scalar_string_function(self):

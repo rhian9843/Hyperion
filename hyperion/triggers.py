@@ -11,6 +11,7 @@ Supports BEFORE/AFTER INSERT, UPDATE, DELETE triggers with:
 import re
 from typing import Any
 
+from .errors import ConstraintError, InternalError
 from .schema import deserialize_row
 from .expr import eval_expr, is_expr
 
@@ -119,7 +120,7 @@ def _exec_body(body_tokens: list[str],
                 msg  = m.group(2) or ""
                 if kind == "IGNORE":
                     raise TriggerIgnore()
-                raise RuntimeError(f"RAISE({kind}): {msg}")
+                raise ConstraintError(f"RAISE({kind}): {msg}")
         ast = _parse_tokens(subst)
         # Tag depth on db to allow recursive trigger detection
         db._trigger_depth = depth
@@ -155,7 +156,7 @@ def fire_triggers(db: Any,
     """Fire all matching triggers for a given DML event on a row."""
     depth = getattr(db, "_trigger_depth", 0)
     if depth >= _MAX_TRIGGER_DEPTH:
-        raise RuntimeError(
+        raise InternalError(
             f"Trigger recursion limit ({_MAX_TRIGGER_DEPTH}) exceeded on '{table}'")
 
     for trig in _triggers_for(db, table, timing, event, changed_cols):

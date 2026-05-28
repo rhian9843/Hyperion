@@ -1,6 +1,7 @@
 """Tests for MVCC / snapshot isolation (copy-on-write pager)."""
 import pytest
 from hyperion import Database
+from hyperion.errors import TransactionError
 from hyperion.pager import MemoryPager
 
 
@@ -307,7 +308,7 @@ def test_memorypager_rollback_clears_working():
 def test_memorypager_no_double_begin():
     mp = MemoryPager()
     mp.begin()
-    with pytest.raises(RuntimeError, match="Transaction already active"):
+    with pytest.raises(TransactionError, match="Transaction already active"):
         mp.begin()
     mp.rollback()
 

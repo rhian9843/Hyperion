@@ -7,6 +7,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from hyperion.database import Database
+from hyperion.errors import HyperionError
 from hyperion.executor import execute
 from hyperion.parser import parse
 
@@ -39,7 +40,7 @@ class TestCreateDropTrigger(unittest.TestCase):
             "CREATE TRIGGER tr_ai AFTER INSERT ON t "
             "FOR EACH ROW BEGIN INSERT INTO log VALUES ('x', NEW.val); END"
         )
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db,
                 "CREATE TRIGGER tr_ai AFTER INSERT ON t "
                 "FOR EACH ROW BEGIN INSERT INTO log VALUES ('x', NEW.val); END"
@@ -69,11 +70,11 @@ class TestCreateDropTrigger(unittest.TestCase):
         self.assertIn("does not exist", r)
 
     def test_drop_trigger_missing_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db, "DROP TRIGGER no_such_trigger")
 
     def test_create_trigger_bad_table_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db,
                 "CREATE TRIGGER tr AFTER INSERT ON nonexistent "
                 "FOR EACH ROW BEGIN INSERT INTO log VALUES ('x', 'y'); END"
@@ -278,7 +279,7 @@ class TestCascadingTriggers(unittest.TestCase):
             "CREATE TRIGGER tr_inf AFTER INSERT ON a "
             "FOR EACH ROW BEGIN INSERT INTO a VALUES (1); END"
         )
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(HyperionError) as ctx:
             sql(self.db, "INSERT INTO a VALUES (1)")
         self.assertIn("recursion limit", str(ctx.exception).lower())
 
@@ -377,7 +378,7 @@ class TestRaise(unittest.TestCase):
             "RAISE(ABORT, 'val must be non-negative'); "
             "END"
         )
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(HyperionError) as ctx:
             sql(self.db, "INSERT INTO t VALUES (2, -1)")
         self.assertIn("val must be non-negative", str(ctx.exception))
 
@@ -411,7 +412,7 @@ class TestRaise(unittest.TestCase):
             "RAISE(FAIL, 'always fail'); "
             "END"
         )
-        with self.assertRaises(RuntimeError) as ctx:
+        with self.assertRaises(HyperionError) as ctx:
             sql(self.db, "INSERT INTO t VALUES (99, 1)")
         self.assertIn("always fail", str(ctx.exception))
 
@@ -466,15 +467,15 @@ class TestInsteadOfTriggers(unittest.TestCase):
         self.assertIn("tokyo", r)
 
     def test_insert_on_view_without_instead_of_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db, "INSERT INTO user_city (id, name, city) VALUES (9, 'x', 'y')")
 
     def test_delete_on_view_without_instead_of_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db, "DELETE FROM user_city WHERE id = 1")
 
     def test_instead_of_on_table_raises(self):
-        with self.assertRaises(RuntimeError):
+        with self.assertRaises(HyperionError):
             sql(self.db,
                 "CREATE TRIGGER tr INSTEAD OF INSERT ON users "
                 "FOR EACH ROW BEGIN INSERT INTO addrs VALUES (NEW.id, 'x'); END"

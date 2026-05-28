@@ -4,6 +4,7 @@ from typing import Callable, Iterator
 from .pager import Pager
 
 from .constants import PAGE_SIZE, PAGE_CKSUM_SZ
+from .errors import UniqueConstraintError, InternalError
 
 
 class BTree:
@@ -183,7 +184,7 @@ class BTree:
         for i in range(n):
             k = self._leaf_key(page, i)
             if key == k:
-                raise RuntimeError(f"Duplicate key {key}")
+                raise UniqueConstraintError(f"Duplicate key {key}")
             if key < k:
                 pos = i
                 break
@@ -205,7 +206,7 @@ class BTree:
         pos = self._lmax
         for i, (k, _) in enumerate(cells):
             if key == k:
-                raise RuntimeError(f"Duplicate key {key}")
+                raise UniqueConstraintError(f"Duplicate key {key}")
             if key < k:
                 pos = i
                 break
@@ -507,7 +508,7 @@ class BTree:
         for i in range(self._num_cells(parent)):
             if self._int_rchild(parent, i) == child_pn:
                 return i + 1
-        raise RuntimeError(f"Child {child_pn} not found in parent")
+        raise InternalError(f"Child {child_pn} not found in parent")
 
     def _get_child(self, parent: bytearray, k: int) -> int:
         return self._sibling(parent) if k == 0 else self._int_rchild(parent, k - 1)

@@ -2,6 +2,7 @@ import re
 import struct
 from typing import Any
 
+from .errors import NoSuchColumnError
 from .where import WhereClause
 
 from .schema import deserialize_row
@@ -56,7 +57,7 @@ def _project_row(row: dict, columns: list[str]) -> dict:
                 elif is_expr(col):
                     result[col] = eval_expr(col, row)
                 else:
-                    raise RuntimeError(f"Unknown column: '{col}'")
+                    raise NoSuchColumnError(f"Unknown column: '{col}'")
         else:
             # bare col → try table-qualified scan before treating as expr
             matches = [v for k, v in row.items() if k.split(".")[-1] == col]
@@ -65,7 +66,7 @@ def _project_row(row: dict, columns: list[str]) -> dict:
             elif is_expr(col):
                 result[col] = eval_expr(col, row)
             else:
-                raise RuntimeError(f"Unknown column: '{col}'")
+                raise NoSuchColumnError(f"Unknown column: '{col}'")
     return result
 
 
