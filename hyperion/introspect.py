@@ -118,6 +118,23 @@ def hyperion_master_rows(db: "Database") -> list[dict]:
     return rows
 
 
+# ── _hyperion_schema_meta rows ────────────────────────────────────────────────
+
+def hyperion_schema_meta_rows(db: "Database") -> list[dict]:
+    """Generate rows for the virtual _hyperion_schema_meta catalog table."""
+    rows: list[dict] = []
+    for obj_type, by_name in db._catalog.meta.items():
+        for obj_name, tags in by_name.items():
+            for key, value in tags.items():
+                rows.append({
+                    "object_type": obj_type,
+                    "object_name": obj_name,
+                    "key":         key,
+                    "value":       value,
+                })
+    return rows
+
+
 # ── integrity_check ───────────────────────────────────────────────────────────
 
 def integrity_check(db: "Database") -> list[str]:

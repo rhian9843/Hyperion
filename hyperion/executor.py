@@ -42,6 +42,7 @@ from .encoding import _apply_set_op, _apply_order_limit, _encode_composite_key, 
 from .expr import eval_expr, is_expr
 from .json_funcs import json_each_rows as _json_each_rows
 from .introspect import (hyperion_master_rows as _hyperion_master_rows,
+                         hyperion_schema_meta_rows as _hyperion_schema_meta_rows,
                          integrity_check as _integrity_check,
                          explain_plan as _explain_plan)
 from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
@@ -699,6 +700,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         elif tbl == "_hyperion_master":
             rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
                                         "rows": _hyperion_master_rows(db)}, db, ctes)
+        elif tbl == "_hyperion_schema_meta":
+            rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
+                                        "rows": _hyperion_schema_meta_rows(db)}, db, ctes)
         elif tbl in ctes:
             if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
@@ -828,6 +832,7 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
                 and tbl not in merged_ctes
                 and tbl not in db.views
                 and tbl != "_hyperion_master"
+                and tbl != "_hyperion_schema_meta"
                 and not _JSON_EACH_RE.match(tbl)
                 and tbl in db._catalog.tables
                 and not stmt.get("order_by")
@@ -1121,6 +1126,60 @@ def _exec_instead_of_delete(stmt: dict, db: Database) -> str:
     return f"{n} row{'s' if n != 1 else ''} deleted."
 
 
+_SCHEMA_META_COLS = ("object_type", "object_name", "key", "value")
+
+
+def _meta_parse_val(v: str) -> str | None:
+    """Unquote a parser string token to a Python string for _hyperion_schema_meta writes."""
+    if v is None or v.upper() == "NULL":
+        return None
+    if _is_single_string_literal(v):
+        return v[1:-1].replace("''", "'")
+    return v
+
+
+def _exec_meta_insert(stmt: dict, db: Database) -> str:
+    col_names = list(stmt.get("col_names") or _SCHEMA_META_COLS)
+    for values in stmt["rows"]:
+        if len(col_names) != len(values):
+            raise DataError(
+                f"_hyperion_schema_meta expects {len(_SCHEMA_META_COLS)} columns, "
+                f"got {len(values)}")
+        row = {c: _meta_parse_val(v) for c, v in zip(col_names, values)}
+        db.set_meta(row["object_type"], row["object_name"], row["key"], row["value"])
+    n = len(stmt["rows"])
+    return f"{n} row{'s' if n != 1 else ''} inserted."
+
+
+def _exec_meta_update(stmt: dict, db: Database) -> str:
+    rows = _hyperion_schema_meta_rows(db)
+    where = stmt.get("where")
+    if where:
+        rows = [r for r in rows if where.evaluate(r, db)]
+    for row in rows:
+        new_row = dict(row)
+        for col, val_str in stmt["assignments"].items():
+            new_row[col] = _meta_parse_val(str(val_str)) if val_str is not None else None
+        if new_row != row:
+            db.delete_meta(row["object_type"], row["object_name"], row["key"])
+            if new_row.get("value") is not None:
+                db.set_meta(new_row["object_type"], new_row["object_name"],
+                            new_row["key"], new_row["value"])
+    n = len(rows)
+    return f"{n} row{'s' if n != 1 else ''} updated."
+
+
+def _exec_meta_delete(stmt: dict, db: Database) -> str:
+    rows = _hyperion_schema_meta_rows(db)
+    where = stmt.get("where")
+    if where:
+        rows = [r for r in rows if where.evaluate(r, db)]
+    for row in rows:
+        db.delete_meta(row["object_type"], row["object_name"], row["key"])
+    n = len(rows)
+    return f"{n} row{'s' if n != 1 else ''} deleted."
+
+
 def _execute_inner(stmt: dict, db: Database) -> str:
     from .schema import Schema
     op = stmt["op"]
@@ -1246,6 +1305,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         return f"Trigger '{stmt['name']}' dropped."
 
     if op == "INSERT":
+        if stmt["table"] == "_hyperion_schema_meta":
+            return _exec_meta_insert(stmt, db)
         if stmt["table"] not in db.tables and stmt["table"] in db.views:
             if not has_instead_of(db, stmt["table"], "INSERT"):
                 raise SchemaError(
@@ -1372,6 +1433,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
 
     if op == "UPDATE":
         tname = stmt["table"]
+        if tname == "_hyperion_schema_meta":
+            return _exec_meta_update(stmt, db)
         if tname not in db.tables and tname in db.views:
             if not has_instead_of(db, tname, "UPDATE"):
                 raise SchemaError(
@@ -1398,6 +1461,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
 
     if op == "DELETE":
         tname = stmt["table"]
+        if tname == "_hyperion_schema_meta":
+            return _exec_meta_delete(stmt, db)
         if tname not in db.tables and tname in db.views:
             if not has_instead_of(db, tname, "DELETE"):
                 raise SchemaError(

@@ -47,6 +47,9 @@ class Catalog:
     # stats["table"] = {"row_count": N, "columns": {"col": {"ndv": K}}}
     stats:          dict[str, dict]           = field(default_factory=dict)
     triggers:       dict[str, TriggerMeta]    = field(default_factory=dict)
+    # meta[object_type][object_name][key] = value
+    # e.g. meta["table"]["users"]["description"] = "User account records"
+    meta:           dict[str, dict]           = field(default_factory=dict)
 
     CATALOG_PAGE = 0
 
@@ -76,6 +79,7 @@ class Catalog:
                     "body_tokens": m.body_tokens}
                 for n, m in self.triggers.items()
             },
+            "meta": self.meta,
         }).encode()
 
     def ops_to_bytes(self) -> bytes:
@@ -126,6 +130,7 @@ class Catalog:
                     "body_tokens": m.body_tokens}
                 for n, m in self.triggers.items()
             },
+            "meta": self.meta,
         }).encode()
 
     # ── Deserialisation ───────────────────────────────────────────────────────
@@ -178,6 +183,7 @@ class Catalog:
             free_pages=d_o.get("free_pages", []),
             stats=d_s.get("stats", {}),
             triggers=triggers,
+            meta=d_s.get("meta", {}),
         )
 
     @classmethod
@@ -209,4 +215,5 @@ class Catalog:
                    next_free_page=d.get("next_free_page", 1),
                    free_pages=d.get("free_pages", []),
                    stats=d.get("stats", {}),
-                   triggers=triggers)
+                   triggers=triggers,
+                   meta=d.get("meta", {}))

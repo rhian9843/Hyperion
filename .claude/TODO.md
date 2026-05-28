@@ -199,7 +199,7 @@
 - [x] Structured error types — every error from the engine is a plain `RuntimeError` with a human-readable string; LLM agents need to distinguish parse errors (`ParseError`), constraint violations, type errors, and missing-table errors to self-correct without re-parsing an English message
 - [x] Async API — no `async def execute()` or asyncio support anywhere; agents built on asyncio/trio frameworks block their entire event loop on every database call; needs an `AsyncDatabase` / `AsyncCursor` wrapper or native coroutine execution path
 - [x] `executescript` discards SELECT results — when a script contains a SELECT statement the rows are silently dropped; an agent running a multi-statement script that includes a SELECT gets no data back
-- [ ] Schema semantic metadata — no mechanism to attach descriptions or semantic tags to tables and columns; the LLM text-to-SQL layer can only infer meaning from names alone; a `_hyperion_schema_meta` system table with `(object_type, object_name, key, value)` rows would let the LLM layer read column descriptions, embedding model names, tenant boundary markers, and other context needed for accurate SQL generation
+- [x] Schema semantic metadata — no mechanism to attach descriptions or semantic tags to tables and columns; the LLM text-to-SQL layer can only infer meaning from names alone; a `_hyperion_schema_meta` system table with `(object_type, object_name, key, value)` rows would let the LLM layer read column descriptions, embedding model names, tenant boundary markers, and other context needed for accurate SQL generation
 
 ## Vector Database Prerequisites
 

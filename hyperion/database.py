@@ -198,6 +198,71 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             from .expr import _USER_AGGS
             _USER_AGGS[name.upper()] = (n_args, aggregate_class)
 
+    # ── Schema semantic metadata ──────────────────────────────────────────────
+
+    def set_meta(self, object_type: str, object_name: str, key: str,
+                 value: str) -> None:
+        """Attach a semantic tag to any catalog object.
+
+        Args:
+            object_type: Kind of object — e.g. ``"table"``, ``"column"``,
+                         ``"index"``, ``"view"``.  Any string is accepted.
+            object_name: Identifier of the object.  Use ``"table.column"``
+                         style for columns (e.g. ``"users.email"``).
+            key:         Tag name, e.g. ``"description"``, ``"embedding_model"``.
+            value:       Tag value string.
+        """
+        with self._lock:
+            m = self._catalog.meta
+            if object_type not in m:
+                m[object_type] = {}
+            if object_name not in m[object_type]:
+                m[object_type][object_name] = {}
+            m[object_type][object_name][key] = value
+
+    def get_meta(self, object_type: str, object_name: str,
+                 key: str | None = None):
+        """Retrieve semantic tags for a catalog object.
+
+        Returns the value string when *key* is given, or a ``{key: value}``
+        dict when *key* is ``None``.  Returns ``None`` / ``{}`` when nothing
+        is stored.
+        """
+        with self._lock:
+            by_name = self._catalog.meta.get(object_type, {})
+            tags = by_name.get(object_name, {})
+            if key is not None:
+                return tags.get(key)
+            return dict(tags)
+
+    def delete_meta(self, object_type: str, object_name: str,
+                    key: str | None = None) -> int:
+        """Remove semantic tags for a catalog object.
+
+        When *key* is given, removes only that tag.  When *key* is ``None``,
+        removes all tags for the ``(object_type, object_name)`` pair.
+        Returns the number of entries removed.
+        """
+        with self._lock:
+            m = self._catalog.meta
+            by_name = m.get(object_type, {})
+            tags = by_name.get(object_name, {})
+            if key is not None:
+                if key in tags:
+                    del tags[key]
+                    if not tags:
+                        del by_name[object_name]
+                    if not by_name:
+                        del m[object_type]
+                    return 1
+                return 0
+            n = len(tags)
+            if n:
+                del by_name[object_name]
+                if not by_name:
+                    del m[object_type]
+            return n
+
     # ── PEP 249 DB-API ────────────────────────────────────────────────────────
 
     def cursor(self) -> "Cursor":
