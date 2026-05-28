@@ -1,9 +1,10 @@
 """PEP 249-compatible Cursor with parameter binding."""
 from __future__ import annotations
 
+import itertools
 import re
 import time
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Iterator
 
 if TYPE_CHECKING:
     from .database import Database
@@ -245,8 +246,7 @@ class Cursor:
 
     def __init__(self, db: "Database") -> None:
         self._db = db
-        self._result: list[dict] = []
-        self._pos: int = 0
+        self._iter: Iterator[dict] | None = None
         self.description: tuple | None = None
         self.rowcount: int = -1
         self.lastrowid: int | None = None
@@ -256,7 +256,7 @@ class Cursor:
 
     def execute(self, sql: str, params=None, timeout_ms: int | None = None) -> "Cursor":
         from .parser import parse
-        from .executor import execute as _exec, _rows_for_stmt, QueryTimeoutError
+        from .executor import execute as _exec, _iter_rows_for_stmt, QueryTimeoutError
         from .introspect import explain_plan
         from .auth import check_authorizer, SQLITE_IGNORE
         from .expr import get_last_insert_rowid
@@ -280,20 +280,18 @@ class Cursor:
             # SELECT ops bypass executor.execute, so authorizer must be checked here
             if op in _SELECT_OPS and self._db._authorizer is not None:
                 if check_authorizer(self._db._authorizer, stmt) == SQLITE_IGNORE:
-                    self._result = []; self._pos = 0
+                    self._iter = None
                     self.description = None; self.rowcount = -1
                     return self
 
             if op in _SELECT_OPS:
-                rows = _rows_for_stmt(stmt, self._db)
-                self._set_select_result(rows, stmt)
+                self._set_select_result(_iter_rows_for_stmt(stmt, self._db), stmt)
             elif op == "EXPLAIN":
                 rows = explain_plan(stmt["stmt"], self._db)
-                self._set_select_result(rows)
+                self._set_select_result(iter(rows))
             else:
                 result_str = _exec(stmt, self._db)
-                self._result = []
-                self._pos = 0
+                self._iter = None
                 self.description = None
                 self.rowcount = _rowcount_from_result(result_str)
                 if op in ("INSERT", "INSERT_SELECT", "UPSERT"):
@@ -334,25 +332,35 @@ class Cursor:
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
     def fetchone(self) -> Any:
-        if self._pos >= len(self._result):
+        if self._iter is None:
             return None
-        row = self._result[self._pos]
-        self._pos += 1
-        return self._apply_factory(row)
+        try:
+            return self._apply_factory(next(self._iter))
+        except StopIteration:
+            self._iter = None
+            return None
 
     def fetchmany(self, size: int = 1) -> list:
-        chunk = self._result[self._pos:self._pos + size]
-        self._pos += len(chunk)
-        return [self._apply_factory(r) for r in chunk]
+        if self._iter is None:
+            return []
+        rows: list = []
+        for _ in range(size):
+            try:
+                rows.append(self._apply_factory(next(self._iter)))
+            except StopIteration:
+                self._iter = None
+                break
+        return rows
 
     def fetchall(self) -> list:
-        remaining = self._result[self._pos:]
-        self._pos = len(self._result)
-        return [self._apply_factory(r) for r in remaining]
+        if self._iter is None:
+            return []
+        rows = [self._apply_factory(r) for r in self._iter]
+        self._iter = None
+        return rows
 
     def close(self) -> None:
-        self._result = []
-        self._pos = 0
+        self._iter = None
 
     def __iter__(self) -> "Cursor":
         return self
@@ -370,17 +378,23 @@ class Cursor:
             return row
         return self.row_factory(self, row)
 
-    def _set_select_result(self, rows: list[dict], stmt: dict | None = None) -> None:
-        self._result = rows
-        self._pos = 0
-        self.rowcount = -1
-        if rows:
-            col_names = list(rows[0].keys())
-        else:
+    def _set_select_result(self, row_iter, stmt: dict | None = None) -> None:
+        """Store a row iterator; peek one row to populate description."""
+        it = iter(row_iter)
+        try:
+            first = next(it)
+        except StopIteration:
+            self._iter = None
+            self.rowcount = -1
             col_names = _infer_col_names(stmt, self._db) if stmt is not None else None
-        if col_names is not None:
-            self.description = tuple(
-                (k, None, None, None, None, None, None) for k in col_names
+            self.description = (
+                tuple((k, None, None, None, None, None, None) for k in col_names)
+                if col_names is not None else None
             )
-        else:
-            self.description = None
+            return
+        col_names = list(first.keys())
+        self.description = tuple(
+            (k, None, None, None, None, None, None) for k in col_names
+        )
+        self.rowcount = -1
+        self._iter = itertools.chain([first], it)

@@ -784,6 +784,68 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     raise RuntimeError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
 
 
+def _iter_rows_for_stmt(stmt: dict, db: "Database",
+                        ctes: dict | None = None):
+    """Streaming SELECT: yields rows one at a time without building a full list.
+
+    For simple table scans (real table, no ORDER BY / GROUP BY / DISTINCT /
+    aggregates / window functions / scalar subqueries) rows are yielded
+    directly from the B-tree so the caller never holds the entire result set in
+    memory.  All other query shapes fall back to the fully-materialised
+    _rows_for_stmt path and then yield from that list.
+    """
+    _check_timeout(db)
+    merged_ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
+    op = stmt.get("op", "")
+
+    if op == "SELECT" and not stmt.get("subquery_from"):
+        tbl = stmt.get("table") or ""
+        stmt_cols = stmt.get("columns") or []
+        if (tbl
+                and tbl not in merged_ctes
+                and tbl not in db.views
+                and tbl != "_hyperion_master"
+                and not _JSON_EACH_RE.match(tbl)
+                and tbl in db._catalog.tables
+                and not stmt.get("order_by")
+                and not stmt.get("group_by")
+                and not stmt.get("having")
+                and not stmt.get("distinct", False)
+                and not any(_q_parse_agg(c) for c in stmt_cols if c != "*")
+                and not any(_WINDOW_RE.search(c) or _WINDOW_NAMED_RE.search(c)
+                            for c in stmt_cols if c != "*")
+                and not any(_is_scalar_subquery_col(c) for c in stmt_cols)):
+            s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+            col_aliases = stmt.get("col_aliases") or {}
+            meta = db._meta(tbl)
+            schema = meta.schema
+            where  = s.get("where")
+            cols   = s.get("columns")
+            limit  = s.get("limit")
+            offset = s.get("offset") or 0
+            skipped = 0
+            count   = 0
+            for _, raw in db._table_btree(meta).scan():
+                _check_timeout(db)
+                row = deserialize_row(schema, db._unpack_row_cell(raw))
+                if where and not where.evaluate(row, db):
+                    continue
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                projected = _project_row(row, cols) if cols else row
+                if col_aliases:
+                    projected = {col_aliases.get(k, k): v
+                                 for k, v in projected.items()}
+                yield projected
+                count += 1
+                if limit is not None and count >= limit:
+                    return
+            return
+
+    yield from _rows_for_stmt(stmt, db, merged_ctes)
+
+
 def _is_unique_index(idx_name: str, idx_meta, db: Database) -> bool:
     if idx_name.startswith("_pk_"):
         return True
