@@ -9,8 +9,12 @@ def _encode_index_key(val: Any, col_type: str) -> int:
 
     INTEGER  — identity (already int64).
     REAL     — IEEE 754 bit-manipulation preserving float sort order.
-    TEXT/VARCHAR — FNV-1a 64-bit hash (equality lookups only; collisions
-                   are caught by the post-lookup row verification step).
+    TEXT/VARCHAR — first 8 UTF-8 bytes, zero-padded, interpreted as a
+                   big-endian uint64 then biased to signed int64.  This
+                   preserves lexicographic byte order so range predicates
+                   (>, >=, <, <=, BETWEEN) and ORDER BY work correctly.
+                   Strings that share their first 8 bytes get the same key;
+                   collisions are caught by post-scan row verification.
     """
     if col_type == INTEGER:
         return int(val)
@@ -21,11 +25,14 @@ def _encode_index_key(val: Any, col_type: str) -> int:
         # because IEEE 754 exponent is in the high bits and max float < 2^63.
         encoded = raw ^ 0x7FFFFFFFFFFFFFFF if raw >> 63 else raw
         return struct.unpack(">q", struct.pack(">Q", encoded))[0]
-    # TEXT / VARCHAR — FNV-1a 64-bit
-    h = 14695981039346656037
-    for b in str(val).encode("utf-8"):
-        h = ((h ^ b) * 1099511628211) & 0xFFFFFFFFFFFFFFFF
-    return h if h < (1 << 63) else h - (1 << 64)
+    # TEXT / VARCHAR — prefix-encoded for sort-order preservation
+    b = str(val).encode("utf-8")
+    # Take first 8 bytes; zero-pad shorter strings (NUL sorts before any char)
+    prefix = b[:8].ljust(8, b"\x00")
+    unsigned = struct.unpack(">Q", prefix)[0]
+    # Subtract 2^63 to map unsigned 0…2^64-1 → signed -2^63…2^63-1 while
+    # preserving relative order; compatible with _make_index_key's +_KEY_SIGN bias.
+    return unsigned - (1 << 63)
 
 
 def _encode_composite_key(vals: list[Any], col_types: list[str]) -> int:

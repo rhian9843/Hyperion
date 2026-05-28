@@ -145,17 +145,131 @@ def _left_alias_of(col: str | None) -> str | None:
     return None
 
 
+_OUTER_JOIN_TYPES = frozenset({"LEFT", "LEFT OUTER", "RIGHT", "RIGHT OUTER",
+                               "FULL", "FULL OUTER"})
+
+
+def _reorder_inner_extras(
+    seed_tables: list[tuple[str, str | None]],
+    inner_extras: list[dict],
+    db,
+) -> list[dict] | None:
+    """Greedy-reorder a list of INNER extra-join dicts given an already-placed seed set.
+
+    seed_tables: tables already in the result (their aliases are 'placed' from the start).
+    inner_extras: INNER extra-join dicts to reorder.
+    Returns a reordered list, or None if reordering is impossible / produces no change.
+    """
+    if not inner_extras:
+        return None
+
+    # Collect table info
+    tables   = list(seed_tables)  # fixed prefix (not reordered)
+    ex_start = len(tables)        # index of first inner_extra table in `tables`
+    ex_conds: list[tuple[str | None, str | None]] = []
+    for ej in inner_extras:
+        on_left = ej.get("on_left")
+        if not on_left or "." not in on_left:
+            return None  # unqualified — cannot reorder
+        tables.append((ej["right_table"], ej.get("right_alias")))
+        ex_conds.append((on_left, ej.get("on_right")))
+
+    alias_to_idx: dict[str, int] = {}
+    for i, (tname, talias) in enumerate(tables):
+        alias_to_idx[_talias(tname, talias)] = i
+        alias_to_idx[tname] = i
+
+    # Build edges among the inner extras only (indices ex_start..n-1)
+    edges: list[tuple[int, int, str, str]] = []
+    for k, (on_left, on_right) in enumerate(ex_conds):
+        right_idx = ex_start + k
+        la        = _left_alias_of(on_left)
+        left_idx  = alias_to_idx.get(la) if la else None
+        if left_idx is None:
+            return None
+        edges.append((left_idx, right_idx,
+                      on_left or "",
+                      (on_right or "").split(".")[-1]))
+        right_alias_str = _talias(*tables[right_idx])
+        rev_ol  = f"{right_alias_str}.{(on_right or '').split('.')[-1]}"
+        rev_or  = (on_left or "").split(".")[-1]
+        edges.append((right_idx, left_idx, rev_ol, rev_or))
+
+    # Greedy: start from all seed tables already placed, find best order for extras
+    n_extras = len(inner_extras)
+    placed   = set(range(ex_start))
+    accum    = {_talias(*t) for t in seed_tables}
+    # Estimate cost baseline: product of seed table sizes (rough)
+    left_count = max(1, sum(estimate_rows(db, t[0]) for t in seed_tables))
+
+    ordering: list[int] = []
+    plan_conds: list[tuple[str | None, str | None]] = []
+
+    for _ in range(n_extras):
+        candidates: list[tuple[float, int, str, str]] = []
+        for a_idx, b_idx, ol, or_ in edges:
+            if a_idx not in placed or b_idx in placed:
+                continue
+            la = _left_alias_of(ol)
+            if la and la not in accum:
+                continue
+            cost = _step_cost(db, left_count, tables[b_idx][0], or_)
+            candidates.append((cost, b_idx, ol, or_))
+        if not candidates:
+            return None  # disconnected graph — cannot reorder
+        candidates.sort(key=lambda x: x[0])
+        _, nxt, ol, or_ = candidates[0]
+        placed.add(nxt)
+        ordering.append(nxt)
+        plan_conds.append((ol, or_))
+        accum.add(_talias(*tables[nxt]))
+        left_count = _output_estimate(db, left_count, tables[nxt][0], or_ or None)
+
+    # Check if ordering differs from original
+    orig_order = list(range(ex_start, ex_start + n_extras))
+    if ordering == orig_order:
+        return None  # no change
+
+    new_extras: list[dict] = []
+    for k, idx in enumerate(ordering):
+        orig_ej = inner_extras[idx - ex_start]
+        ol_k, or_k = plan_conds[k]
+        new_extras.append({**orig_ej, "on_left": ol_k, "on_right": or_k})
+    return new_extras
+
+
 def optimize_join(stmt: dict, db) -> dict:
     """
     Attempt to reorder a join statement's tables to minimise estimated cost.
-    Only applied to chains of INNER equijoins where all ON conditions are qualified
-    (e.g. 'a.id = b.a_id').  Returns the original stmt unchanged if it cannot be
-    safely reordered.
+
+    For pure INNER equijoin chains: full greedy reorder of all tables.
+    For chains with an OUTER primary join: keep the primary pair fixed and
+    greedy-reorder any subsequent INNER extra-joins.
+    Returns the original stmt unchanged if no safe reorder is found.
     """
     extra     = stmt.get("extra_joins") or []
     join_type = stmt.get("join_type", "INNER")
 
-    # Only reorder pure INNER JOIN chains with equijoin conditions
+    primary_is_outer = join_type in _OUTER_JOIN_TYPES
+
+    # If primary is OUTER: keep primary pair fixed, reorder only INNER extra-joins
+    if primary_is_outer:
+        inner_extras = [ej for ej in extra if ej.get("join_type", "INNER") == "INNER"]
+        non_inner    = [ej for ej in extra if ej.get("join_type", "INNER") != "INNER"]
+        if not inner_extras:
+            return stmt
+        seed = [(stmt["left_table"],  stmt.get("left_alias")),
+                (stmt["right_table"], stmt.get("right_alias"))]
+        new_inner = _reorder_inner_extras(seed, inner_extras, db)
+        if new_inner is None:
+            return stmt
+        # Interleave: non_inner extras keep their original relative positions
+        # For simplicity, append non_inner extras after reordered inner ones
+        new_stmt = dict(stmt)
+        new_stmt["extra_joins"] = new_inner + non_inner
+        return new_stmt
+
+    # Original pure-INNER chain guard
     if join_type != "INNER":
         return stmt
     for ej in extra:

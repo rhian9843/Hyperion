@@ -162,10 +162,10 @@
 
 ### Indexes / Optimizer
 
-- [ ] Text index ordering — TEXT/VARCHAR index keys are FNV-1a hashes; range predicates (`WHERE name > 'M'`), `BETWEEN`, and `ORDER BY` with index all produce wrong or suboptimal results; text B-tree keys need to be prefix-encoded byte strings so sort order is preserved
-- [ ] Outer join optimisation — the cost-based join reorderer only runs on chains of INNER equijoins; LEFT / RIGHT / FULL OUTER joins are never reordered regardless of table sizes
-- [ ] Range predicate index use — `WHERE int_col > 100` never uses an index today; the optimizer only probes indexes for equality (`=`); `scan_range` exists on BTree but is never invoked from the query planner
-- [ ] True prepared statements — the current `_bind_params` substitutes values into the SQL string *before* parsing, so every call with different parameter values produces a different string and a guaranteed cache miss; a plan cache keyed on the raw template string (`"SELECT ... WHERE id = ?"`) is therefore a no-op for all parameterised queries; fix requires two-phase execution: (1) parse and plan the SQL with `?` placeholders intact and cache that plan, (2) bind actual values at execution time against the already-parsed plan; this also unblocks vector parameter binding — passing a float list as `?` currently serialises it to a string literal `'[0.1, 0.2, 0.3]'` that must be re-parsed at query time
+- [x] Text index ordering — TEXT/VARCHAR index keys are FNV-1a hashes; range predicates (`WHERE name > 'M'`), `BETWEEN`, and `ORDER BY` with index all produce wrong or suboptimal results; text B-tree keys need to be prefix-encoded byte strings so sort order is preserved
+- [x] Outer join optimisation — the cost-based join reorderer only runs on chains of INNER equijoins; LEFT / RIGHT / FULL OUTER joins are never reordered regardless of table sizes
+- [x] Range predicate index use — `WHERE int_col > 100` never uses an index today; the optimizer only probes indexes for equality (`=`); `scan_range` exists on BTree but is never invoked from the query planner
+- [x] True prepared statements — the current `_bind_params` substitutes values into the SQL string *before* parsing, so every call with different parameter values produces a different string and a guaranteed cache miss; a plan cache keyed on the raw template string (`"SELECT ... WHERE id = ?"`) is therefore a no-op for all parameterised queries; fix requires two-phase execution: (1) parse and plan the SQL with `?` placeholders intact and cache that plan, (2) bind actual values at execution time against the already-parsed plan; this also unblocks vector parameter binding — passing a float list as `?` currently serialises it to a string literal `'[0.1, 0.2, 0.3]'` that must be re-parsed at query time
 
 ### Storage
 

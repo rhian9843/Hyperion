@@ -274,7 +274,7 @@ class QueryMixin:
         else:
             lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
             rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
-            use_inlj = (join_type == "INNER"
+            use_inlj = (join_type in ("INNER", "LEFT", "LEFT OUTER")
                         and find_eq_index(self, right_table, rcol) is not None)
 
         def _on_match(lr: dict, rr: dict) -> bool:
@@ -286,9 +286,22 @@ class QueryMixin:
             for lr in left_rows:
                 val = lr.get(lcol)  # type: ignore[arg-type]
                 if val is None:
-                    continue  # INNER JOIN: NULL never matches
+                    if join_type in ("LEFT", "LEFT OUTER"):
+                        # NULL key: no right-side match possible — emit null row
+                        merged = {f"{la}.{k}": v for k, v in lr.items()}
+                        merged.update(right_null)
+                        row = _emit(merged)
+                        if row is not None:
+                            results.append(row)
+                    continue
                 probed = _probe_index(self, right_table, rcol, val)  # type: ignore[arg-type]
                 if not probed:
+                    if join_type in ("LEFT", "LEFT OUTER"):
+                        merged = {f"{la}.{k}": v for k, v in lr.items()}
+                        merged.update(right_null)
+                        row = _emit(merged)
+                        if row is not None:
+                            results.append(row)
                     continue
                 for rr in probed:
                     row = _emit(_merge(lr, rr))
@@ -413,7 +426,7 @@ class QueryMixin:
                         col_obj = next(
                             (c for c in meta.schema.columns if c.name == cond.col), None
                         )
-                        if col_obj and col_obj.type != TEXT:
+                        if col_obj:
                             return m, cond
             cond = cond.and_clause
         return None, None
@@ -432,12 +445,20 @@ class QueryMixin:
 
         _MAX_ROWID = 0xFFFFFFFFFFFFFFFF
         _MAX_KEY   = (_MAX_ROWID << 64) | _MAX_ROWID
+        is_text    = col_obj.type == TEXT
 
         op = range_cond.op
         if op == ">=":
             lo, hi = _make_index_key(val_key, 0),              _MAX_KEY
         elif op == ">":
-            lo, hi = _make_index_key(val_key, _MAX_ROWID) + 1, _MAX_KEY
+            if is_text:
+                # Strings longer than 8 bytes that share the boundary's prefix
+                # map to the same val_key but are lexicographically greater;
+                # include the full same-prefix range and let post-filter exclude
+                # entries that are not actually > val.
+                lo, hi = _make_index_key(val_key, 0),          _MAX_KEY
+            else:
+                lo, hi = _make_index_key(val_key, _MAX_ROWID) + 1, _MAX_KEY
         elif op == "<=":
             lo, hi = 0,                                         _make_index_key(val_key, _MAX_ROWID)
         else:  # "<"
@@ -454,5 +475,5 @@ class QueryMixin:
             row = deserialize_row(schema, raw)
             if where and not where.evaluate(row, self):
                 continue
-            results.append({k: row[k] for k in columns} if columns else row)
+            results.append(_project_row(row, columns) if columns else row)
         return results

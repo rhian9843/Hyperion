@@ -91,6 +91,111 @@ def _bind_params(sql: str, params: Any) -> str:
     return "".join(result)
 
 
+# ── AST-level parameter binding ──────────────────────────────────────────────
+
+def _unquote_str(s: str) -> str:
+    """Strip outer single quotes (mirrors parser's _unquote_token)."""
+    if s.startswith("'") and s.endswith("'") and len(s) >= 2:
+        return s[1:-1].replace("''", "'")
+    return s
+
+
+def _bind_ast_params(stmt: dict, params) -> dict:
+    """Return a shallow copy of stmt with '?' / ':name' placeholders filled in.
+
+    Substitution rules per location:
+      - WHERE / HAVING conditions (WhereClause.val): unquoted value so the
+        existing coercion logic in _eval_atom sees the same string format as
+        a parsed literal would produce.
+      - INSERT rows (stmt['rows'] list): SQL-literal form so the executor's
+        string-processing code can handle it identically to a parsed literal.
+      - UPDATE assignments (stmt['assignments']): unquoted value, same as
+        the parser's _unquote_token would produce.
+    """
+    from .where import WhereClause
+
+    if isinstance(params, dict):
+        param_dict = params
+        pos_iter   = None
+    else:
+        param_dict = None
+        pos_iter   = iter(list(params))
+
+    def _next_param() -> Any:
+        if pos_iter is None:
+            raise ValueError("Use named parameters (:name) with a dict, not positional ?")
+        return next(pos_iter)
+
+    def _resolve_named(name: str) -> Any:
+        key = name.lstrip(":$")
+        if param_dict is None:
+            raise ValueError(f"Named parameter '{name}' requires a dict of params")
+        if key not in param_dict:
+            raise ValueError(f"No value for named parameter '{name}'")
+        return param_dict[key]
+
+    def _is_placeholder(val: str) -> bool:
+        return val == "?" or (
+            param_dict is not None
+            and isinstance(val, str)
+            and len(val) > 1
+            and val[0] in (":", "$")
+        )
+
+    def _sub_unquoted(val: str) -> str:
+        """Return unquoted substituted value for WHERE / UPDATE contexts."""
+        if not _is_placeholder(val):
+            return val
+        raw = _next_param() if val == "?" else _resolve_named(val)
+        return _unquote_str(_sql_literal(raw))
+
+    def _sub_row_val(val: str) -> str:
+        """Return SQL-literal substituted value for INSERT rows."""
+        if not _is_placeholder(val):
+            return val
+        raw = _next_param() if val == "?" else _resolve_named(val)
+        return _sql_literal(raw)
+
+    def _sub_where(where: "WhereClause | None") -> "WhereClause | None":
+        if where is None:
+            return None
+        new_val = _sub_unquoted(where.val) if where.val else where.val
+        return WhereClause(
+            col=where.col, op=where.op, val=new_val,
+            subquery_ast=where.subquery_ast,
+            row_cols=where.row_cols,
+            group_clause=_sub_where(where.group_clause),
+            and_clause=_sub_where(where.and_clause),
+            or_clause=_sub_where(where.or_clause),
+        )
+
+    new_stmt = dict(stmt)
+    op = stmt.get("op", "")
+
+    if op in ("INSERT", "INSERT_OR_REPLACE", "UPSERT"):
+        if "rows" in stmt:
+            new_stmt["rows"] = [[_sub_row_val(v) for v in row] for row in stmt["rows"]]
+        new_stmt["where"] = _sub_where(stmt.get("where"))
+
+    elif op == "UPDATE":
+        if "assignments" in stmt:
+            new_stmt["assignments"] = {
+                col: _sub_unquoted(val) if isinstance(val, str) else val
+                for col, val in stmt["assignments"].items()
+            }
+        new_stmt["where"] = _sub_where(stmt.get("where"))
+
+    elif op == "DELETE":
+        new_stmt["where"] = _sub_where(stmt.get("where"))
+
+    else:
+        # SELECT / JOIN / SET_OP / RECURSIVE_CTE / etc.
+        new_stmt["where"]  = _sub_where(stmt.get("where"))
+        new_stmt["having"] = _sub_where(stmt.get("having"))
+
+    return new_stmt
+
+
 # ── Rowcount parsing ──────────────────────────────────────────────────────────
 
 _ROWCOUNT_RE = re.compile(r"^(\d+)\s+row", re.IGNORECASE)
@@ -156,8 +261,14 @@ class Cursor:
         from .auth import check_authorizer, SQLITE_IGNORE
         from .expr import get_last_insert_rowid
 
-        bound = _bind_params(sql, params) if params is not None else sql
-        stmt = parse(bound)
+        cache = self._db._plan_cache
+        if sql not in cache:
+            cache[sql] = parse(sql)
+            # Simple size cap: evict oldest entries when cache grows large
+            if len(cache) > 512:
+                oldest = next(iter(cache))
+                del cache[oldest]
+        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
         op = stmt.get("op", "")
 
         if timeout_ms is not None:

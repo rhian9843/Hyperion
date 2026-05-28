@@ -32,6 +32,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self.fk_enforcement  = True
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
+        self._plan_cache: dict[str, dict] = {}  # raw SQL template → parsed AST
 
     # ── Transaction control ────────────────────────────────────────────────────
 
