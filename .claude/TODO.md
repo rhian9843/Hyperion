@@ -148,4 +148,4 @@
 
 - [x] Refactor `_parse_tokens` (1,420 lines) into per-statement parser functions — the monolithic function makes it hard to isolate bugs and the expressions-in-VALUES bug is a direct consequence of it
 - [x] Unify `_execute_inner` and `_rows_for_stmt` execution paths — JOIN+aggregation, CTE resolution, and GROUP BY fixes applied to one path must be manually mirrored to the other; the divergence is the root cause of the JOIN+GROUP BY and CTE+JOIN bugs
-- [ ] Update module docstring — currently missing joins, aggregates, transactions, constraints, set operations, subqueries
+- [x] Update module docstring — currently missing joins, aggregates, transactions, constraints, set operations, subqueries
