@@ -9,7 +9,15 @@ class ParseError(ValueError):
     pass
 
 
-_TOKEN_RE = re.compile(r"'(?:[^']|'')*'|\"[^\"]*\"|`[^`]*`|\w+\([^()]*\)|[(),;*]|[^\s(),;*]+")
+_TOKEN_RE = re.compile(
+    r"'(?:[^']|'')*'"          # single-quoted strings
+    r'|"[^"]*"'                # double-quoted identifiers
+    r'|`[^`]*`'               # backtick-quoted identifiers
+    r'|\w+\([^()]*\)'          # function calls like UPPER(col)
+    r'|[(),;*]'                # single-char punctuation
+    r'|!=|<>|<=|>=|[=<>!]'    # comparison operators (longest match first)
+    r'|[^\s(),;*=<>!]+'        # everything else: identifiers, numbers, keywords
+)
 
 
 def _unquote_token(t: str) -> str:

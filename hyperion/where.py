@@ -6,6 +6,22 @@ from .encoding import _apply_set_op
 from .expr import eval_expr, is_expr
 
 
+def _is_sql_constant(s: str) -> bool:
+    """True when s is a SQL literal that can appear on the LHS of a condition.
+
+    Covers numeric literals (int/float, optionally negative) and the SQL
+    keyword constants TRUE, FALSE, and NULL.  Identifiers and expressions are
+    intentionally excluded so typo column names still raise 'Unknown column'.
+    """
+    if s.upper() in ("TRUE", "FALSE", "NULL"):
+        return True
+    try:
+        float(s)
+        return True
+    except (ValueError, TypeError):
+        return False
+
+
 @dataclass
 class WhereClause:
     col:          str
@@ -51,6 +67,9 @@ class WhereClause:
         # col lookup — strip table/alias prefix when exact key absent, or evaluate as expr
         if self.col in row:
             cell = row[self.col]
+        elif _is_sql_constant(self.col):
+            # Numeric literal or SQL constant on the LHS (e.g. WHERE 1=0, WHERE 3.14 > x)
+            cell = eval_expr(self.col, row)
         elif "." in self.col and self.col.split(".", 1)[1] in row:
             cell = row[self.col.split(".", 1)[1]]
         elif "." in self.col:
