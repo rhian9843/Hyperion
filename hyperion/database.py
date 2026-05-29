@@ -1,3 +1,4 @@
+import contextlib
 import struct
 import threading
 from pathlib import Path
@@ -28,6 +29,72 @@ _CAT_HDR     = 8                    # [next_pn: 4][chunk_len: 4]
 _CAT_CHUNK   = PAGE_SIZE - _CAT_HDR - PAGE_CKSUM_SZ    # 4084
 
 
+class _RWLock:
+    """Single-writer / multiple-reader lock with reentrant write support.
+
+    Multiple threads may hold the read lock simultaneously.  A write request
+    blocks until all readers finish, then grants exclusive access.  A thread
+    that already holds the write lock may re-acquire it without deadlocking
+    (reentrant write, tracked by depth counter).  Pending writers are counted
+    so new readers wait once a writer is queued, preventing writer starvation.
+    """
+
+    __slots__ = ("_cond", "_readers", "_write_owner", "_write_depth",
+                 "_writers_waiting")
+
+    def __init__(self) -> None:
+        self._cond             = threading.Condition(threading.Lock())
+        self._readers: int     = 0
+        self._write_owner      = None   # thread ident or None
+        self._write_depth: int = 0
+        self._writers_waiting: int = 0
+
+    @contextlib.contextmanager
+    def read(self):
+        """Shared (read) lock — multiple holders allowed, blocks on active/pending writers."""
+        tid = threading.get_ident()
+        acquired = False
+        with self._cond:
+            if self._write_owner == tid:
+                pass  # current write owner also has implicit read access
+            else:
+                while self._write_owner is not None or self._writers_waiting > 0:
+                    self._cond.wait()
+                self._readers += 1
+                acquired = True
+        try:
+            yield
+        finally:
+            if acquired:
+                with self._cond:
+                    self._readers -= 1
+                    if self._readers == 0:
+                        self._cond.notify_all()
+
+    @contextlib.contextmanager
+    def write(self):
+        """Exclusive (write) lock — reentrant for the same thread."""
+        tid = threading.get_ident()
+        with self._cond:
+            if self._write_owner == tid:
+                self._write_depth += 1  # reentrant
+            else:
+                self._writers_waiting += 1
+                while self._readers > 0 or self._write_owner is not None:
+                    self._cond.wait()
+                self._writers_waiting -= 1
+                self._write_owner = tid
+                self._write_depth = 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._write_depth -= 1
+                if self._write_depth == 0:
+                    self._write_owner = None
+                    self._cond.notify_all()
+
+
 class _ReadOnlyContext:
     __slots__ = ("_db", "_prev")
 
@@ -49,7 +116,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         if str(path) == ":memory:":
             self._pager: Pager | MemoryPager = MemoryPager()
         else:
-            self._pager = Pager(Path(path))
+            self._pager = Pager(Path(path), readonly=readonly)
         self._readonly = readonly
         self.max_rows: int | None = None
         (self._catalog,
@@ -67,10 +134,11 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # Schema bytes cache: skip page writes when structure hasn't changed.
         # Ops are always written (they're small and change on every INSERT).
         self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
-        # Coarse-grained reentrant lock: serialises all public API calls so that
-        # two threads sharing one Database object don't corrupt _catalog,
-        # _txn_depth, _savepoints, _plan_cache, or pager state.
-        self._lock = threading.RLock()
+        # Readers-writer lock: concurrent SELECTs share the read lock; writes
+        # (DML, DDL, transactions) require exclusive access.  Write lock is
+        # reentrant for the same thread so nested calls (e.g. executescript →
+        # commit, close → begin/drop/commit) don't deadlock.
+        self._lock = _RWLock()
 
     # ── Read-only toggle ──────────────────────────────────────────────────────
 
@@ -101,14 +169,14 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         return self._txn_depth > 0
 
     def begin(self) -> None:
-        with self._lock:
+        with self._lock.write():
             if self._txn_depth > 0:
                 raise TransactionError("Transaction already active")
             self._pager.begin()
             self._txn_depth = 1
 
     def commit(self) -> None:
-        with self._lock:
+        with self._lock.write():
             if self._txn_depth == 0:
                 raise TransactionError("No active transaction")
             self._flush_catalog()
@@ -116,7 +184,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._txn_depth = 0
 
     def rollback(self) -> None:
-        with self._lock:
+        with self._lock.write():
             if self._txn_depth == 0:
                 raise TransactionError("No active transaction")
             self._savepoints.clear()
@@ -127,7 +195,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     # ── Savepoints ─────────────────────────────────────────────────────────────
 
     def savepoint(self, name: str) -> None:
-        with self._lock:
+        with self._lock.write():
             if self._txn_depth == 0:
                 self._pager.begin()
                 self._txn_depth = 1
@@ -142,12 +210,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
 
     def release_savepoint(self, name: str) -> None:
-        with self._lock:
+        with self._lock.write():
             idx = self._find_savepoint(name)
             del self._savepoints[idx:]
 
     def rollback_to_savepoint(self, name: str) -> None:
-        with self._lock:
+        with self._lock.write():
             idx = self._find_savepoint(name)
             _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
                 self._savepoints[idx]
@@ -177,7 +245,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             n_args: Number of expected arguments, or -1 for variadic.
             fn:     Callable invoked with evaluated SQL arguments.
         """
-        with self._lock:
+        with self._lock.write():
             from .expr import _USER_FUNCS
             _USER_FUNCS[name.upper()] = (n_args, fn)
 
@@ -194,7 +262,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             n_args:          Number of per-row arguments, or -1 for variadic.
             aggregate_class: Class implementing the aggregate protocol.
         """
-        with self._lock:
+        with self._lock.write():
             from .expr import _USER_AGGS
             _USER_AGGS[name.upper()] = (n_args, aggregate_class)
 
@@ -212,7 +280,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             key:         Tag name, e.g. ``"description"``, ``"embedding_model"``.
             value:       Tag value string.
         """
-        with self._lock:
+        with self._lock.write():
             m = self._catalog.meta
             if object_type not in m:
                 m[object_type] = {}
@@ -228,7 +296,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         dict when *key* is ``None``.  Returns ``None`` / ``{}`` when nothing
         is stored.
         """
-        with self._lock:
+        with self._lock.read():
             by_name = self._catalog.meta.get(object_type, {})
             tags = by_name.get(object_name, {})
             if key is not None:
@@ -243,7 +311,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         removes all tags for the ``(object_type, object_name)`` pair.
         Returns the number of entries removed.
         """
-        with self._lock:
+        with self._lock.write():
             m = self._catalog.meta
             by_name = m.get(object_type, {})
             tags = by_name.get(object_name, {})
@@ -287,12 +355,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         or SQLITE_IGNORE (2) to silently skip the operation.
         Pass None to remove the authorizer.
         """
-        with self._lock:
+        with self._lock.write():
             self._authorizer = fn
 
     def iterdump(self):
         """Yield SQL statements that recreate the full database (like sqlite3.iterdump)."""
-        with self._lock:
+        with self._lock.read():
             lines = list(self._iterdump_inner())
         yield from lines
 
@@ -707,7 +775,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def create_view(self, name: str, sql: str,
                     if_not_exists: bool = False,
                     or_replace: bool = False) -> None:
-        with self._lock:
+        with self._lock.write():
             if name in self._catalog.views:
                 if or_replace:
                     pass  # overwrite below
@@ -718,7 +786,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._catalog.views[name] = sql
 
     def drop_view(self, name: str, if_exists: bool = False) -> None:
-        with self._lock:
+        with self._lock.write():
             if name not in self._catalog.views:
                 if if_exists:
                     return
@@ -726,7 +794,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             del self._catalog.views[name]
 
     def close(self) -> None:
-        with self._lock:
+        with self._lock.write():
             temp_tables = [n for n, m in self._catalog.tables.items() if m.temporary]
             if temp_tables:
                 self.begin()
@@ -737,7 +805,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def vacuum(self) -> str:
         """Rebuild the database file compactly, reclaiming space from deleted rows."""
-        with self._lock:
+        with self._lock.write():
             return self._vacuum_inner()
 
     def _vacuum_inner(self) -> str:

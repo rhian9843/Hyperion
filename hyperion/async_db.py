@@ -12,12 +12,24 @@ if TYPE_CHECKING:
     from .database import Database
     from .cursor import Cursor
 
+# Rows per thread-pool trip for fetchone / __anext__. Batching amortises the
+# per-call overhead of run_in_executor across this many rows.
+_FETCH_CHUNK = 256
+
 
 class AsyncCursor:
-    """Async wrapper around a synchronous Cursor."""
+    """Async wrapper around a synchronous Cursor.
+
+    fetchone() and async-iteration are buffered: rows are fetched from the
+    underlying sync cursor in batches of _FETCH_CHUNK so that only one
+    thread-pool dispatch is needed per chunk rather than per row.
+    """
 
     def __init__(self, cursor: "Cursor") -> None:
         self._cursor = cursor
+        self._buffer: list[Any] = []
+        self._buf_pos: int = 0
+        self._exhausted: bool = False
 
     @property
     def description(self):
@@ -35,20 +47,62 @@ class AsyncCursor:
     def script_results(self) -> list:
         return self._cursor.script_results
 
-    async def fetchone(self) -> Any:
+    async def _load_chunk(self) -> None:
+        """Fetch the next batch from the sync cursor into the local buffer."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._cursor.fetchone)
+        rows = await loop.run_in_executor(
+            None, lambda: self._cursor.fetchmany(_FETCH_CHUNK)
+        )
+        self._buffer = rows
+        self._buf_pos = 0
+        if len(rows) < _FETCH_CHUNK:
+            self._exhausted = True
+
+    async def fetchone(self) -> Any:
+        if self._buf_pos < len(self._buffer):
+            row = self._buffer[self._buf_pos]
+            self._buf_pos += 1
+            return row
+        if self._exhausted:
+            return None
+        await self._load_chunk()
+        if self._buf_pos < len(self._buffer):
+            row = self._buffer[self._buf_pos]
+            self._buf_pos += 1
+            return row
+        return None
 
     async def fetchmany(self, size: int = 1) -> list:
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, lambda: self._cursor.fetchmany(size))
+        result: list[Any] = []
+        while len(result) < size:
+            available = len(self._buffer) - self._buf_pos
+            if available > 0:
+                take = min(size - len(result), available)
+                result.extend(self._buffer[self._buf_pos:self._buf_pos + take])
+                self._buf_pos += take
+            elif self._exhausted:
+                break
+            else:
+                await self._load_chunk()
+                if not self._buffer:
+                    break
+        return result
 
     async def fetchall(self) -> list:
+        buffered = self._buffer[self._buf_pos:]
+        self._buffer = []
+        self._buf_pos = 0
+        if self._exhausted:
+            return buffered
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._cursor.fetchall)
+        rest = await loop.run_in_executor(None, self._cursor.fetchall)
+        return buffered + rest
 
     def close(self) -> None:
         self._cursor.close()
+        self._buffer = []
+        self._buf_pos = 0
+        self._exhausted = True
 
     def __aiter__(self) -> "AsyncCursor":
         return self

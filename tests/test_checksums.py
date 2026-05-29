@@ -1,14 +1,14 @@
 """Tests for per-page CRC-32 checksums."""
 import struct
-import tempfile
-from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from hyperion import Database
 from hyperion.checksum import (
     CorruptPageError, page_checksum, stamp_page, verify_page,
+    _CRC_ZERO_SENTINEL,
 )
-from hyperion.constants import PAGE_SIZE, PAGE_CKSUM_OFF, PAGE_CKSUM_SZ
+from hyperion.constants import PAGE_SIZE, PAGE_CKSUM_OFF
 from hyperion.introspect import integrity_check
 
 
@@ -50,6 +50,45 @@ def test_checksum_covers_only_data_area():
     a[PAGE_CKSUM_OFF] = 0x11
     b[PAGE_CKSUM_OFF] = 0x22
     assert page_checksum(a) == page_checksum(b)
+
+
+def test_zero_raw_crc_is_remapped_to_sentinel():
+    """page_checksum must never return 0; a raw CRC of 0 maps to _CRC_ZERO_SENTINEL."""
+    page = bytearray(PAGE_SIZE)
+    with patch("hyperion.checksum._crc32", return_value=0):
+        crc = page_checksum(page)
+    assert crc == _CRC_ZERO_SENTINEL
+    assert crc != 0
+
+
+def test_stamp_stores_sentinel_when_raw_crc_is_zero():
+    """stamp_page must write the sentinel, not 0, when raw CRC-32 is 0."""
+    page = bytearray(PAGE_SIZE)
+    with patch("hyperion.checksum._crc32", return_value=0):
+        stamp_page(page)
+    stored = struct.unpack_from("<I", page, PAGE_CKSUM_OFF)[0]
+    assert stored == _CRC_ZERO_SENTINEL
+    assert stored != 0
+
+
+def test_verify_passes_after_stamp_with_zero_raw_crc():
+    """A page stamped under a zero raw CRC must pass verify_page without error."""
+    page = bytearray(PAGE_SIZE)
+    with patch("hyperion.checksum._crc32", return_value=0):
+        stamp_page(page)
+        # verify_page must also use the remapped value, so no mismatch
+        verify_page(page, 0)
+
+
+def test_verify_detects_corruption_on_zero_raw_crc_page():
+    """Corrupting a page that was stamped via the sentinel must still be caught."""
+    page = bytearray(PAGE_SIZE)
+    with patch("hyperion.checksum._crc32", return_value=0):
+        stamp_page(page)
+    # Flip a data byte outside the checksum slot
+    page[42] ^= 0xFF
+    with pytest.raises(CorruptPageError):
+        verify_page(page, 7)
 
 
 def test_stamp_is_idempotent():

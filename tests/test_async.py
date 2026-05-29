@@ -376,6 +376,108 @@ class TestAsyncExecutemany:
         run(go())
 
 
+# ── Buffered fetch (large result sets) ───────────────────────────────────────
+
+class TestAsyncBufferedFetch:
+    """AsyncCursor must return correct rows at all sizes, including chunk boundaries."""
+
+    def _make_db_with_rows(self, n: int):
+        """Return an AsyncDatabase(:memory:) loaded with n rows in table t(n INTEGER)."""
+        import asyncio
+        from hyperion import AsyncDatabase
+
+        async def setup():
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(n)])
+            return db
+
+        return asyncio.run(setup())
+
+    def test_fetchall_large(self):
+        """fetchall on 1000 rows (>_FETCH_CHUNK) returns all rows."""
+        async def go():
+            from hyperion import AsyncDatabase
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(1000)])
+            cur = await db.execute("SELECT n FROM t ORDER BY n")
+            rows = await cur.fetchall()
+            assert len(rows) == 1000
+            assert [r["n"] for r in rows] == list(range(1000))
+            await db.close()
+        run(go())
+
+    def test_async_for_large(self):
+        """async for over 500 rows (close to 2× _FETCH_CHUNK) returns all rows."""
+        async def go():
+            from hyperion import AsyncDatabase
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(500)])
+            cur = await db.execute("SELECT n FROM t ORDER BY n")
+            results = []
+            async for row in cur:
+                results.append(row["n"])
+            assert results == list(range(500))
+            await db.close()
+        run(go())
+
+    def test_async_for_exact_chunk_boundary(self):
+        """async for over exactly _FETCH_CHUNK rows hits the boundary cleanly."""
+        from hyperion.async_db import _FETCH_CHUNK
+
+        async def go():
+            from hyperion import AsyncDatabase
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany(
+                "INSERT INTO t VALUES (?)", [(i,) for i in range(_FETCH_CHUNK)]
+            )
+            cur = await db.execute("SELECT n FROM t ORDER BY n")
+            results = []
+            async for row in cur:
+                results.append(row["n"])
+            assert results == list(range(_FETCH_CHUNK))
+            await db.close()
+        run(go())
+
+    def test_fetchmany_spans_chunk_boundary(self):
+        """fetchmany with size > _FETCH_CHUNK loads multiple chunks correctly."""
+        from hyperion.async_db import _FETCH_CHUNK
+
+        async def go():
+            from hyperion import AsyncDatabase
+            n = _FETCH_CHUNK + 10
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(n)])
+            cur = await db.execute("SELECT n FROM t ORDER BY n")
+            batch = await cur.fetchmany(_FETCH_CHUNK + 5)
+            assert len(batch) == _FETCH_CHUNK + 5
+            rest = await cur.fetchmany(100)
+            assert len(rest) == 5  # remaining rows
+            assert await cur.fetchone() is None
+            await db.close()
+        run(go())
+
+    def test_interleaved_fetchone_fetchall(self):
+        """fetchone drains buffer; fetchall returns the remainder without repetition."""
+        async def go():
+            from hyperion import AsyncDatabase
+            db = AsyncDatabase(":memory:")
+            await db.execute("CREATE TABLE t (n INTEGER)")
+            await db.executemany("INSERT INTO t VALUES (?)", [(i,) for i in range(10)])
+            cur = await db.execute("SELECT n FROM t ORDER BY n")
+            first = await cur.fetchone()
+            assert first["n"] == 0
+            rest = await cur.fetchall()
+            assert [r["n"] for r in rest] == list(range(1, 10))
+            assert await cur.fetchone() is None
+            await db.close()
+        run(go())
+
+
 # ── User-defined functions ────────────────────────────────────────────────────
 
 class TestAsyncUserFunctions:

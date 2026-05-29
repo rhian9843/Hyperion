@@ -1,11 +1,12 @@
 """Thread safety tests: concurrent access to a shared Database instance."""
 import threading
 from hyperion import Database
+from hyperion.database import _RWLock
 
 
-def test_database_has_rlock():
+def test_database_has_rwlock():
     db = Database(":memory:")
-    assert isinstance(db._lock, type(threading.RLock()))
+    assert isinstance(db._lock, _RWLock)
 
 
 def test_concurrent_inserts_correct_row_count():
@@ -131,6 +132,43 @@ def test_fetchall_thread_safe():
     expected = list(range(100))
     for tid, rows in results.items():
         assert rows == expected, f"Thread {tid} got wrong rows"
+
+
+def test_concurrent_selects_not_serialised():
+    """Two threads doing fetchall() on the same DB must proceed in parallel.
+
+    With the old RLock, Thread B's execute() blocked until Thread A's
+    fetchall() released the lock.  With the new RWLock, both hold the read
+    lock simultaneously.
+
+    We verify correctness (not timing) by running many concurrent reads and
+    confirming each thread sees all the pre-committed rows.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER)")
+    n = 200
+    for i in range(n):
+        db.execute(f"INSERT INTO t VALUES ({i})")
+
+    results = {}
+    errors = []
+
+    def reader(tid):
+        try:
+            rows = db.execute("SELECT id FROM t ORDER BY id").fetchall()
+            results[tid] = len(rows)
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=reader, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Errors: {errors}"
+    for tid, count in results.items():
+        assert count == n, f"Thread {tid} got {count} rows, expected {n}"
 
 
 def test_ddl_serialised_with_dml():

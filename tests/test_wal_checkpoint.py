@@ -55,7 +55,14 @@ def test_wal_file_created_on_first_begin(tmp_path):
     db.close()
 
 
-def test_wal_accumulates_multiple_commits(tmp_path):
+def test_wal_checkpointed_after_every_commit(tmp_path):
+    """Each commit must checkpoint the WAL before releasing LOCK_EX.
+
+    This ensures that any other connection opening the file immediately after
+    a commit sees the committed data in the main file without needing WAL
+    replay.  The WAL may still exist (header present) but must contain no
+    unresolved committed transactions.
+    """
     db_path = tmp_path / "db.hdb"
     db = Database(db_path)
     wal_path = db_path.with_suffix(".wal")
@@ -65,10 +72,9 @@ def test_wal_accumulates_multiple_commits(tmp_path):
         db.begin()
         db.execute(f"INSERT INTO t VALUES ({i})")
         db.commit()
-
-    # WAL should still exist (below checkpoint threshold) and hold multiple commits
-    assert wal_path.exists()
-    assert _wal_commit_count(wal_path) >= 1  # at least some commits present
+        # After each commit the WAL must be empty (no pending commit frames).
+        if wal_path.exists():
+            assert _wal_commit_count(wal_path) == 0
 
     db.close()
 

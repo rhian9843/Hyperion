@@ -271,34 +271,55 @@ class Cursor:
 
     def execute(self, sql: str, params=None, timeout_ms: int | None = None,
                max_rows: int | None = None) -> "Cursor":
-        with self._db._lock:
-            return self._execute_inner(sql, params, timeout_ms, max_rows)
-
-    def _execute_inner(self, sql: str, params=None,
-                       timeout_ms: int | None = None,
-                       max_rows: int | None = None) -> "Cursor":
+        # Parse and bind BEFORE acquiring any lock.  _plan_cache access is
+        # safe under the GIL: worst case two threads both parse the same SQL,
+        # and the final dict value is the same either way (benign race).
         from .parser import parse
-        from .executor import execute as _exec, _iter_rows_for_stmt, QueryTimeoutError
-        from .introspect import explain_plan
-        from .auth import check_authorizer, SQLITE_IGNORE
-        from .expr import get_last_insert_rowid
 
         cache = self._db._plan_cache
         if sql not in cache:
             cache[sql] = parse(sql)
-            # Simple size cap: evict oldest entries when cache grows large
             if len(cache) > 512:
                 oldest = next(iter(cache))
                 del cache[oldest]
         stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
-        op = stmt.get("op", "")
+        op   = stmt.get("op", "")
+
+        lock = (self._db._lock.read()
+                if op in _SELECT_OPS or op == "EXPLAIN"
+                else self._db._lock.write())
+        with lock:
+            return self._execute_stmt(stmt, op, timeout_ms, max_rows)
+
+    def _execute_inner(self, sql: str, params=None,
+                       timeout_ms: int | None = None,
+                       max_rows: int | None = None) -> "Cursor":
+        """Parse+bind then execute.  Caller must already hold the appropriate lock."""
+        from .parser import parse
+
+        cache = self._db._plan_cache
+        if sql not in cache:
+            cache[sql] = parse(sql)
+            if len(cache) > 512:
+                oldest = next(iter(cache))
+                del cache[oldest]
+        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
+        return self._execute_stmt(stmt, stmt.get("op", ""), timeout_ms, max_rows)
+
+    def _execute_stmt(self, stmt: dict, op: str,
+                      timeout_ms: int | None = None,
+                      max_rows: int | None = None) -> "Cursor":
+        """Execute a pre-parsed, pre-bound statement.  Caller holds the lock."""
+        from .executor import execute as _exec, _iter_rows_for_stmt
+        from .introspect import explain_plan
+        from .auth import check_authorizer, SQLITE_IGNORE
+        from .expr import get_last_insert_rowid
 
         if timeout_ms is not None:
             self._db._query_deadline = time.monotonic() + timeout_ms / 1000.0
         else:
             self._db._query_deadline = None
 
-        # Per-query max_rows overrides connection-level; None means no limit.
         effective_max_rows = max_rows if max_rows is not None else self._db.max_rows
 
         try:
@@ -331,17 +352,29 @@ class Cursor:
         return self
 
     def executemany(self, sql: str, params_seq) -> "Cursor":
-        with self._db._lock:
+        from .parser import parse
+
+        cache = self._db._plan_cache
+        if sql not in cache:
+            cache[sql] = parse(sql)
+            if len(cache) > 512:
+                oldest = next(iter(cache))
+                del cache[oldest]
+        stmt_template = cache[sql]
+        op = stmt_template.get("op", "")
+
+        with self._db._lock.write():
             total = 0
             for params in params_seq:
-                self._execute_inner(sql, params)
+                stmt = _bind_ast_params(stmt_template, params)
+                self._execute_stmt(stmt, op)
                 if self.rowcount >= 0:
                     total += self.rowcount
             self.rowcount = total
             return self
 
     def executescript(self, sql: str) -> "Cursor":
-        with self._db._lock:
+        with self._db._lock.write():
             from .repl import _split_statements
             from .parser import parse
             from .executor import execute as _exec, _rows_for_stmt
@@ -377,7 +410,7 @@ class Cursor:
     # ── Fetch ─────────────────────────────────────────────────────────────────
 
     def fetchone(self) -> Any:
-        with self._db._lock:
+        with self._db._lock.read():
             if self._iter is None:
                 return None
             try:
@@ -387,7 +420,7 @@ class Cursor:
                 return None
 
     def fetchmany(self, size: int = 1) -> list:
-        with self._db._lock:
+        with self._db._lock.read():
             if self._iter is None:
                 return []
             rows: list = []
@@ -400,7 +433,7 @@ class Cursor:
             return rows
 
     def fetchall(self) -> list:
-        with self._db._lock:
+        with self._db._lock.read():
             if self._iter is None:
                 return []
             rows = [self._apply_factory(r) for r in self._iter]

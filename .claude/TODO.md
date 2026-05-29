@@ -201,6 +201,13 @@
 - [x] `executescript` discards SELECT results — when a script contains a SELECT statement the rows are silently dropped; an agent running a multi-statement script that includes a SELECT gets no data back
 - [x] Schema semantic metadata — no mechanism to attach descriptions or semantic tags to tables and columns; the LLM text-to-SQL layer can only infer meaning from names alone; a `_hyperion_schema_meta` system table with `(object_type, object_name, key, value)` rows would let the LLM layer read column descriptions, embedding model names, tenant boundary markers, and other context needed for accurate SQL generation
 
+## Architectural Bottlenecks & Design Issues
+
+- [x] Exclusive locking during Pager initialization — always attempts to acquire `LOCK_EX` for WAL recovery, blocking any concurrent connections from opening the file even for reading. Fails on read-only filesystems because file is opened in `"r+b"` mode. Needs a fix to skip `LOCK_EX` and use read-only file mode if database is opened as `readonly`.
+- [x] Thread-pool hop overhead in Async API — offloads every individual `fetchone()` call to the thread pool executor. For large result sets, this causes massive context-switching and scheduling overhead. Fix by buffering rows in batches (e.g., 100 rows) or returning the full list when fetching, rather than hopping threads on every single row.
+- [x] Page checksum validation loophole — computed CRC-32 checksums of exactly `0` are stored as `0`, which is treated as a legacy page and bypasses verification entirely. Corruption on pages with checksum `0` goes undetected. Fix by mapping computed `0` checksums to a non-zero value (e.g. `1`).
+- [x] Monolithic connection lock blockage — connection uses a single reentrant lock (`threading.RLock`) for all cursor executes and fetches. A long-running query holds the lock for its entire execution, blocking concurrent threads using the same connection from performing lightweight metadata queries or introspection.
+
 ## Vector Database Prerequisites
 
 > **Dependency order** — these items have a strict prerequisite chain and cannot be parallelised:

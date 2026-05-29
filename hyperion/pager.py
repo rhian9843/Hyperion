@@ -7,25 +7,47 @@ from .checksum import stamp_page, verify_page
 from .wal import WAL
 
 try:
+    import errno as _errno
     import fcntl as _fcntl
+
     def _flock(fd: int, how: int) -> None:
         try:
             _fcntl.flock(fd, how)
         except OSError:
             pass  # some filesystems (NFS, tmpfs on some platforms) don't support flock
+
+    def _flock_try_ex(fd: int) -> bool:
+        """Non-blocking LOCK_EX attempt. Returns True if acquired (or unsupported)."""
+        try:
+            _fcntl.flock(fd, 2 | 4)  # LOCK_EX | LOCK_NB
+            return True
+        except OSError as e:
+            if e.errno in (_errno.EAGAIN, _errno.EWOULDBLOCK):
+                return False  # another connection holds a lock — skip WAL replay
+            return True  # filesystem doesn't support flock — proceed as if acquired
+
 except ImportError:
     def _flock(fd: int, how: int) -> None:  # type: ignore[misc]
         pass  # Windows or other platform without fcntl
 
+    def _flock_try_ex(fd: int) -> bool:  # type: ignore[misc]
+        return True
+
 
 class Pager:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, *, readonly: bool = False):
         wal_path = path.with_suffix(".wal")
-        self._file = open(path, "r+b" if path.exists() else "w+b")
-        # Acquire exclusive lock briefly for WAL crash recovery, then downgrade to shared
-        _flock(self._file.fileno(), 2)   # LOCK_EX
-        WAL.replay_if_exists(wal_path, self._file)
-        _flock(self._file.fileno(), 1)   # LOCK_SH — hold while open
+        if readonly:
+            self._file = open(path, "rb")
+            _flock(self._file.fileno(), 1)   # LOCK_SH — read-only, no WAL replay
+        else:
+            self._file = open(path, "r+b" if path.exists() else "w+b")
+            # Try non-blocking LOCK_EX for WAL crash recovery.  If another connection
+            # is already open (holding LOCK_SH) we skip recovery — the live connection
+            # will handle it on its own close/checkpoint.
+            if _flock_try_ex(self._file.fileno()):
+                WAL.replay_if_exists(wal_path, self._file)
+            _flock(self._file.fileno(), 1)   # LOCK_SH — hold while open
         self._path    = path
         self._cache:   dict[int, bytearray] = {}  # committed pages (stable snapshot)
         self._working: dict[int, bytearray] = {}  # in-transaction copy-on-write pages
@@ -96,8 +118,12 @@ class Pager:
         self._working.clear()
         self._dirty.clear()
         self._in_txn = False
-        if self._wal.needs_checkpoint():
-            self._wal.checkpoint(self._file)
+        # Always checkpoint before releasing LOCK_EX so the main file is fully
+        # current when LOCK_EX downgrades to LOCK_SH.  Any connection that
+        # subsequently acquires LOCK_SH will read an up-to-date main file and
+        # can safely skip WAL replay.  (WAL still provides crash durability for
+        # the commit_txn fsync that preceded this.)
+        self._wal.checkpoint(self._file)
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
     def rollback(self) -> None:

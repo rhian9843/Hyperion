@@ -230,6 +230,45 @@ class TestFileLocking(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["val"], "first")
 
+    def test_concurrent_open_does_not_block(self):
+        """Opening a second connection while the first is open must not deadlock.
+
+        Previously Pager.__init__ always acquired LOCK_EX (blocking), so connection B
+        would block indefinitely while connection A held LOCK_SH.  The fix uses
+        LOCK_EX | LOCK_NB and skips WAL replay if another connection is already live.
+        """
+        db1 = Database(self.db_path)
+        sql(db1, "CREATE TABLE t (id INTEGER)")
+        db1.close()
+
+        db_a = Database(self.db_path)
+        # db_b must open without hanging even though db_a holds LOCK_SH
+        db_b = Database(self.db_path)
+        rows_a = list(db_a.select("t", None, None))
+        rows_b = list(db_b.select("t", None, None))
+        db_a.close()
+        db_b.close()
+        self.assertEqual(rows_a, [])
+        self.assertEqual(rows_b, [])
+
+    def test_readonly_opens_read_only_file(self):
+        """Database(path, readonly=True) must open a chmod 444 file without error."""
+        db1 = Database(self.db_path)
+        sql(db1, "CREATE TABLE t (id INTEGER, v TEXT)")
+        sql(db1, "INSERT INTO t VALUES (1, 'hello')")
+        db1.close()
+
+        # Make file read-only at the OS level
+        self.db_path.chmod(0o444)
+        try:
+            db_ro = Database(self.db_path, readonly=True)
+            rows = list(db_ro.select("t", None, None))
+            db_ro.close()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["v"], "hello")
+        finally:
+            self.db_path.chmod(0o644)  # restore so TearDown can delete it
+
 
 if __name__ == "__main__":
     unittest.main()

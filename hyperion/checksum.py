@@ -3,11 +3,19 @@
 Every page reserves its last PAGE_CKSUM_SZ bytes for a CRC-32 of the
 preceding content (bytes 0 .. PAGE_CKSUM_OFF).  A stored value of zero
 means the page pre-dates checksums and is accepted without verification.
+
+To keep the zero-means-legacy convention while still protecting pages
+whose raw CRC-32 evaluates to 0x00000000, stamp_page maps that value to
+the canonical sentinel 0x00000001 before writing.  verify_page applies the
+same remap before comparing, so the round-trip is transparent.
 """
 import struct
 from binascii import crc32 as _crc32
 
 from .constants import PAGE_CKSUM_OFF
+
+# Raw CRC-32 of 0x00000000 would be misread as "no checksum"; remap it to 1.
+_CRC_ZERO_SENTINEL = 0x0000_0001
 
 
 class CorruptPageError(RuntimeError):
@@ -22,8 +30,9 @@ class CorruptPageError(RuntimeError):
 
 
 def page_checksum(data: bytes | bytearray) -> int:
-    """CRC-32 of page content (bytes 0 .. PAGE_CKSUM_OFF)."""
-    return _crc32(data[:PAGE_CKSUM_OFF]) & 0xFFFF_FFFF
+    """CRC-32 of page content (bytes 0 .. PAGE_CKSUM_OFF), never returns 0."""
+    raw = _crc32(data[:PAGE_CKSUM_OFF]) & 0xFFFF_FFFF
+    return _CRC_ZERO_SENTINEL if raw == 0 else raw
 
 
 def stamp_page(page: bytearray) -> None:
