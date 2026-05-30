@@ -10,10 +10,15 @@ from .errors import DataError
 from .json_funcs import eval_json_func as _eval_json_func
 
 # ── Application-defined function registries ────────────────────────────────────
-# Populated by Database.create_function / create_aggregate.
-# Keys are always upper-cased function names.
-_USER_FUNCS: dict[str, tuple[int, Any]] = {}   # name → (n_args, callable)
-_USER_AGGS:  dict[str, tuple[int, Any]] = {}   # name → (n_args, aggregate_class)
+# Stored per-connection on Database._user_funcs / _user_aggs (instance dicts).
+# Before each statement execution, cursor.py copies the active connection's
+# dicts into thread-local storage so eval_expr and query.py read the right
+# registry without needing a db parameter at every call site.
+def _get_user_funcs() -> dict:
+    return getattr(_tls, "user_funcs", {})
+
+def _get_user_aggs() -> dict:
+    return getattr(_tls, "user_aggs", {})
 
 # ── Last insert rowid tracking ─────────────────────────────────────────────────
 # Thread-local so concurrent inserts on different threads don't clobber each
@@ -394,8 +399,9 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
     # ── Application-defined scalar functions ───────────────────────────────────
 
     upper = fname.upper()
-    if upper in _USER_FUNCS:
-        n_expected, fn = _USER_FUNCS[upper]
+    user_funcs = _get_user_funcs()
+    if upper in user_funcs:
+        n_expected, fn = user_funcs[upper]
         if n_expected >= 0 and len(args) != n_expected:
             raise DataError(
                 f"wrong number of arguments to function {fname}(): "

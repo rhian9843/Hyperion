@@ -676,6 +676,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     This is the single authoritative SELECT execution path.  _execute_inner
     delegates all SELECT/JOIN/SET_OP ops here and just formats the result.
     """
+    from .expr import _tls
+    _tls.user_funcs = db._user_funcs
+    _tls.user_aggs  = db._user_aggs
     _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     op = stmt["op"]
@@ -992,6 +995,10 @@ _ANALYZE_NULL_SENTINEL = object()
 
 def execute(stmt: dict, db: Database) -> str:
     op = stmt["op"]
+
+    from .expr import _tls
+    _tls.user_funcs = db._user_funcs
+    _tls.user_aggs  = db._user_aggs
 
     # Authorizer check (DML/DDL ops; SELECT ops are checked in Cursor.execute)
     if db._authorizer is not None:

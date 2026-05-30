@@ -11,7 +11,7 @@ from .encoding import (
     _encode_index_key, _encode_composite_key,
     _make_index_key, _apply_order_limit,
 )
-from .expr import eval_expr, is_expr, _USER_AGGS
+from .expr import eval_expr, is_expr, _get_user_aggs
 from .optimizer import find_eq_index, probe_index as _probe_index
 
 
@@ -33,7 +33,7 @@ def _parse_agg(col: str) -> tuple[str, str, bool] | None:
         return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
     # Check application-defined aggregates
     m2 = _USER_AGG_CALL_RE.match(col)
-    if m2 and m2.group(1).upper() in _USER_AGGS:
+    if m2 and m2.group(1).upper() in _get_user_aggs():
         return (m2.group(1).upper(), m2.group(3).strip(), bool(m2.group(2)))
     return None
 
@@ -199,8 +199,8 @@ class QueryMixin:
                 if distinct:
                     str_vals = list(dict.fromkeys(str_vals))
                 result[col] = sep.join(str_vals) if str_vals else None
-            elif func in _USER_AGGS:
-                _, agg_class = _USER_AGGS[func]
+            elif func in _get_user_aggs():
+                _, agg_class = _get_user_aggs()[func]
                 agg_obj = agg_class()
                 for r in bucket_rows:
                     v = eval_expr(arg, r) if is_expr(arg) else r.get(arg)

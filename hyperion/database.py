@@ -139,6 +139,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # reentrant for the same thread so nested calls (e.g. executescript →
         # commit, close → begin/drop/commit) don't deadlock.
         self._lock = _RWLock()
+        self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
+        self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
 
     # ── Read-only toggle ──────────────────────────────────────────────────────
 
@@ -246,8 +248,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             fn:     Callable invoked with evaluated SQL arguments.
         """
         with self._lock.write():
-            from .expr import _USER_FUNCS
-            _USER_FUNCS[name.upper()] = (n_args, fn)
+            self._user_funcs[name.upper()] = (n_args, fn)
 
     def create_aggregate(self, name: str, n_args: int, aggregate_class) -> None:
         """Register a custom aggregate function callable from SQL GROUP BY.
@@ -263,8 +264,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             aggregate_class: Class implementing the aggregate protocol.
         """
         with self._lock.write():
-            from .expr import _USER_AGGS
-            _USER_AGGS[name.upper()] = (n_args, aggregate_class)
+            self._user_aggs[name.upper()] = (n_args, aggregate_class)
 
     # ── Schema semantic metadata ──────────────────────────────────────────────
 
