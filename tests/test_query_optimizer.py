@@ -34,15 +34,25 @@ class TestEstimateRows(unittest.TestCase):
             sql(self.db, f"INSERT INTO t VALUES ({i})")
         self.assertEqual(estimate_rows(self.db, "t"), 10)
 
-    def test_result_is_cached(self):
+    def test_result_is_cached_between_writes(self):
+        """Cache is warm between writes; calling estimate_rows twice without a write returns same value."""
         sql(self.db, "CREATE TABLE t (id INTEGER)")
         for i in range(5):
             sql(self.db, f"INSERT INTO t VALUES ({i})")
         first  = estimate_rows(self.db, "t")
-        # Insert another row — cached value should NOT change within session
-        sql(self.db, "INSERT INTO t VALUES (99)")
-        second = estimate_rows(self.db, "t")
+        second = estimate_rows(self.db, "t")  # no write between — must hit cache
         self.assertEqual(first, second)
+
+    def test_cache_invalidated_after_insert(self):
+        """INSERT evicts the cache entry so estimate_rows re-derives the count."""
+        sql(self.db, "CREATE TABLE t (id INTEGER)")
+        for i in range(5):
+            sql(self.db, f"INSERT INTO t VALUES ({i})")
+        before = estimate_rows(self.db, "t")
+        sql(self.db, "INSERT INTO t VALUES (99)")
+        after = estimate_rows(self.db, "t")
+        self.assertEqual(before, 5)
+        self.assertEqual(after, 6)  # re-derived after cache eviction
 
 
 # ── find_eq_index ─────────────────────────────────────────────────────────────

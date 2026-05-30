@@ -45,7 +45,8 @@ from .introspect import (hyperion_master_rows as _hyperion_master_rows,
                          hyperion_schema_meta_rows as _hyperion_schema_meta_rows,
                          integrity_check as _integrity_check,
                          explain_plan as _explain_plan)
-from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
+from .optimizer import (find_eq_index as _find_eq_index, probe_index as _probe_index,
+                        optimize_join, invalidate_row_count as _invalidate_rc)
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
 from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
@@ -1218,6 +1219,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         for row in rows:
             db.insert(stmt["name"], row)
         n = len(rows)
+        _invalidate_rc(db, stmt["name"])
         return f"Table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
 
     if op == "CREATE_TABLE":
@@ -1252,6 +1254,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         if stmt.get("if_exists") and stmt["name"] not in db.tables:
             return f"Table '{stmt['name']}' does not exist."
         db.drop_table(stmt["name"])
+        _invalidate_rc(db, stmt["name"])
         return f"Table '{stmt['name']}' dropped."
 
     if op == "CREATE_VIEW":
@@ -1391,6 +1394,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 if returning_cols:
                     returned_rows.append(row_out)
         n = len(stmt["rows"])
+        _invalidate_rc(db, stmt["table"])
         if returning_cols:
             projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
             return _format_rows(projected, returning_cols)
@@ -1426,6 +1430,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             if _has_ins_trig2:
                 fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
         n = len(src_rows)
+        _invalidate_rc(db, stmt["table"])
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
     if op in ("SELECT", "SELECT_NOFROM", "JOIN", "SET_OP"):
@@ -1436,6 +1441,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
     if op == "TRUNCATE":
         rows = db.delete(stmt["table"], None)
         n = len(rows)
+        _invalidate_rc(db, stmt["table"])
         return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
 
     if op == "UPDATE":
@@ -1461,6 +1467,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         else:
             rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
         n = len(rows)
+        _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
             return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
@@ -1485,6 +1492,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         else:
             rows = db.delete(tname, stmt["where"], stmt.get("limit"))
         n = len(rows)
+        _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
             return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
