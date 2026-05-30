@@ -249,4 +249,4 @@
 ## Known Limitations
 
 - [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
-- [ ] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
+- [x] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table

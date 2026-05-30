@@ -27,7 +27,7 @@ _WRITE_OPS = frozenset({
     "CREATE_VIEW", "DROP_VIEW",
     "CREATE_TRIGGER", "DROP_TRIGGER",
     "ALTER_ADD_COLUMN", "ALTER_DROP_COLUMN",
-    "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE",
+    "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE", "ALTER_ALTER_COLUMN",
     "ANALYZE", "VACUUM",
 })
 
@@ -1282,6 +1282,12 @@ def _execute_inner(stmt: dict, db: Database) -> str:
     if op == "ALTER_RENAME_TABLE":
         db.alter_rename_table(stmt["table"], stmt["new_name"])
         return f"Table '{stmt['table']}' renamed to '{stmt['new_name']}'."
+
+    if op == "ALTER_ALTER_COLUMN":
+        db.alter_column_type(stmt["table"], stmt["col_name"],
+                             stmt["new_type"], stmt["new_size"])
+        return (f"Column '{stmt['col_name']}' in '{stmt['table']}' "
+                f"type changed to {stmt['new_type']}.")
 
     if op == "CREATE_INDEX":
         if stmt.get("if_not_exists") and stmt["idx_name"] in db.indexes:

@@ -985,6 +985,15 @@ def _parse_alter(t: list[str]) -> dict:
         if len(t) < 6 or t[4].upper() != "COLUMN":
             raise ParseError("Expected: DROP COLUMN <name>")
         return {"op": "ALTER_DROP_COLUMN", "table": table, "col_name": t[5]}
+    if sub == "ALTER":
+        if len(t) < 7 or t[4].upper() != "COLUMN":
+            raise ParseError("Expected: ALTER COLUMN <name> TYPE <type>")
+        col_name = t[5]
+        if len(t) < 8 or t[6].upper() != "TYPE":
+            raise ParseError("Expected TYPE after column name")
+        new_type, new_size = _parse_col_type(t[7])
+        return {"op": "ALTER_ALTER_COLUMN", "table": table,
+                "col_name": col_name, "new_type": new_type, "new_size": new_size}
     raise ParseError(f"Unknown ALTER TABLE operation: '{t[3]}'")
 
 
