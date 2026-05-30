@@ -824,6 +824,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             tmp_path = Path(f.name)
         tmp_path.unlink(missing_ok=True)
 
+        import copy
         new_db = Database(tmp_path)
         new_db.begin()
         for tname, tmeta in list(self._catalog.tables.items()):
@@ -836,6 +837,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 new_db.create_index(idx_name, idx_meta.table_name, idx_meta.columns)
         for vname, vsql in list(self._catalog.views.items()):
             new_db.create_view(vname, vsql)
+        for trig_name, trig_meta in list(self._catalog.triggers.items()):
+            new_db.create_trigger(trig_name, trig_meta)
+        new_db._catalog.stats = copy.deepcopy(self._catalog.stats)
+        new_db._catalog.meta  = copy.deepcopy(self._catalog.meta)
         new_db.commit()
         new_db._pager.close()
 
