@@ -12,14 +12,46 @@ from .encoding import _encode_composite_key, _make_index_key
 class ConstraintsMixin:
     """Constraint-checking methods mixed into Database."""
 
+    def _unique_index_conflict(self, meta, col_names: list[str],
+                               vals: list, col_types: list[str],
+                               exclude_rowid: int | None) -> bool | None:
+        """Probe an index for a UNIQUE conflict.
+
+        Returns True (conflict exists), False (no conflict), or None (no
+        usable index — caller must fall back to a full table scan).
+        """
+        idx_meta = None
+        for m in self._catalog.indexes.values():
+            if m.table_name == meta.schema.name and m.columns == col_names:
+                idx_meta = m
+                break
+        if idx_meta is None:
+            return None
+        try:
+            val_key = _encode_composite_key(vals, col_types)
+        except (ValueError, TypeError):
+            return None
+        lo = _make_index_key(val_key, 0)
+        hi = _make_index_key(val_key, 0xFFFFFFFFFFFFFFFF)
+        for _, rowid_raw in self._index_btree(idx_meta).scan_range(lo, hi):
+            rowid = struct.unpack("q", rowid_raw)[0]
+            if rowid != exclude_rowid:
+                return True
+        return False
+
     def _check_unique(self, meta, row: dict[str, Any],
                       exclude_rowid: int | None = None) -> None:
-        """Raise if any UNIQUE column or multi-column unique constraint is violated."""
+        """Raise if any UNIQUE column or multi-column unique constraint is violated.
+
+        Uses an index probe when a matching index exists; falls back to a full
+        table scan only for constraints that have no backing index.
+        """
         schema      = meta.schema
         unique_cols = [c for c in schema.columns if c.unique]
         mc_unique   = schema.unique_constraints  # list[list[str]]
         if not unique_cols and not mc_unique:
             return
+
         # Coerce single-column UNIQUE values to their storage types for comparison
         typed: dict[str, Any] = {}
         for col in unique_cols:
@@ -32,37 +64,67 @@ class ConstraintsMixin:
                 typed[col.name] = float(v)
             else:
                 typed[col.name] = str(v)
+
+        # Try index probe for each single-column UNIQUE; collect those needing scan
+        scan_single: list = []  # Column objects without a usable index
+        for col in unique_cols:
+            v = typed[col.name]
+            if v is None:
+                continue
+            result = self._unique_index_conflict(
+                meta, [col.name], [v], [col.type], exclude_rowid)
+            if result is True:
+                raise UniqueConstraintError(
+                    f"UNIQUE constraint failed: {schema.name}.{col.name}")
+            elif result is None:
+                scan_single.append(col)
+
+        # Try index probe for each multi-column UNIQUE; collect those needing scan
+        scan_mc: list = []  # (uc_cols, new_vals) tuples without a usable index
+        for uc_cols in mc_unique:
+            new_vals = []
+            col_types = []
+            for c in uc_cols:
+                v = row.get(c)
+                col_obj = next((col for col in schema.columns if col.name == c), None)
+                if v is not None and col_obj:
+                    if col_obj.type == INTEGER:
+                        try: v = int(v)
+                        except (ValueError, TypeError): pass
+                    elif col_obj.type == REAL:
+                        try: v = float(v)
+                        except (ValueError, TypeError): pass
+                new_vals.append(v)
+                col_types.append(col_obj.type if col_obj else "TEXT")
+            if any(v is None for v in new_vals):
+                continue  # NULL exempts from multi-col unique
+            result = self._unique_index_conflict(
+                meta, list(uc_cols), new_vals, col_types, exclude_rowid)
+            if result is True:
+                raise UniqueConstraintError(
+                    f"UNIQUE constraint failed: "
+                    f"{schema.name}({', '.join(uc_cols)})")
+            elif result is None:
+                scan_mc.append((uc_cols, new_vals))
+
+        # Full scan only for constraints that had no backing index
+        if not scan_single and not scan_mc:
+            return
         for rowid, raw in self._table_btree(meta).scan():
             if rowid == exclude_rowid:
                 continue
             existing = deserialize_row(schema, self._unpack_row_cell(raw))
-            for col in unique_cols:
+            for col in scan_single:
                 v = typed[col.name]
                 if v is not None and existing.get(col.name) == v:
                     raise UniqueConstraintError(
-                        f"UNIQUE constraint failed: {schema.name}.{col.name}"
-                    )
-            for uc_cols in mc_unique:
-                new_vals = []
-                for c in uc_cols:
-                    v = row.get(c)
-                    col_obj = next((col for col in schema.columns if col.name == c), None)
-                    if v is not None and col_obj:
-                        if col_obj.type == INTEGER:
-                            try: v = int(v)
-                            except (ValueError, TypeError): pass
-                        elif col_obj.type == REAL:
-                            try: v = float(v)
-                            except (ValueError, TypeError): pass
-                    new_vals.append(v)
-                if any(v is None for v in new_vals):
-                    continue  # NULL exempts from multi-col unique
+                        f"UNIQUE constraint failed: {schema.name}.{col.name}")
+            for uc_cols, new_vals in scan_mc:
                 ex_vals = [existing.get(c) for c in uc_cols]
                 if new_vals == ex_vals:
                     raise UniqueConstraintError(
                         f"UNIQUE constraint failed: "
-                        f"{schema.name}({', '.join(uc_cols)})"
-                    )
+                        f"{schema.name}({', '.join(uc_cols)})")
 
     def _check_constraints(self, schema: Schema, row: dict[str, Any]) -> None:
         """Raise if any column CHECK expression evaluates to False for the given row."""
