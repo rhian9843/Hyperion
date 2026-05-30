@@ -669,16 +669,14 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def _make_alloc(self, meta: TableMeta) -> Callable[[], int]:
         def alloc() -> int:
-            pn = self._catalog.next_free_page
-            self._catalog.next_free_page += 1
+            pn = self._alloc_page()
             meta.next_page = pn + 1
             return pn
         return alloc
 
     def _make_idx_alloc(self, idx: IndexMeta) -> Callable[[], int]:
         def alloc() -> int:
-            pn = self._catalog.next_free_page
-            self._catalog.next_free_page += 1
+            pn = self._alloc_page()
             idx.next_page = pn + 1
             return pn
         return alloc
