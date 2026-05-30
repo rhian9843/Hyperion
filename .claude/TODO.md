@@ -224,11 +224,16 @@
 - [x] Optimizer row-count cache never invalidated by DML or DDL — `optimizer.py:31–44`; the `_opt_row_counts` dict is only populated on first access or ANALYZE; INSERTs, DELETEs, and DROP+recreate with the same table name never update it; after a significant data load the optimizer still uses the stale row count, producing wrong join order decisions; fix by invalidating the entry for a table after any write to it
 - [x] Composite index keys use FNV-1a hashing — range queries silently degrade — `encoding.py:39–51`; multi-column indexes encode all column values into a single int64 via FNV-1a; hash values do not preserve sort order across column combinations, so range predicates and ORDER BY on composite indexes silently fall back to a full table scan with no warning; an agent generating `WHERE tenant_id = ? AND created_at > ?` on a `(tenant_id, created_at)` index gets no index benefit for the range component; fix requires prefix-encoded composite keys that preserve per-column sort order
 
-## Vector Database Prerequisites
+## Known Limitations
 
-> **Dependency order** — these items have a strict prerequisite chain and cannot be parallelised:
-> `Variable-length row storage` → `VECTOR(n) type` → `ANN index (HNSW)` → `Hybrid search planner`
-> Similarly on the agent side: `Thread safety` → `MVCC` → `Async API` (async safety depends on both).
+- [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
+- [x] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
+- [x] `PRAGMA` / `RETURNING` / `EXPLAIN` results not fetchable — `execute()` returned a formatted string; `cursor.fetchall()` on PRAGMA/RETURNING/EXPLAIN returned `[]`; fixed by introducing `RowResult` so all data-producing ops are fetchable via the cursor
+
+## Phase 2
+
+> **Dependency order** — strict prerequisite chain:
+> `VECTOR(n) type` → `Bulk vector insert` → `ANN index (HNSW)` → `Vector similarity operators` → `Hybrid search planner`
 
 ### Storage
 
@@ -246,9 +251,3 @@
 - [ ] Inverted index (FTS) — an in-engine inverted index mapping terms to `(rowid, frequency)` posting lists; required for keyword search over text columns; the B-tree index only supports equality and range on raw values, not tokenised term lookup; storage must be efficient for large vocabularies across millions of documents
 - [ ] BM25 / TF-IDF scoring — once an inverted index exists, a `bm25(col, query)` scoring function and `MATCH` operator so queries like `SELECT * FROM docs WHERE body MATCH 'neural network' ORDER BY bm25(body, 'neural network') DESC` work; BM25 is the standard baseline for keyword retrieval in production RAG systems
 - [ ] Hybrid retrieval query — combine FTS BM25 score and vector similarity score in a single query with configurable weighting (`alpha * bm25_score + (1-alpha) * cosine_score`); this is the core retrieval primitive for production RAG and requires the planner to understand both index types simultaneously
-
-## Known Limitations
-
-- [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
-- [x] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
-- [x] `PRAGMA` / `RETURNING` / `EXPLAIN` results not fetchable — `execute()` returned a formatted string; `cursor.fetchall()` on PRAGMA/RETURNING/EXPLAIN returned `[]`; fixed by introducing `RowResult` so all data-producing ops are fetchable via the cursor
