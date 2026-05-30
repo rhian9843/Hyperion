@@ -245,3 +245,8 @@
 - [ ] Inverted index (FTS) — an in-engine inverted index mapping terms to `(rowid, frequency)` posting lists; required for keyword search over text columns; the B-tree index only supports equality and range on raw values, not tokenised term lookup; storage must be efficient for large vocabularies across millions of documents
 - [ ] BM25 / TF-IDF scoring — once an inverted index exists, a `bm25(col, query)` scoring function and `MATCH` operator so queries like `SELECT * FROM docs WHERE body MATCH 'neural network' ORDER BY bm25(body, 'neural network') DESC` work; BM25 is the standard baseline for keyword retrieval in production RAG systems
 - [ ] Hybrid retrieval query — combine FTS BM25 score and vector similarity score in a single query with configurable weighting (`alpha * bm25_score + (1-alpha) * cosine_score`); this is the core retrieval primitive for production RAG and requires the planner to understand both index types simultaneously
+
+## Known Limitations
+
+- [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
+- [ ] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
