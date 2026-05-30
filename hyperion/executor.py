@@ -5,11 +5,8 @@ from collections import defaultdict
 from typing import Any
 
 from .errors import (HyperionError, NoSuchTableError, NoSuchIndexError, SchemaError,
-                     ParseError, InternalError, DataError, ConstraintError)
-
-
-class QueryTimeoutError(RuntimeError):
-    """Raised when a query exceeds its allotted execution time."""
+                     ParseError, InternalError, DataError, ConstraintError,
+                     QueryTimeoutError, ReadOnlyError, TooManyRowsError)
 
 
 class RowResult:
@@ -1408,7 +1405,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
         for values in stmt["rows"]:
             if len(col_names) != len(values):
-                raise RuntimeError(
+                raise DataError(
                     f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
                 )
             parsed: dict[str, Any] = {}

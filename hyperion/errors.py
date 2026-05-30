@@ -92,3 +92,40 @@ class AuthorizationError(HyperionError):
 class InternalError(HyperionError):
     """An unexpected internal engine error. Should not reach users in normal
     operation — if raised, it indicates a bug in Hyperion."""
+
+
+# ── Storage integrity ─────────────────────────────────────────────────────────
+
+class CorruptPageError(HyperionError):
+    """A page's stored CRC does not match its computed CRC."""
+    def __init__(self, page_num: int, stored: int, computed: int) -> None:
+        super().__init__(
+            f"page {page_num}: checksum mismatch "
+            f"(stored 0x{stored:08x}, computed 0x{computed:08x})")
+        self.page_num = page_num
+        self.stored   = stored
+        self.computed = computed
+
+
+# ── Execution limits ──────────────────────────────────────────────────────────
+
+class QueryTimeoutError(HyperionError):
+    """A query exceeded its allotted execution time."""
+
+
+class ReadOnlyError(HyperionError):
+    """A write operation was attempted on a read-only Database."""
+
+
+class TooManyRowsError(HyperionError):
+    """A query result exceeded the configured max_rows limit."""
+
+
+# ── Client / server ───────────────────────────────────────────────────────────
+
+class ServerConnectionError(HyperionError, ConnectionError):
+    """The client lost its connection to the Hyperion server.
+
+    Inherits Python's built-in ConnectionError so callers that catch
+    OSError / ConnectionError at the network layer still see it.
+    """

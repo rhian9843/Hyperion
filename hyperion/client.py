@@ -26,6 +26,8 @@ import socket
 import struct
 from typing import Any
 
+from .errors import ServerConnectionError
+
 _HDR = struct.Struct("!I")
 
 
@@ -69,7 +71,7 @@ def _decode_blobs(obj):
 def _recv(sock: socket.socket) -> dict:
     hdr = _recv_exactly(sock, _HDR.size)
     if hdr is None:
-        raise ConnectionError("Server closed the connection")
+        raise ServerConnectionError("Server closed the connection")
     (length,) = _HDR.unpack(hdr)
     body = _recv_exactly(sock, length)
     if body is None:
