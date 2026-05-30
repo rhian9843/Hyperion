@@ -116,7 +116,7 @@ try:
     check("parse() op is SELECT", ast["op"] == "SELECT")
 
     result = hyperion.execute(ast, db)
-    check("execute() returns string", isinstance(result, str))
+    check("execute() returns RowResult for SELECT", isinstance(result, hyperion.RowResult))
     check("execute() output contains Bob", "Bob" in result)
 
     db.close()

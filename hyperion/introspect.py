@@ -142,7 +142,7 @@ def integrity_check(db: "Database") -> list[str]:
     Returns ['ok'] or a list of error strings.
     """
     from .checksum import verify_page, CorruptPageError
-    from .encoding import _IDX_KEY_SZ
+    from .encoding import _idx_key_sz
     from .catalog import Catalog
 
     errors: list[str] = []
@@ -195,7 +195,8 @@ def integrity_check(db: "Database") -> list[str]:
     for tmeta in db._catalog.tables.values():
         known.update(db._collect_tree_pages(tmeta.root_page))
     for imeta in db._catalog.indexes.values():
-        known.update(db._collect_tree_pages(imeta.root_page, key_sz=_IDX_KEY_SZ))
+        known.update(db._collect_tree_pages(imeta.root_page,
+                                            key_sz=_idx_key_sz(len(imeta.columns))))
     free = set(db._catalog.free_pages)
 
     for pn in sorted(known - free):

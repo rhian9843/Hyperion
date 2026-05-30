@@ -9,9 +9,9 @@ from .schema import deserialize_row
 from .constants import TEXT
 from .encoding import (
     _encode_index_key, _encode_composite_key,
-    _make_index_key, _apply_order_limit,
+    _make_index_key, _apply_order_limit, _composite_prefix_bounds,
 )
-from .expr import eval_expr, is_expr, _USER_AGGS
+from .expr import eval_expr, is_expr, _get_user_aggs
 from .optimizer import find_eq_index, probe_index as _probe_index
 
 
@@ -33,7 +33,7 @@ def _parse_agg(col: str) -> tuple[str, str, bool] | None:
         return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
     # Check application-defined aggregates
     m2 = _USER_AGG_CALL_RE.match(col)
-    if m2 and m2.group(1).upper() in _USER_AGGS:
+    if m2 and m2.group(1).upper() in _get_user_aggs():
         return (m2.group(1).upper(), m2.group(3).strip(), bool(m2.group(2)))
     return None
 
@@ -130,6 +130,12 @@ class QueryMixin:
                     idx_results = self._index_range_select(
                         meta, idx, range_cond, where, columns, max_rows=max_rows,
                         reverse=order_is_desc)
+                else:
+                    # Prefix equality + range on a composite index
+                    idx, eq_dict, range_cond = self._find_index_for_prefix_range(table, where)
+                    if idx:
+                        idx_results = self._index_prefix_range_select(
+                            meta, idx, eq_dict, range_cond, where, columns)
             if idx_results is not None:
                 if distinct:
                     seen_idx: set[tuple] = set()
@@ -199,8 +205,8 @@ class QueryMixin:
                 if distinct:
                     str_vals = list(dict.fromkeys(str_vals))
                 result[col] = sep.join(str_vals) if str_vals else None
-            elif func in _USER_AGGS:
-                _, agg_class = _USER_AGGS[func]
+            elif func in _get_user_aggs():
+                _, agg_class = _get_user_aggs()[func]
                 agg_obj = agg_class()
                 for r in bucket_rows:
                     v = eval_expr(arg, r) if is_expr(arg) else r.get(arg)
@@ -529,6 +535,95 @@ class QueryMixin:
         results: list[dict] = []
         scan_fn = itree.scan_range_reverse if reverse else itree.scan_range
         for _, rowid_raw in scan_fn(lo, hi):
+            rowid = struct.unpack("q", rowid_raw)[0]
+            raw   = ptree.lookup(rowid)
+            if raw is None:
+                continue
+            row = deserialize_row(schema, self._unpack_row_cell(raw))
+            if where and not where.evaluate(row, self):
+                continue
+            results.append(_project_row(row, columns) if columns else row)
+            if max_rows is not None and len(results) >= max_rows:
+                break
+        return results
+
+    def _find_index_for_prefix_range(self, table: str,
+                                     where: "WhereClause | None") -> tuple:
+        """Return (IndexMeta, eq_dict, range_cond) for prefix-equality + range on a composite index.
+
+        Matches WHERE clauses of the form:
+            col_0 = V_0 [AND col_1 = V_1 ...] AND col_N op range_val
+
+        where col_0 … col_N-1 are the leading columns of a multi-column index
+        with equality conditions and col_N is the next index column with a range op.
+        Returns (None, {}, None) when no suitable index is found.
+        """
+        if not where or where.or_clause is not None:
+            return None, {}, None
+        eq: dict[str, str] = {}
+        range_cond = None
+        cond = where
+        while cond is not None:
+            if cond.or_clause is not None:
+                return None, {}, None
+            if cond.op == "=" and range_cond is None:
+                eq[cond.col] = cond.val
+            elif cond.op in self._RANGE_OPS and range_cond is None and cond.op != "BETWEEN":
+                range_cond = cond
+            else:
+                return None, {}, None
+            cond = cond.and_clause
+        if range_cond is None or not eq:
+            return None, {}, None
+        for m in self._catalog.indexes.values():
+            if m.table_name != table or len(m.columns) < len(eq) + 1:
+                continue
+            prefix = m.columns[:len(eq)]
+            if set(prefix) != set(eq.keys()):
+                continue
+            if m.columns[len(eq)] == range_cond.col:
+                return m, eq, range_cond
+        return None, {}, None
+
+    def _index_prefix_range_select(self, meta, idx_meta, eq_dict: dict,
+                                   range_cond, where: "WhereClause | None",
+                                   columns: list[str] | None,
+                                   max_rows: int | None = None) -> list[dict[str, Any]]:
+        """Scan a composite index for prefix-equality + range rows.
+
+        Uses _composite_prefix_bounds to compute conservative scan bounds,
+        then post-filters every returned row with the full WHERE predicate.
+        """
+        schema = meta.schema
+
+        prefix_cols = idx_meta.columns[:len(eq_dict)]
+        range_col   = idx_meta.columns[len(eq_dict)]
+        n_total     = len(idx_meta.columns)
+
+        def _col_type(name):
+            col_obj = next((c for c in schema.columns if c.name == name), None)
+            return col_obj.type if col_obj else TEXT
+
+        eq_types    = [_col_type(c) for c in prefix_cols]
+        range_type  = _col_type(range_col)
+        # Values for prefix columns in index-column order
+        eq_vals     = [eq_dict[c] for c in prefix_cols]
+
+        try:
+            lo_key, hi_key = _composite_prefix_bounds(
+                eq_vals, eq_types, range_cond.val, range_type,
+                range_cond.op, n_total,
+            )
+        except (ValueError, TypeError):
+            return []
+
+        lo = _make_index_key(lo_key, 0)
+        hi = _make_index_key(hi_key, 0xFFFFFFFFFFFFFFFF)
+
+        itree   = self._index_btree(idx_meta)
+        ptree   = self._table_btree(meta)
+        results: list[dict] = []
+        for _, rowid_raw in itree.scan_range(lo, hi):
             rowid = struct.unpack("q", rowid_raw)[0]
             raw   = ptree.lookup(rowid)
             if raw is None:

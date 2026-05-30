@@ -90,7 +90,7 @@ System catalog
 """
 
 from .constants import PAGE_SIZE, PAGE_CKSUM_SZ, PAGE_CKSUM_OFF, INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
-from .checksum import CorruptPageError, page_checksum, stamp_page, verify_page
+from .checksum import page_checksum, stamp_page, verify_page
 from .schema import Column, ForeignKey, Schema, serialize_row, deserialize_row
 from .btree import BTree
 from .catalog import TableMeta, IndexMeta, TriggerMeta, Catalog
@@ -137,9 +137,14 @@ from .errors import (
     ConstraintError, UniqueConstraintError, NotNullConstraintError,
     CheckConstraintError, ForeignKeyConstraintError,
     DataError, TransactionError, AuthorizationError, InternalError,
+    CorruptPageError,
+    QueryTimeoutError, ReadOnlyError, TooManyRowsError,
+    ServerConnectionError,
 )
-from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError
+from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError, RowResult
 from .async_db import AsyncDatabase, AsyncCursor
+from .server import Server
+from .client import connect
 from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)

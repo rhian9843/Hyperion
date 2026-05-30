@@ -44,6 +44,17 @@ def estimate_rows(db, table: str) -> int:
     return db._opt_row_counts[table]
 
 
+def invalidate_row_count(db, table: str) -> None:
+    """Drop the session row-count cache entry for table.
+
+    Called after any DML that changes a table's row count so the next
+    query against that table re-derives its estimate rather than using a
+    stale value from before the write.
+    """
+    if hasattr(db, "_opt_row_counts"):
+        db._opt_row_counts.pop(table, None)
+
+
 # ── NDV (number of distinct values) ──────────────────────────────────────────
 
 def get_ndv(db, table: str, col: str) -> int | None:

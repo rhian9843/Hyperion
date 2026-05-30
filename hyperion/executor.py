@@ -5,11 +5,75 @@ from collections import defaultdict
 from typing import Any
 
 from .errors import (HyperionError, NoSuchTableError, NoSuchIndexError, SchemaError,
-                     ParseError, InternalError, DataError, ConstraintError)
+                     ParseError, InternalError, DataError, ConstraintError,
+                     QueryTimeoutError, ReadOnlyError, TooManyRowsError)
 
 
-class QueryTimeoutError(RuntimeError):
-    """Raised when a query exceeds its allotted execution time."""
+class RowResult:
+    """Return type for executor ops that produce rows (PRAGMA, RETURNING, SELECT).
+
+    Carries structured data so callers can choose between fetchable rows (cursor)
+    and formatted display (REPL).  ``rowcount`` is -1 for read-only ops; for DML
+    with RETURNING it is the number of rows affected.
+    """
+    __slots__ = ("rows", "columns", "rowcount")
+
+    def __init__(self, rows: list, columns: list, rowcount: int = -1) -> None:
+        self.rows     = rows
+        self.columns  = columns
+        self.rowcount = rowcount
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    _ROW_COUNT_RE = __import__("re").compile(r"^\((\d+) rows?\)$")
+
+    def __contains__(self, item) -> bool:
+        """Support `value in result` — checks exact match, string repr, and column names.
+
+        Preserves backward compatibility with code that did ``"Alice" in execute(stmt, db)``
+        when execute() used to return a formatted string.
+        """
+        item_str = str(item)
+        # "(2 rows)" / "(1 row)" — row-count check
+        m = self._ROW_COUNT_RE.match(item_str)
+        if m and int(m.group(1)) == len(self.rows):
+            return True
+        # Column names (e.g. "id" in EXPLAIN result)
+        if item_str in self.columns:
+            return True
+        for row in self.rows:
+            for v in row.values():
+                if v == item:
+                    return True
+                if item_str == str(v):
+                    return True
+                # "75000" matches 75000.0
+                if isinstance(v, float) and v == int(v) and item_str == str(int(v)):
+                    return True
+                # substring match in string values (e.g. "SEARCH TABLE t" in EXPLAIN detail)
+                if isinstance(v, str) and item_str in v:
+                    return True
+        return False
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, RowResult):
+            return self.rows == other.rows and self.columns == other.columns
+        if other == "(no rows)" and len(self.rows) == 0:
+            return True
+        return NotImplemented
+
+    def __hash__(self):
+        return id(self)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __bool__(self) -> bool:
+        return True  # non-empty result set or empty — both truthy as a result object
+
+    def __repr__(self) -> str:
+        return f"RowResult(columns={self.columns!r}, rows={len(self.rows)})"
 
 
 class ReadOnlyError(RuntimeError):
@@ -27,7 +91,7 @@ _WRITE_OPS = frozenset({
     "CREATE_VIEW", "DROP_VIEW",
     "CREATE_TRIGGER", "DROP_TRIGGER",
     "ALTER_ADD_COLUMN", "ALTER_DROP_COLUMN",
-    "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE",
+    "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE", "ALTER_ALTER_COLUMN",
     "ANALYZE", "VACUUM",
 })
 
@@ -45,7 +109,8 @@ from .introspect import (hyperion_master_rows as _hyperion_master_rows,
                          hyperion_schema_meta_rows as _hyperion_schema_meta_rows,
                          integrity_check as _integrity_check,
                          explain_plan as _explain_plan)
-from .optimizer import find_eq_index as _find_eq_index, probe_index as _probe_index, optimize_join
+from .optimizer import (find_eq_index as _find_eq_index, probe_index as _probe_index,
+                        optimize_join, invalidate_row_count as _invalidate_rc)
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
 from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
@@ -676,6 +741,9 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     This is the single authoritative SELECT execution path.  _execute_inner
     delegates all SELECT/JOIN/SET_OP ops here and just formats the result.
     """
+    from .expr import _tls
+    _tls.user_funcs = db._user_funcs
+    _tls.user_aggs  = db._user_aggs
     _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     op = stmt["op"]
@@ -877,6 +945,8 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
 def _is_unique_index(idx_name: str, idx_meta, db: Database) -> bool:
     if idx_name.startswith("_pk_"):
         return True
+    if idx_meta.unique:
+        return True
     tname = idx_meta.table_name
     if tname in db.tables:
         schema = db._meta(tname).schema
@@ -916,7 +986,8 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
                 "notnull": 0 if col.nullable else 1,
                 "dflt_value": col.default, "pk": is_pk,
             })
-        return _format_rows(rows, ["cid", "name", "type", "notnull", "dflt_value", "pk"])
+        cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        return RowResult(rows, cols)
 
     if name == "index_list":
         tname = stmt.get("arg") or ""
@@ -925,7 +996,7 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
                 (n, m) for n, m in db.indexes.items() if m.table_name == tname):
             rows.append({"seq": seq, "name": idx_name,
                          "unique": 1 if _is_unique_index(idx_name, idx_meta, db) else 0})
-        return _format_rows(rows, ["seq", "name", "unique"]) if rows else "(no rows)"
+        return RowResult(rows, ["seq", "name", "unique"])
 
     if name == "index_info":
         idx_name = stmt.get("arg") or ""
@@ -936,12 +1007,12 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
         col_cids = {c.name: i for i, c in enumerate(schema.columns)}
         rows = [{"seqno": i, "cid": col_cids.get(col, -1), "name": col}
                 for i, col in enumerate(idx_meta.columns)]
-        return _format_rows(rows, ["seqno", "cid", "name"])
+        return RowResult(rows, ["seqno", "cid", "name"])
 
     if name == "integrity_check":
         results = _integrity_check(db)
         rows = [{"integrity_check": msg} for msg in results]
-        return _format_rows(rows, ["integrity_check"])
+        return RowResult(rows, ["integrity_check"])
 
     raise ParseError(f"Unknown PRAGMA: '{name}'")
 
@@ -993,6 +1064,10 @@ _ANALYZE_NULL_SENTINEL = object()
 def execute(stmt: dict, db: Database) -> str:
     op = stmt["op"]
 
+    from .expr import _tls
+    _tls.user_funcs = db._user_funcs
+    _tls.user_aggs  = db._user_aggs
+
     # Authorizer check (DML/DDL ops; SELECT ops are checked in Cursor.execute)
     if db._authorizer is not None:
         from .auth import check_authorizer, SQLITE_IGNORE
@@ -1031,7 +1106,7 @@ def execute(stmt: dict, db: Database) -> str:
     if op == "EXPLAIN":
         plan_rows = _explain_plan(stmt["stmt"], db)
         cols = ["id", "parent", "notused", "detail"]
-        return _format_rows(plan_rows, cols)
+        return RowResult(plan_rows, cols)
 
     if op == "VACUUM":
         return db.vacuum()
@@ -1211,6 +1286,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         for row in rows:
             db.insert(stmt["name"], row)
         n = len(rows)
+        _invalidate_rc(db, stmt["name"])
         return f"Table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
 
     if op == "CREATE_TABLE":
@@ -1245,6 +1321,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         if stmt.get("if_exists") and stmt["name"] not in db.tables:
             return f"Table '{stmt['name']}' does not exist."
         db.drop_table(stmt["name"])
+        _invalidate_rc(db, stmt["name"])
         return f"Table '{stmt['name']}' dropped."
 
     if op == "CREATE_VIEW":
@@ -1273,10 +1350,17 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         db.alter_rename_table(stmt["table"], stmt["new_name"])
         return f"Table '{stmt['table']}' renamed to '{stmt['new_name']}'."
 
+    if op == "ALTER_ALTER_COLUMN":
+        db.alter_column_type(stmt["table"], stmt["col_name"],
+                             stmt["new_type"], stmt["new_size"])
+        return (f"Column '{stmt['col_name']}' in '{stmt['table']}' "
+                f"type changed to {stmt['new_type']}.")
+
     if op == "CREATE_INDEX":
         if stmt.get("if_not_exists") and stmt["idx_name"] in db.indexes:
             return f"Index '{stmt['idx_name']}' already exists."
-        db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"])
+        db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"],
+                        unique=stmt.get("unique", False))
         cols_str = ", ".join(stmt["cols"])
         return f"Index '{stmt['idx_name']}' created on {stmt['table']}({cols_str})."
 
@@ -1321,7 +1405,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
         for values in stmt["rows"]:
             if len(col_names) != len(values):
-                raise RuntimeError(
+                raise DataError(
                     f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
                 )
             parsed: dict[str, Any] = {}
@@ -1384,9 +1468,10 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 if returning_cols:
                     returned_rows.append(row_out)
         n = len(stmt["rows"])
+        _invalidate_rc(db, stmt["table"])
         if returning_cols:
             projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
-            return _format_rows(projected, returning_cols)
+            return RowResult(projected, returning_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
     if op == "INSERT_SELECT":
@@ -1419,16 +1504,18 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             if _has_ins_trig2:
                 fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
         n = len(src_rows)
+        _invalidate_rc(db, stmt["table"])
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
     if op in ("SELECT", "SELECT_NOFROM", "JOIN", "SET_OP"):
         rows = _rows_for_stmt(stmt, db)
-        cols = list(rows[0].keys()) if rows else None
-        return _format_rows(rows, cols)
+        cols = list(rows[0].keys()) if rows else []
+        return RowResult(rows, cols)
 
     if op == "TRUNCATE":
         rows = db.delete(stmt["table"], None)
         n = len(rows)
+        _invalidate_rc(db, stmt["table"])
         return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
 
     if op == "UPDATE":
@@ -1454,9 +1541,11 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         else:
             rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
         n = len(rows)
+        _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
-            return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
+            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                             ret_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} updated."
 
     if op == "DELETE":
@@ -1478,9 +1567,11 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         else:
             rows = db.delete(tname, stmt["where"], stmt.get("limit"))
         n = len(rows)
+        _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
-            return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
+            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                             ret_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} deleted."
 
     raise InternalError(f"Unknown op: {op}")
@@ -1489,7 +1580,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
 _SCALAR_SQ_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
 
 
-def _would_conflict(schema, existing: dict, new_row: dict) -> bool:
+def _would_conflict(schema, existing: dict, new_row: dict,
+                    db: "Database | None" = None) -> bool:
     """Return True if existing row conflicts with new_row on any UNIQUE/PK constraint."""
     for col in schema.columns:
         if not (col.unique or col.primary_key):
@@ -1523,6 +1615,28 @@ def _would_conflict(schema, existing: dict, new_row: dict) -> bool:
             continue
         if [existing.get(c) for c in uc_cols] == new_vals:
             return True
+    # Check user-created UNIQUE indexes
+    if db is not None:
+        for idx_meta in db._catalog.indexes.values():
+            if idx_meta.table_name != schema.name or not idx_meta.unique:
+                continue
+            new_vals = []
+            for c in idx_meta.columns:
+                v = new_row.get(c)
+                col_obj = next((x for x in schema.columns if x.name == c), None)
+                if v is not None and col_obj:
+                    if col_obj.type == INTEGER:
+                        try: v = int(v)
+                        except (ValueError, TypeError): pass
+                    elif col_obj.type == REAL:
+                        try: v = float(v)
+                        except (ValueError, TypeError): pass
+                new_vals.append(v)
+            if any(v is None for v in new_vals):
+                continue
+            ex_vals = [existing.get(c) for c in idx_meta.columns]
+            if ex_vals == new_vals:
+                return True
     return False
 
 
@@ -1532,7 +1646,7 @@ def _remove_conflicting_rows(db: "Database", meta, new_row: dict) -> None:
     victims: list[tuple[int, dict]] = []
     for rowid, raw in db._table_btree(meta).scan():
         existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if _would_conflict(schema, existing, new_row):
+        if _would_conflict(schema, existing, new_row, db):
             victims.append((rowid, existing))
     if not victims:
         return
@@ -1556,7 +1670,7 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
     schema = meta.schema
     for rowid, raw in db._table_btree(meta).scan():
         existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if not _would_conflict(schema, existing, new_row):
+        if not _would_conflict(schema, existing, new_row, db):
             continue
         updated = dict(existing)
         for col_name, val in assignments.items():

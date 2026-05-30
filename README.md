@@ -1,8 +1,8 @@
 # Hyperion
 
-An embedded relational database engine written in pure Python. Hyperion implements a substantial subset of SQL on top of a B-tree storage layer with a write-ahead log, page checksums, MVCC snapshot isolation, and a PEP 249-compatible API.
+An embedded relational database engine written in pure Python. Hyperion is a full-featured SQL database built from storage primitives through query optimizer to client-server protocol, with no external dependencies.
 
-No C extensions. No external runtime dependencies. `pip install` and go.
+No external runtime dependencies. `pip install` and go.
 
 ---
 
@@ -10,16 +10,16 @@ No C extensions. No external runtime dependencies. `pip install` and go.
 
 ### Storage
 - **B-tree** page storage with 4 KB pages and overflow-page chains for large rows
-- **Write-ahead log (WAL)** — crash-safe commits; WAL is checkpointed before every LOCK_EX release so concurrent readers always see a fully current main file
-- **MVCC snapshot isolation** — copy-on-write pager; readers never block writers and never see uncommitted data
+- **Write-ahead log (WAL)** — crash-safe commits; WAL is checkpointed on every commit so the main file is always current
+- **Readers-writer lock** — concurrent `SELECT` queries run in parallel; writes serialise only against each other
 - **Per-page CRC-32 checksums** — silent corruption is detected on every page read
 - **VACUUM** — compacts the database file, reclaims space from deleted rows
 - **In-memory mode** — `Database(":memory:")` uses a dict-backed pager; no file I/O
 
 ### SQL — DDL
 - `CREATE / DROP TABLE [IF NOT EXISTS]`, `CREATE TABLE AS SELECT`, `CREATE TEMP TABLE`
-- `ALTER TABLE RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`
-- `CREATE / DROP VIEW`, `CREATE / DROP INDEX [IF NOT EXISTS]`
+- `ALTER TABLE RENAME TO`, `RENAME COLUMN`, `ADD COLUMN`, `DROP COLUMN`, `ALTER COLUMN … TYPE`
+- `CREATE / DROP VIEW`, `CREATE / DROP [UNIQUE] INDEX [IF NOT EXISTS]`
 - `CREATE / DROP TRIGGER` — `BEFORE / AFTER / INSTEAD OF`, `INSERT / UPDATE / DELETE`, `FOR EACH ROW`, `WHEN`, `RAISE(ABORT|FAIL|IGNORE|ROLLBACK, …)`
 - Column constraints: `PRIMARY KEY` (single & composite), `AUTOINCREMENT`, `UNIQUE`, `NOT NULL`, `DEFAULT`, `CHECK`, `FOREIGN KEY … ON DELETE/UPDATE CASCADE/SET NULL`
 - Generated / computed columns: `col AS (expr) STORED / VIRTUAL`
@@ -45,7 +45,7 @@ No C extensions. No external runtime dependencies. `pip install` and go.
 - Arithmetic, string concatenation (`||`), comparison, `BETWEEN`, `LIKE [ESCAPE]`, `GLOB`, `IN`, `EXISTS`, `IS [NOT] NULL`
 - `CASE WHEN … THEN … ELSE … END`, `CAST`, `COALESCE`, `NULLIF`, `IFNULL`
 - Boolean literals `TRUE / FALSE`; `CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME`
-- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT / STRING_AGG`, `COUNT(DISTINCT …)`
+- Aggregates: `COUNT`, `SUM`, `AVG`, `MIN`, `MAX`, `GROUP_CONCAT / STRING_AGG`, `COUNT(DISTINCT …)`, `SUM(DISTINCT …)`
 - String: `UPPER`, `LOWER`, `LENGTH`, `SUBSTR`, `TRIM`, `LTRIM`, `RTRIM`, `REPLACE`, `INSTR`, `PRINTF / FORMAT`
 - Math: `ABS`, `ROUND`, `CEIL`, `FLOOR`, `MOD`, `RANDOM`, `RANDOMBLOB`
 - Type: `TYPEOF`, `LAST_INSERT_ROWID`
@@ -67,12 +67,12 @@ No C extensions. No external runtime dependencies. `pip install` and go.
 - Prepared statement plan cache — parse once, bind many times; `?` / `:name` placeholders keep the cache key stable across different parameter values
 
 ### Concurrency & Safety
-- **File locking** — `flock` shared/exclusive protocol; non-blocking init trylock avoids blocking concurrent openers
+- **File locking** — `flock` shared/exclusive protocol; non-blocking trylock avoids blocking concurrent openers
 - **Readers-writer lock** (`_RWLock`) — concurrent `SELECT` queries run in parallel; writes serialise only against each other; reentrant write prevents self-deadlock
 - **Read-only mode** — `Database(path, readonly=True)` or `db.as_readonly()` context manager; any write raises immediately
-- **Query timeout** — `execute(sql, timeout_ms=5000)` raises after the deadline
-- **Max-rows guard** — `db.max_rows = 10_000` or per-call `execute(sql, max_rows=…)` raises before materialising a runaway result set
-- **Page checksums** — every page carries a CRC-32; corruption is detected on read, not just at `PRAGMA integrity_check` time
+- **Query timeout** — `execute(sql, timeout_ms=5000)` raises `QueryTimeoutError` after the deadline
+- **Max-rows guard** — `db.max_rows = 10_000` or per-call `execute(sql, max_rows=…)` raises `TooManyRowsError` before materialising a runaway result set
+- **Page checksums** — every page carries a CRC-32; corruption is detected on read
 
 ### Python API
 - **PEP 249** cursor interface — `execute`, `executemany`, `executescript`, `fetchone`, `fetchall`, `fetchmany`, `.description`, `.rowcount`, `.lastrowid`
@@ -83,8 +83,13 @@ No C extensions. No external runtime dependencies. `pip install` and go.
 - **Authorizer hook** — `db.set_authorizer(fn)` gates every operation; return `SQLITE_OK / SQLITE_DENY / SQLITE_IGNORE`
 - **Schema metadata** — `db.set_meta / get_meta / delete_meta` attaches key-value tags to any catalog object (useful for LLM text-to-SQL context)
 - **`db.iterdump()`** — yields SQL statements that recreate the full database
-- **Structured exceptions** — `ParseError`, `NoSuchTableError`, `UniqueConstraintError`, `ForeignKeyConstraintError`, `TransactionError`, and more; all inherit from `HyperionError`
+- **Structured exceptions** — `ParseError`, `NoSuchTableError`, `UniqueConstraintError`, `ForeignKeyConstraintError`, `QueryTimeoutError`, `ServerConnectionError`, and more; all inherit from `HyperionError`
 - **`db.row_factory`** — pluggable row format; defaults to `dict`
+
+### Server Mode
+- **TCP / Unix-socket server** — `python -m hyperion server mydb.hdb [--host H] [--port P] [--socket PATH]`
+- **Drop-in client** — `from hyperion.client import connect`; exposes the same `Connection` / `Cursor` interface as the embedded `Database`
+- Length-prefixed JSON protocol; BLOB values round-trip safely via base64 sentinel
 
 ---
 
@@ -176,6 +181,24 @@ async def main():
 asyncio.run(main())
 ```
 
+### Server Mode
+
+```bash
+# Start the server
+python -m hyperion server mydb.hdb --port 5433
+```
+
+```python
+# Connect from another process
+from hyperion.client import connect
+
+conn = connect(host="127.0.0.1", port=5433)
+cur  = conn.cursor()
+cur.execute("SELECT * FROM users WHERE id = ?", [1])
+print(cur.fetchone())
+conn.close()
+```
+
 ### Custom Functions
 
 ```python
@@ -217,7 +240,7 @@ pip install pytest
 pytest tests/
 ```
 
-The test suite has ~1 200 tests covering SQL correctness, storage, WAL crash recovery, concurrency, the async API, and the query optimizer.
+The test suite has ~1,350 tests covering SQL correctness, storage, WAL crash recovery, concurrency, the async API, the query optimizer, and the client-server protocol.
 
 ---
 
@@ -248,6 +271,9 @@ hyperion/
 ├── json_funcs.py       JSON scalar functions
 ├── cursor.py           PEP 249 Cursor, parameter binding, plan cache
 ├── async_db.py         AsyncDatabase and AsyncCursor
+├── server.py           TCP / Unix-socket server
+├── client.py           Remote connection client (drop-in for Database)
+├── row.py              Row type and factory helpers
 ├── auth.py             Authorizer hook support
 ├── errors.py           Typed exception hierarchy
 ├── repl.py             Interactive REPL (python -m hyperion)
@@ -272,8 +298,15 @@ H > .quit
 
 ---
 
-## Limitations
+## Roadmap — Phase 2
 
-- Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode
-- No `ALTER TABLE` column type changes
-- Vector / ANN search, full-text search (BM25), and hybrid retrieval are not yet implemented
+The relational engine is feature-complete. Phase 2 adds AI/LLM-native retrieval capabilities:
+
+- **`VECTOR(n)` column type** — store n-dimensional float32 embeddings natively
+- **Bulk vector insert** — batch-optimised ingestion path for 100k+ vectors
+- **Vector similarity operators** — `<->` (L2), `<=>` (cosine), `<#>` (dot product) in `ORDER BY` and `WHERE`
+- **ANN index (HNSW)** — approximate nearest-neighbour index for sub-linear vector search
+- **Hybrid search planner** — combine SQL filter predicates with ANN ranking in a single query
+- **Inverted index (FTS)** — tokenised full-text search over text columns
+- **BM25 scoring** — `MATCH` operator and `bm25()` function for keyword retrieval
+- **Hybrid retrieval** — unified `α · bm25 + (1-α) · cosine` scoring for production RAG

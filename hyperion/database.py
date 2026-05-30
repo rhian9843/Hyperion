@@ -13,7 +13,7 @@ from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
 from .pager import Pager, MemoryPager
-from .encoding import _IDX_KEY_SZ
+from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
 from .ddl import DDLMixin
 from .dml import DMLMixin
@@ -139,6 +139,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # reentrant for the same thread so nested calls (e.g. executescript →
         # commit, close → begin/drop/commit) don't deadlock.
         self._lock = _RWLock()
+        self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
+        self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
 
     # ── Read-only toggle ──────────────────────────────────────────────────────
 
@@ -246,8 +248,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             fn:     Callable invoked with evaluated SQL arguments.
         """
         with self._lock.write():
-            from .expr import _USER_FUNCS
-            _USER_FUNCS[name.upper()] = (n_args, fn)
+            self._user_funcs[name.upper()] = (n_args, fn)
 
     def create_aggregate(self, name: str, n_args: int, aggregate_class) -> None:
         """Register a custom aggregate function callable from SQL GROUP BY.
@@ -263,8 +264,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             aggregate_class: Class implementing the aggregate protocol.
         """
         with self._lock.write():
-            from .expr import _USER_AGGS
-            _USER_AGGS[name.upper()] = (n_args, aggregate_class)
+            self._user_aggs[name.upper()] = (n_args, aggregate_class)
 
     # ── Schema semantic metadata ──────────────────────────────────────────────
 
@@ -665,20 +665,18 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def _index_btree(self, idx: IndexMeta) -> BTree:
         return BTree(self._pager, idx.root_page, 8, self._make_idx_alloc(idx),
-                     key_sz=_IDX_KEY_SZ)
+                     key_sz=_idx_key_sz(len(idx.columns)))
 
     def _make_alloc(self, meta: TableMeta) -> Callable[[], int]:
         def alloc() -> int:
-            pn = self._catalog.next_free_page
-            self._catalog.next_free_page += 1
+            pn = self._alloc_page()
             meta.next_page = pn + 1
             return pn
         return alloc
 
     def _make_idx_alloc(self, idx: IndexMeta) -> Callable[[], int]:
         def alloc() -> int:
-            pn = self._catalog.next_free_page
-            self._catalog.next_free_page += 1
+            pn = self._alloc_page()
             idx.next_page = pn + 1
             return pn
         return alloc
@@ -824,6 +822,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             tmp_path = Path(f.name)
         tmp_path.unlink(missing_ok=True)
 
+        import copy
         new_db = Database(tmp_path)
         new_db.begin()
         for tname, tmeta in list(self._catalog.tables.items()):
@@ -836,6 +835,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 new_db.create_index(idx_name, idx_meta.table_name, idx_meta.columns)
         for vname, vsql in list(self._catalog.views.items()):
             new_db.create_view(vname, vsql)
+        for trig_name, trig_meta in list(self._catalog.triggers.items()):
+            new_db.create_trigger(trig_name, trig_meta)
+        new_db._catalog.stats = copy.deepcopy(self._catalog.stats)
+        new_db._catalog.meta  = copy.deepcopy(self._catalog.meta)
         new_db.commit()
         new_db._pager.close()
 

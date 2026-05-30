@@ -135,5 +135,6 @@ def test_no_timeout_by_default():
     assert len(cur.fetchall()) == 100
 
 
-def test_timeout_error_is_runtime_error():
-    assert issubclass(QueryTimeoutError, RuntimeError)
+def test_timeout_error_is_hyperion_error():
+    from hyperion.errors import HyperionError
+    assert issubclass(QueryTimeoutError, HyperionError)

@@ -3,13 +3,13 @@ from typing import Any
 
 from .errors import (NoSuchTableError, NoSuchColumnError, NoSuchIndexError,
                      TableExistsError, ColumnExistsError, IndexExistsError,
-                     SchemaError)
+                     SchemaError, DataError)
 from .schema import Schema, Column, ForeignKey, serialize_row, deserialize_row
 from .btree import BTree
 from .catalog import TableMeta, IndexMeta, TriggerMeta
-from .encoding import _encode_composite_key, _make_index_key, _IDX_KEY_SZ
+from .encoding import _encode_composite_key, _make_index_key, _idx_key_sz
 from .expr import eval_expr, is_expr
-from .constants import TEXT
+from .constants import TEXT, INTEGER, REAL, BLOB
 
 
 def _index_col_types(cols: list[str], schema_columns) -> list[str]:
@@ -21,6 +21,35 @@ def _index_col_types(cols: list[str], schema_columns) -> list[str]:
         else:
             types.append(next(c.type for c in schema_columns if c.name == col))
     return types
+
+
+def _make_type_cast(old_type: str, new_type: str, col_name: str):
+    """Return a value-conversion callable for old_type → new_type, or None if trivial."""
+    if old_type == new_type:
+        return None
+
+    def _cast(v):
+        try:
+            if new_type == INTEGER:
+                if isinstance(v, float) and v == int(v):
+                    return int(v)
+                return int(v)
+            if new_type == REAL:
+                return float(v)
+            if new_type == TEXT:
+                return str(v)
+            if new_type == BLOB:
+                if isinstance(v, (bytes, bytearray)):
+                    return bytes(v)
+                return str(v).encode()
+        except (ValueError, TypeError) as exc:
+            raise DataError(
+                f"Cannot convert value {v!r} in column '{col_name}' "
+                f"from {old_type} to {new_type}: {exc}"
+            ) from exc
+        return v
+
+    return _cast
 
 
 class DDLMixin:
@@ -48,8 +77,9 @@ class DDLMixin:
         to_drop = [n for n, m in self._catalog.indexes.items()
                    if m.table_name == name]
         for n in to_drop:
-            for pn in self._collect_tree_pages(self._catalog.indexes[n].root_page,
-                                               key_sz=_IDX_KEY_SZ):
+            idx = self._catalog.indexes[n]
+            for pn in self._collect_tree_pages(idx.root_page,
+                                               key_sz=_idx_key_sz(len(idx.columns))):
                 self._free_page(pn)
             del self._catalog.indexes[n]
         del self._catalog.tables[name]
@@ -93,6 +123,23 @@ class DDLMixin:
             if idx.table_name == table and old_name in idx.columns:
                 idx.columns = [new_name if c == old_name else c for c in idx.columns]
 
+    def alter_column_type(self, table: str, col_name: str,
+                          new_type: str, new_size: int) -> None:
+        meta = self._meta(table)
+        old_schema = meta.schema
+        col = next((c for c in old_schema.columns if c.name == col_name), None)
+        if col is None:
+            raise NoSuchColumnError(f"Column '{col_name}' not found in '{table}'")
+        from dataclasses import replace as _replace
+        new_cols = [
+            _replace(c, type=new_type, size=new_size) if c.name == col_name else c
+            for c in old_schema.columns
+        ]
+        new_schema = Schema(old_schema.name, new_cols)
+        cast_fn = _make_type_cast(col.type, new_type, col_name)
+        self._rewrite_table(meta, old_schema, new_schema,
+                            cast_map={col_name: cast_fn} if cast_fn else None)
+
     def alter_rename_table(self, old_name: str, new_name: str) -> None:
         if new_name in self._catalog.tables:
             raise TableExistsError(f"Table '{new_name}' already exists")
@@ -105,7 +152,8 @@ class DDLMixin:
                 idx.table_name = new_name
 
     def _rewrite_table(self, meta: TableMeta, old_schema: Schema,
-                       new_schema: Schema) -> None:
+                       new_schema: Schema,
+                       cast_map: "dict | None" = None) -> None:
         """Scan old tree, reserialize rows with new_schema, rebuild on a fresh root."""
         from .constants import ROW_CELL_SIZE
         old_tree   = BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
@@ -127,6 +175,10 @@ class DDLMixin:
         new_tree = self._table_btree(meta)
         for rowid, old_row in saved:
             new_row = {c.name: old_row.get(c.name) for c in new_schema.columns}
+            if cast_map:
+                for cname, fn in cast_map.items():
+                    if cname in new_row and new_row[cname] is not None:
+                        new_row[cname] = fn(new_row[cname])
             new_tree.insert(rowid, self._pack_row_cell(serialize_row(new_schema, new_row)))
 
         old_idx_pages: list[int] = []
@@ -137,7 +189,7 @@ class DDLMixin:
                        for col in idx.columns):
                 continue
             old_idx_pages.extend(self._collect_tree_pages(idx.root_page,
-                                                          key_sz=_IDX_KEY_SZ))
+                                                          key_sz=_idx_key_sz(len(idx.columns))))
             idx_root = self._alloc_page()
             BTree.init_root_leaf(self._pager, idx_root)
             idx.root_page = idx_root
@@ -156,7 +208,8 @@ class DDLMixin:
         for fp in old_overflow_pages:
             self._free_overflow(fp)
 
-    def create_index(self, idx_name: str, table: str, cols: list[str]) -> None:
+    def create_index(self, idx_name: str, table: str, cols: list[str],
+                     unique: bool = False) -> None:
         if idx_name in self._catalog.indexes:
             raise IndexExistsError(f"Index '{idx_name}' already exists")
         meta = self._meta(table)
@@ -167,7 +220,8 @@ class DDLMixin:
         BTree.init_root_leaf(self._pager, root)
         idx_meta = IndexMeta(table_name=table, columns=cols,
                              root_page=root,
-                             next_page=self._catalog.next_free_page)
+                             next_page=self._catalog.next_free_page,
+                             unique=unique)
         self._catalog.indexes[idx_name] = idx_meta
         tree      = self._table_btree(meta)
         itree     = self._index_btree(idx_meta)
@@ -202,7 +256,8 @@ class DDLMixin:
     def drop_index(self, idx_name: str) -> None:
         if idx_name not in self._catalog.indexes:
             raise NoSuchIndexError(f"Index '{idx_name}' does not exist")
-        for pn in self._collect_tree_pages(self._catalog.indexes[idx_name].root_page,
-                                           key_sz=_IDX_KEY_SZ):
+        idx = self._catalog.indexes[idx_name]
+        for pn in self._collect_tree_pages(idx.root_page,
+                                           key_sz=_idx_key_sz(len(idx.columns))):
             self._free_page(pn)
         del self._catalog.indexes[idx_name]

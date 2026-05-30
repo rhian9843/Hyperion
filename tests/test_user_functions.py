@@ -160,3 +160,69 @@ class TestAggregateFunctions:
         sql(db, "INSERT INTO t VALUES (5)")
         r = rows(db, "SELECT myagg(n) AS v FROM t")
         assert r[0]["v"] == 25
+
+
+# ── Cross-connection isolation ────────────────────────────────────────────────
+
+class TestConnectionIsolation:
+    """Functions registered on one Database must not bleed into another."""
+
+    def test_scalar_not_visible_on_other_connection(self):
+        db_a = Database(":memory:")
+        db_b = Database(":memory:")
+        db_a.create_function("tenant_fn", 1, lambda x: x + 1)
+        # db_a can use it; db_b sees NULL (unknown function → NULL, not a cross-connection leak)
+        assert rows(db_a, "SELECT tenant_fn(1) AS v")[0]["v"] == 2
+        assert rows(db_b, "SELECT tenant_fn(1) AS v")[0]["v"] is None
+
+    def test_scalar_same_name_different_impl(self):
+        db_a = Database(":memory:")
+        db_b = Database(":memory:")
+        db_a.create_function("myfunc", 1, lambda x: x + 1)
+        db_b.create_function("myfunc", 1, lambda x: x * 100)
+        r_a = rows(db_a, "SELECT myfunc(5) AS v")
+        r_b = rows(db_b, "SELECT myfunc(5) AS v")
+        assert r_a[0]["v"] == 6
+        assert r_b[0]["v"] == 500
+
+    def test_aggregate_not_visible_on_other_connection(self):
+        db_a = Database(":memory:")
+        db_b = Database(":memory:")
+        db_a.create_aggregate("tenant_agg", 1, SumSquares)
+        sql(db_a, "CREATE TABLE t (n INTEGER)")
+        sql(db_a, "INSERT INTO t VALUES (3)")
+        # db_a resolves the aggregate; db_b has an empty table and unknown agg → None
+        assert rows(db_a, "SELECT tenant_agg(n) AS v FROM t")[0]["v"] == 9
+        sql(db_b, "CREATE TABLE t (n INTEGER)")
+        sql(db_b, "INSERT INTO t VALUES (3)")
+        assert rows(db_b, "SELECT tenant_agg(n) AS v FROM t")[0]["v"] is None
+
+    def test_interleaved_queries_keep_correct_functions(self):
+        """Simulate two 'tenants' alternating queries on the same thread."""
+        db_a = Database(":memory:")
+        db_b = Database(":memory:")
+        db_a.create_function("adder", 1, lambda x: x + 10)
+        db_b.create_function("adder", 1, lambda x: x + 200)
+        for _ in range(5):
+            r_a = rows(db_a, "SELECT adder(1) AS v")
+            r_b = rows(db_b, "SELECT adder(1) AS v")
+            assert r_a[0]["v"] == 11
+            assert r_b[0]["v"] == 201
+
+    def test_thread_isolation_different_connections(self):
+        """Each thread uses its own DB; functions must not cross thread boundaries."""
+        import threading
+        results = {}
+
+        def worker(name, impl, expected):
+            db = Database(":memory:")
+            db.create_function("f", 1, impl)
+            r = rows(db, "SELECT f(1) AS v")
+            results[name] = r[0]["v"]
+
+        t1 = threading.Thread(target=worker, args=("a", lambda x: x + 1, 2))
+        t2 = threading.Thread(target=worker, args=("b", lambda x: x * 99, 99))
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        assert results["a"] == 2
+        assert results["b"] == 99

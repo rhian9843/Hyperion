@@ -13,20 +13,10 @@ import struct
 from binascii import crc32 as _crc32
 
 from .constants import PAGE_CKSUM_OFF
+from .errors import CorruptPageError
 
 # Raw CRC-32 of 0x00000000 would be misread as "no checksum"; remap it to 1.
 _CRC_ZERO_SENTINEL = 0x0000_0001
-
-
-class CorruptPageError(RuntimeError):
-    """Raised when a page's stored CRC does not match its computed CRC."""
-    def __init__(self, page_num: int, stored: int, computed: int) -> None:
-        super().__init__(
-            f"page {page_num}: checksum mismatch "
-            f"(stored 0x{stored:08x}, computed 0x{computed:08x})")
-        self.page_num = page_num
-        self.stored   = stored
-        self.computed = computed
 
 
 def page_checksum(data: bytes | bytearray) -> int:

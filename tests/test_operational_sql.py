@@ -223,6 +223,246 @@ class TestVacuum(unittest.TestCase):
         self.assertLessEqual(size_after, size_before + 4096)  # allow one page slack
 
 
+# ── VACUUM catalog preservation ───────────────────────────────────────────────
+
+def test_vacuum_preserves_triggers(tmp_path):
+    """Triggers must survive VACUUM and continue firing correctly afterwards."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER, val TEXT)")
+    db.execute("CREATE TABLE log (msg TEXT)")
+    db.execute("""
+        CREATE TRIGGER trg_after_insert AFTER INSERT ON t
+        FOR EACH ROW BEGIN
+            INSERT INTO log VALUES ('inserted');
+        END
+    """)
+    db.execute("INSERT INTO t VALUES (1, 'pre-vacuum')")
+    assert db.execute("SELECT COUNT(*) AS n FROM log").fetchone()["n"] == 1
+
+    db.vacuum()
+
+    # Trigger must still be registered in the catalog
+    assert "trg_after_insert" in db._catalog.triggers
+
+    # Trigger must still fire after vacuum
+    db.execute("INSERT INTO t VALUES (2, 'post-vacuum')")
+    assert db.execute("SELECT COUNT(*) AS n FROM log").fetchone()["n"] == 2
+
+    db.close()
+
+
+def test_vacuum_preserves_analyze_stats(tmp_path):
+    """ANALYZE statistics must survive VACUUM so the optimizer uses them."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER, score INTEGER)")
+    for i in range(20):
+        db.execute(f"INSERT INTO t VALUES ({i}, {i * 10})")
+    db.execute("ANALYZE")
+
+    assert db._catalog.stats.get("t", {}).get("row_count") == 20
+
+    db.vacuum()
+
+    assert db._catalog.stats.get("t", {}).get("row_count") == 20, \
+        "ANALYZE stats lost after VACUUM"
+    db.close()
+
+
+def test_vacuum_preserves_schema_metadata(tmp_path):
+    """set_meta annotations must survive VACUUM."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE users (id INTEGER, email TEXT)")
+    db.set_meta("table",  "users",        "description", "User accounts")
+    db.set_meta("column", "users.email",  "description", "Primary contact")
+
+    db.vacuum()
+
+    assert db.get_meta("table",  "users")       == {"description": "User accounts"}, \
+        "Table metadata lost after VACUUM"
+    assert db.get_meta("column", "users.email") == {"description": "Primary contact"}, \
+        "Column metadata lost after VACUUM"
+    db.close()
+
+
+def test_vacuum_preserves_all_three_survive_reopen(tmp_path):
+    """Triggers, stats, and metadata must all be readable after close+reopen post-VACUUM."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER, val TEXT)")
+    db.execute("CREATE TABLE log (n INTEGER)")
+    db.execute("""
+        CREATE TRIGGER trg AFTER INSERT ON t FOR EACH ROW
+        BEGIN INSERT INTO log VALUES (1); END
+    """)
+    for i in range(10):
+        db.execute(f"INSERT INTO t VALUES ({i}, 'x')")
+    db.execute("ANALYZE")
+    db.set_meta("table", "t", "owner", "test-suite")
+
+    db.vacuum()
+    db.close()
+
+    db2 = Database(tmp_path / "v.hdb")
+    assert "trg" in db2._catalog.triggers
+    assert db2._catalog.stats.get("t", {}).get("row_count") == 10
+    assert db2.get_meta("table", "t") == {"owner": "test-suite"}
+
+    # Trigger still fires after reopen
+    pre = db2.execute("SELECT COUNT(*) AS n FROM log").fetchone()["n"]
+    db2.execute("INSERT INTO t VALUES (99, 'after-reopen')")
+    post = db2.execute("SELECT COUNT(*) AS n FROM log").fetchone()["n"]
+    assert post == pre + 1, f"Trigger did not fire after reopen (log: {pre} → {post})"
+    db2.close()
+
+
+def test_vacuum_preserves_multiple_triggers_all_types(tmp_path):
+    """BEFORE, AFTER, and UPDATE triggers on the same table all survive VACUUM."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER, val TEXT)")
+    db.execute("CREATE TABLE log (event TEXT)")
+    db.execute("""
+        CREATE TRIGGER trg_before_insert BEFORE INSERT ON t FOR EACH ROW
+        BEGIN INSERT INTO log VALUES ('before_insert'); END
+    """)
+    db.execute("""
+        CREATE TRIGGER trg_after_insert AFTER INSERT ON t FOR EACH ROW
+        BEGIN INSERT INTO log VALUES ('after_insert'); END
+    """)
+    db.execute("""
+        CREATE TRIGGER trg_after_delete AFTER DELETE ON t FOR EACH ROW
+        BEGIN INSERT INTO log VALUES ('after_delete'); END
+    """)
+    db.execute("""
+        CREATE TRIGGER trg_after_update AFTER UPDATE ON t FOR EACH ROW
+        BEGIN INSERT INTO log VALUES ('after_update'); END
+    """)
+
+    db.vacuum()
+
+    for name in ("trg_before_insert", "trg_after_insert",
+                 "trg_after_delete", "trg_after_update"):
+        assert name in db._catalog.triggers, f"{name} lost after VACUUM"
+
+    db.execute("INSERT INTO t VALUES (1, 'x')")
+    events = [r["event"] for r in db.execute("SELECT event FROM log ORDER BY rowid").fetchall()]
+    assert "before_insert" in events
+    assert "after_insert" in events
+
+    db.execute("UPDATE t SET val = 'y' WHERE id = 1")
+    events2 = [r["event"] for r in db.execute("SELECT event FROM log ORDER BY rowid").fetchall()]
+    assert "after_update" in events2
+
+    db.execute("DELETE FROM t WHERE id = 1")
+    events3 = [r["event"] for r in db.execute("SELECT event FROM log ORDER BY rowid").fetchall()]
+    assert "after_delete" in events3
+
+    db.close()
+
+
+def test_vacuum_preserves_instead_of_trigger_on_view(tmp_path):
+    """INSTEAD OF trigger on a view must survive VACUUM and still intercept DML."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE base (id INTEGER, val TEXT)")
+    db.execute("CREATE VIEW v AS SELECT id, val FROM base")
+    db.execute("CREATE TABLE routed (id INTEGER, val TEXT)")
+    db.execute("""
+        CREATE TRIGGER trg_instead INSTEAD OF INSERT ON v FOR EACH ROW
+        BEGIN INSERT INTO routed VALUES (NEW.id, NEW.val); END
+    """)
+
+    db.vacuum()
+
+    assert "trg_instead" in db._catalog.triggers
+
+    db.execute("INSERT INTO v (id, val) VALUES (42, 'via-view')")
+    row = db.execute("SELECT id FROM routed").fetchone()
+    assert row is not None and row["id"] == 42, \
+        "INSTEAD OF trigger did not fire after VACUUM"
+
+    db.close()
+
+
+def test_vacuum_preserves_trigger_with_when_clause(tmp_path):
+    """A trigger with a WHEN guard must survive VACUUM and only fire when the condition holds."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER, score INTEGER)")
+    db.execute("CREATE TABLE log (id INTEGER)")
+    db.execute("""
+        CREATE TRIGGER trg_high_score AFTER INSERT ON t FOR EACH ROW
+        WHEN NEW.score > 90
+        BEGIN INSERT INTO log VALUES (NEW.id); END
+    """)
+
+    db.vacuum()
+
+    db.execute("INSERT INTO t VALUES (1, 50)")   # below threshold — should not log
+    db.execute("INSERT INTO t VALUES (2, 95)")   # above threshold — should log
+    rows = db.execute("SELECT id FROM log").fetchall()
+    assert [r["id"] for r in rows] == [2], \
+        f"WHEN clause not preserved after VACUUM: got {rows}"
+
+    db.close()
+
+
+def test_vacuum_preserves_analyze_stats_multiple_tables(tmp_path):
+    """ANALYZE stats for every table must all survive VACUUM."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE a (x INTEGER)")
+    db.execute("CREATE TABLE b (y INTEGER)")
+    for i in range(10):
+        db.execute(f"INSERT INTO a VALUES ({i})")
+    for i in range(25):
+        db.execute(f"INSERT INTO b VALUES ({i})")
+    db.execute("ANALYZE")
+
+    db.vacuum()
+
+    assert db._catalog.stats.get("a", {}).get("row_count") == 10, "Stats for 'a' lost"
+    assert db._catalog.stats.get("b", {}).get("row_count") == 25, "Stats for 'b' lost"
+    db.close()
+
+
+def test_vacuum_preserves_metadata_multiple_objects(tmp_path):
+    """Metadata on tables, columns, and indexes must all survive VACUUM."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT)")
+    db.execute("CREATE INDEX idx_email ON users (email)")
+    db.set_meta("table",  "users",         "description",     "Registered users")
+    db.set_meta("column", "users.email",   "description",     "Login email address")
+    db.set_meta("column", "users.email",   "embedding_model", "text-embedding-3-small")
+    db.set_meta("index",  "idx_email",     "purpose",         "Login lookup")
+
+    db.vacuum()
+
+    assert db.get_meta("table",  "users")["description"]         == "Registered users"
+    assert db.get_meta("column", "users.email")["description"]   == "Login email address"
+    assert db.get_meta("column", "users.email")["embedding_model"] == "text-embedding-3-small"
+    assert db.get_meta("index",  "idx_email")["purpose"]         == "Login lookup"
+    db.close()
+
+
+def test_vacuum_with_no_triggers_stats_meta(tmp_path):
+    """VACUUM on a plain database with no triggers, ANALYZE, or metadata must not error."""
+    from hyperion import Database
+    db = Database(tmp_path / "v.hdb")
+    db.execute("CREATE TABLE t (id INTEGER)")
+    db.execute("INSERT INTO t VALUES (1)")
+    db.vacuum()
+    assert db.execute("SELECT id FROM t").fetchone()["id"] == 1
+    assert db._catalog.triggers == {}
+    assert db._catalog.stats    == {}
+    assert db._catalog.meta     == {}
+    db.close()
+
+
 # ── Quoted identifiers ─────────────────────────────────────────────────────────
 
 class TestQuotedIdentifiers(unittest.TestCase):

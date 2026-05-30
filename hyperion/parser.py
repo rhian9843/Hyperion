@@ -810,7 +810,7 @@ def _parse_create_view(t: list[str], i: int, or_replace: bool) -> dict:
             "if_not_exists": if_not_exists, "or_replace": or_replace}
 
 
-def _parse_create_index(t: list[str], i: int) -> dict:
+def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
     if_not_exists = False
     if i < len(t) and t[i].upper() == "IF":
         if i + 2 < len(t) and t[i+1].upper() == "NOT" and t[i+2].upper() == "EXISTS":
@@ -841,7 +841,8 @@ def _parse_create_index(t: list[str], i: int) -> dict:
     if not cols:
         raise ParseError("Expected at least one column in index")
     return {"op": "CREATE_INDEX", "idx_name": idx_name,
-            "table": table, "cols": cols, "if_not_exists": if_not_exists}
+            "table": table, "cols": cols, "if_not_exists": if_not_exists,
+            "unique": unique}
 
 
 def _parse_create_trigger(t: list[str], i: int) -> dict:
@@ -943,7 +944,7 @@ def _parse_create(t: list[str]) -> dict:
     if sub == "INDEX":
         return _parse_create_index(t, 2)
     if sub == "UNIQUE" and len(t) > 2 and t[2].upper() == "INDEX":
-        return _parse_create_index(t, 3)
+        return _parse_create_index(t, 3, unique=True)
     if sub == "TRIGGER":
         return _parse_create_trigger(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
@@ -985,6 +986,15 @@ def _parse_alter(t: list[str]) -> dict:
         if len(t) < 6 or t[4].upper() != "COLUMN":
             raise ParseError("Expected: DROP COLUMN <name>")
         return {"op": "ALTER_DROP_COLUMN", "table": table, "col_name": t[5]}
+    if sub == "ALTER":
+        if len(t) < 7 or t[4].upper() != "COLUMN":
+            raise ParseError("Expected: ALTER COLUMN <name> TYPE <type>")
+        col_name = t[5]
+        if len(t) < 8 or t[6].upper() != "TYPE":
+            raise ParseError("Expected TYPE after column name")
+        new_type, new_size = _parse_col_type(t[7])
+        return {"op": "ALTER_ALTER_COLUMN", "table": table,
+                "col_name": col_name, "new_type": new_type, "new_size": new_size}
     raise ParseError(f"Unknown ALTER TABLE operation: '{t[3]}'")
 
 

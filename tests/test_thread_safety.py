@@ -203,6 +203,158 @@ def test_ddl_serialised_with_dml():
     assert row["n"] == 4 * 50
 
 
+def test_lastrowid_is_thread_local():
+    """Each thread must see its own lastrowid, not another thread's."""
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+
+    results: dict[int, int | None] = {}
+    errors = []
+
+    def worker(tid):
+        try:
+            cur = db.execute("INSERT INTO t (val) VALUES (?)", (f"v{tid}",))
+            results[tid] = cur.lastrowid
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Errors: {errors}"
+    assert all(v is not None for v in results.values()), \
+        f"None lastrowid in: {results}"
+    # All captured rowids must be distinct (each insert got a unique key)
+    assert len(set(results.values())) == 20, \
+        f"Duplicate lastrowids: {results}"
+
+
+def test_lastrowid_multiple_inserts_per_thread():
+    """A thread doing N sequential inserts must see the rowid from its own last insert,
+    not one from a concurrent thread that fired between the two."""
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+
+    # Thread A does two inserts and records both rowids.
+    # Thread B hammers inserts concurrently trying to clobber A's lastrowid.
+    a_rowids: list[int | None] = []
+    errors = []
+
+    barrier = threading.Barrier(2)
+
+    def thread_a():
+        try:
+            barrier.wait()
+            cur1 = db.execute("INSERT INTO t (val) VALUES ('a1')")
+            a_rowids.append(cur1.lastrowid)
+            cur2 = db.execute("INSERT INTO t (val) VALUES ('a2')")
+            a_rowids.append(cur2.lastrowid)
+        except Exception as e:
+            errors.append(e)
+
+    def thread_b():
+        try:
+            barrier.wait()
+            for _ in range(50):
+                db.execute("INSERT INTO t (val) VALUES ('b')")
+        except Exception as e:
+            errors.append(e)
+
+    ta = threading.Thread(target=thread_a)
+    tb = threading.Thread(target=thread_b)
+    ta.start(); tb.start()
+    ta.join();  tb.join()
+
+    assert not errors, f"Errors: {errors}"
+    assert len(a_rowids) == 2, f"Thread A only recorded {len(a_rowids)} rowids"
+    assert a_rowids[0] != a_rowids[1], "Both inserts should have different rowids"
+    assert all(r is not None for r in a_rowids)
+
+
+def test_last_insert_rowid_sql_function_is_thread_local():
+    """SELECT LAST_INSERT_ROWID() on a connection must return the rowid from that
+    connection's most recent insert, not one from a concurrent thread."""
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+
+    sql_results: dict[int, int | None] = {}
+    errors = []
+
+    def worker(tid):
+        try:
+            db.execute("INSERT INTO t (val) VALUES (?)", (f"v{tid}",))
+            row = db.execute("SELECT LAST_INSERT_ROWID() AS rid").fetchone()
+            sql_results[tid] = row["rid"] if row else None
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(20)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Errors: {errors}"
+    assert all(v is not None for v in sql_results.values()), \
+        f"None LAST_INSERT_ROWID in: {sql_results}"
+    assert len(set(sql_results.values())) == 20, \
+        f"Duplicate LAST_INSERT_ROWID values: {sql_results}"
+
+
+def test_lastrowid_none_before_insert_on_new_thread():
+    """A thread that has never performed an insert sees lastrowid as None."""
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+    # Do one insert on the main thread to populate the main-thread TLS slot
+    db.execute("INSERT INTO t (val) VALUES ('main')")
+
+    result: list[int | None] = []
+
+    def fresh_thread():
+        # This thread has never inserted — its TLS slot must be None
+        from hyperion.expr import get_last_insert_rowid
+        result.append(get_last_insert_rowid())
+
+    t = threading.Thread(target=fresh_thread)
+    t.start()
+    t.join()
+
+    assert result == [None], f"Expected [None], got {result}"
+
+
+def test_lastrowid_file_backed_concurrent(tmp_path):
+    """Concurrent inserts into a file-backed database each return the correct rowid."""
+    db_path = tmp_path / "tc.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, val TEXT)")
+
+    results: dict[int, int | None] = {}
+    errors = []
+
+    def worker(tid):
+        try:
+            cur = db.execute("INSERT INTO t (val) VALUES (?)", (f"v{tid}",))
+            results[tid] = cur.lastrowid
+        except Exception as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    db.close()
+
+    assert not errors, f"Errors: {errors}"
+    assert all(v is not None for v in results.values())
+    assert len(set(results.values())) == 10, \
+        f"Duplicate lastrowids in file-backed DB: {results}"
+
+
 def test_explicit_transaction_serialised():
     """Two threads racing on an explicit transaction must not double-commit or corrupt."""
     db = Database(":memory:")

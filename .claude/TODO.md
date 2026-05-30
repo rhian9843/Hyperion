@@ -12,6 +12,7 @@
 - [x] Fix `SELECT id AS uid FROM t` — the column parser treats `AS` and `uid` as additional column names instead of recognising the alias; columns list becomes `['id', 'AS', 'uid']`
 - [x] Fix `DROP INDEX IF EXISTS idx_name` — parser puts `IF` as the index name instead of skipping the `IF EXISTS` guard
 - [x] Fix VARCHAR(n) silent truncation — inserting a value longer than the column size silently truncates instead of raising an error
+- [x] Fix `CREATE UNIQUE INDEX` not enforcing uniqueness on INSERT/UPDATE — `CREATE UNIQUE INDEX idx ON t(col)` creates the index but duplicate values are silently accepted; only `col UNIQUE` column constraints and multi-column `UNIQUE(a,b)` constraints are checked today
 
 ## Performance
 
@@ -208,11 +209,31 @@
 - [x] Page checksum validation loophole — computed CRC-32 checksums of exactly `0` are stored as `0`, which is treated as a legacy page and bypasses verification entirely. Corruption on pages with checksum `0` goes undetected. Fix by mapping computed `0` checksums to a non-zero value (e.g. `1`).
 - [x] Monolithic connection lock blockage — connection uses a single reentrant lock (`threading.RLock`) for all cursor executes and fetches. A long-running query holds the lock for its entire execution, blocking concurrent threads using the same connection from performing lightweight metadata queries or introspection.
 
-## Vector Database Prerequisites
+## Phase 1 Audit — Bugs & Gaps (Deep Analysis)
 
-> **Dependency order** — these items have a strict prerequisite chain and cannot be parallelised:
-> `Variable-length row storage` → `VECTOR(n) type` → `ANN index (HNSW)` → `Hybrid search planner`
-> Similarly on the agent side: `Thread safety` → `MVCC` → `Async API` (async safety depends on both).
+### Phase 2 Blockers — Must Fix Before Agent Layer
+
+- [x] `_LAST_INSERT_ROWID` is a process-global variable — `expr.py:18` stores `_LAST_INSERT_ROWID` as a module-level global; concurrent inserts from two threads will race and `cursor.lastrowid` returns the wrong ID for the losing thread; any agent workflow that inserts a row and uses the returned ID to build a FK relationship produces corrupt data with no error; fix by moving last-insert-rowid state onto the `Database` instance so each connection has its own value
+- [x] `VACUUM` silently drops triggers, ANALYZE stats, and schema metadata — `database.py:829–853` rebuilds the DB by copying tables/indexes/views but never copies `_catalog.triggers`, `_catalog.stats`, or `_catalog.meta`; after VACUUM all BEFORE/AFTER/INSTEAD OF triggers are gone, all ANALYZE statistics are gone (optimizer reverts to full-scan estimates), and all `set_meta` schema annotations are gone — the exact annotations the LLM layer relies on for query generation
+- [x] `_USER_FUNCS` and `_USER_AGGS` are process-global dicts — `expr.py:14–15`; `db.create_function()` writes into a shared module-level registry; every `Database` instance in the same process shares the same custom function namespace; in a multi-tenant agent scenario a function registered for tenant A is callable from tenant B's queries; fix by moving the registries onto the `Database` instance
+- [x] B-tree page allocators bypass the free-page list — `database.py:670–681`; `_make_alloc` and `_make_idx_alloc` (used on every B-tree split during INSERT) directly increment `next_free_page` without checking `free_pages`; pages freed by `drop_table` are never reused by subsequent inserts; an agent workload that repeatedly creates tables, bulk-loads data, and drops them grows the file indefinitely; fix by routing all allocation through `_alloc_page`
+
+### Significant Weaknesses — Will Surface Under Agent Workloads
+
+- [x] `_check_unique` does a full table scan on every INSERT — `constraints.py:35` scans every row to check UNIQUE constraints even when an index exists on the column; at 100k rows a bulk-load into a table with UNIQUE columns is O(n²); fix by using the index probe path (`optimizer.probe_index`) when a matching index exists
+- [x] Optimizer row-count cache never invalidated by DML or DDL — `optimizer.py:31–44`; the `_opt_row_counts` dict is only populated on first access or ANALYZE; INSERTs, DELETEs, and DROP+recreate with the same table name never update it; after a significant data load the optimizer still uses the stale row count, producing wrong join order decisions; fix by invalidating the entry for a table after any write to it
+- [x] Composite index keys use FNV-1a hashing — range queries silently degrade — `encoding.py:39–51`; multi-column indexes encode all column values into a single int64 via FNV-1a; hash values do not preserve sort order across column combinations, so range predicates and ORDER BY on composite indexes silently fall back to a full table scan with no warning; an agent generating `WHERE tenant_id = ? AND created_at > ?` on a `(tenant_id, created_at)` index gets no index benefit for the range component; fix requires prefix-encoded composite keys that preserve per-column sort order
+
+## Known Limitations
+
+- [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
+- [x] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
+- [x] `PRAGMA` / `RETURNING` / `EXPLAIN` results not fetchable — `execute()` returned a formatted string; `cursor.fetchall()` on PRAGMA/RETURNING/EXPLAIN returned `[]`; fixed by introducing `RowResult` so all data-producing ops are fetchable via the cursor
+
+## Phase 2
+
+> **Dependency order** — strict prerequisite chain:
+> `VECTOR(n) type` → `Bulk vector insert` → `ANN index (HNSW)` → `Vector similarity operators` → `Hybrid search planner`
 
 ### Storage
 

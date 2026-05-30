@@ -31,6 +31,7 @@ class IndexMeta:
     columns:    list[str]
     root_page:  int
     next_page:  int
+    unique:     bool = False
 
     @property
     def column_name(self) -> str:
@@ -68,7 +69,8 @@ class Catalog:
                 for n, m in self.tables.items() if not m.temporary
             },
             "indexes": {
-                n: {"table_name": m.table_name, "columns": m.columns}
+                n: {"table_name": m.table_name, "columns": m.columns,
+                    "unique": m.unique}
                 for n, m in self.indexes.items()
             },
             "views":    self.views,
@@ -119,7 +121,8 @@ class Catalog:
             },
             "indexes": {
                 n: {"table_name": m.table_name, "columns": m.columns,
-                    "root_page": m.root_page, "next_page": m.next_page}
+                    "root_page": m.root_page, "next_page": m.next_page,
+                    "unique": m.unique}
                 for n, m in self.indexes.items()
             },
             "views": self.views,
@@ -166,6 +169,7 @@ class Catalog:
                 columns=i["columns"],
                 root_page=ops.get("root_page", 0),
                 next_page=ops.get("next_page", 0),
+                unique=i.get("unique", False),
             )
 
         triggers = {
@@ -201,7 +205,8 @@ class Catalog:
         indexes = {
             n: IndexMeta(i["table_name"],
                          i["columns"] if "columns" in i else [i["column_name"]],
-                         i["root_page"], i["next_page"])
+                         i["root_page"], i["next_page"],
+                         unique=i.get("unique", False))
             for n, i in d.get("indexes", {}).items()
         }
         triggers = {
