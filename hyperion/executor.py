@@ -12,6 +12,73 @@ class QueryTimeoutError(RuntimeError):
     """Raised when a query exceeds its allotted execution time."""
 
 
+class RowResult:
+    """Return type for executor ops that produce rows (PRAGMA, RETURNING, SELECT).
+
+    Carries structured data so callers can choose between fetchable rows (cursor)
+    and formatted display (REPL).  ``rowcount`` is -1 for read-only ops; for DML
+    with RETURNING it is the number of rows affected.
+    """
+    __slots__ = ("rows", "columns", "rowcount")
+
+    def __init__(self, rows: list, columns: list, rowcount: int = -1) -> None:
+        self.rows     = rows
+        self.columns  = columns
+        self.rowcount = rowcount
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    _ROW_COUNT_RE = __import__("re").compile(r"^\((\d+) rows?\)$")
+
+    def __contains__(self, item) -> bool:
+        """Support `value in result` — checks exact match, string repr, and column names.
+
+        Preserves backward compatibility with code that did ``"Alice" in execute(stmt, db)``
+        when execute() used to return a formatted string.
+        """
+        item_str = str(item)
+        # "(2 rows)" / "(1 row)" — row-count check
+        m = self._ROW_COUNT_RE.match(item_str)
+        if m and int(m.group(1)) == len(self.rows):
+            return True
+        # Column names (e.g. "id" in EXPLAIN result)
+        if item_str in self.columns:
+            return True
+        for row in self.rows:
+            for v in row.values():
+                if v == item:
+                    return True
+                if item_str == str(v):
+                    return True
+                # "75000" matches 75000.0
+                if isinstance(v, float) and v == int(v) and item_str == str(int(v)):
+                    return True
+                # substring match in string values (e.g. "SEARCH TABLE t" in EXPLAIN detail)
+                if isinstance(v, str) and item_str in v:
+                    return True
+        return False
+
+    def __eq__(self, other) -> bool:
+        if isinstance(other, RowResult):
+            return self.rows == other.rows and self.columns == other.columns
+        if other == "(no rows)" and len(self.rows) == 0:
+            return True
+        return NotImplemented
+
+    def __hash__(self):
+        return id(self)
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __bool__(self) -> bool:
+        return True  # non-empty result set or empty — both truthy as a result object
+
+    def __repr__(self) -> str:
+        return f"RowResult(columns={self.columns!r}, rows={len(self.rows)})"
+
+
 class ReadOnlyError(RuntimeError):
     """Raised when a write operation is attempted on a read-only Database."""
 
@@ -920,7 +987,8 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
                 "notnull": 0 if col.nullable else 1,
                 "dflt_value": col.default, "pk": is_pk,
             })
-        return _format_rows(rows, ["cid", "name", "type", "notnull", "dflt_value", "pk"])
+        cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+        return RowResult(rows, cols)
 
     if name == "index_list":
         tname = stmt.get("arg") or ""
@@ -929,7 +997,7 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
                 (n, m) for n, m in db.indexes.items() if m.table_name == tname):
             rows.append({"seq": seq, "name": idx_name,
                          "unique": 1 if _is_unique_index(idx_name, idx_meta, db) else 0})
-        return _format_rows(rows, ["seq", "name", "unique"]) if rows else "(no rows)"
+        return RowResult(rows, ["seq", "name", "unique"])
 
     if name == "index_info":
         idx_name = stmt.get("arg") or ""
@@ -940,12 +1008,12 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
         col_cids = {c.name: i for i, c in enumerate(schema.columns)}
         rows = [{"seqno": i, "cid": col_cids.get(col, -1), "name": col}
                 for i, col in enumerate(idx_meta.columns)]
-        return _format_rows(rows, ["seqno", "cid", "name"])
+        return RowResult(rows, ["seqno", "cid", "name"])
 
     if name == "integrity_check":
         results = _integrity_check(db)
         rows = [{"integrity_check": msg} for msg in results]
-        return _format_rows(rows, ["integrity_check"])
+        return RowResult(rows, ["integrity_check"])
 
     raise ParseError(f"Unknown PRAGMA: '{name}'")
 
@@ -1039,7 +1107,7 @@ def execute(stmt: dict, db: Database) -> str:
     if op == "EXPLAIN":
         plan_rows = _explain_plan(stmt["stmt"], db)
         cols = ["id", "parent", "notused", "detail"]
-        return _format_rows(plan_rows, cols)
+        return RowResult(plan_rows, cols)
 
     if op == "VACUUM":
         return db.vacuum()
@@ -1403,7 +1471,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         _invalidate_rc(db, stmt["table"])
         if returning_cols:
             projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
-            return _format_rows(projected, returning_cols)
+            return RowResult(projected, returning_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} inserted."
 
     if op == "INSERT_SELECT":
@@ -1441,8 +1509,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
 
     if op in ("SELECT", "SELECT_NOFROM", "JOIN", "SET_OP"):
         rows = _rows_for_stmt(stmt, db)
-        cols = list(rows[0].keys()) if rows else None
-        return _format_rows(rows, cols)
+        cols = list(rows[0].keys()) if rows else []
+        return RowResult(rows, cols)
 
     if op == "TRUNCATE":
         rows = db.delete(stmt["table"], None)
@@ -1476,7 +1544,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
-            return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
+            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                             ret_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} updated."
 
     if op == "DELETE":
@@ -1501,7 +1570,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         _invalidate_rc(db, tname)
         if stmt.get("returning"):
             ret_cols = stmt["returning"]
-            return _format_rows([{c: r.get(c) for c in ret_cols} for r in rows], ret_cols)
+            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                             ret_cols, rowcount=n)
         return f"{n} row{'s' if n != 1 else ''} deleted."
 
     raise InternalError(f"Unknown op: {op}")

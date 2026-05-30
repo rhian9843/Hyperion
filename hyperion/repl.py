@@ -5,7 +5,7 @@ from pathlib import Path
 from .database import Database
 from .errors import HyperionError
 from .parser import parse, ParseError
-from .executor import execute
+from .executor import execute, _format_rows, RowResult
 
 
 def handle_meta(cmd: str, db: Database) -> bool | None:
@@ -134,7 +134,9 @@ def repl(db: Database) -> None:
             if not part:
                 continue
             try:
-                print(execute(parse(part), db))
+                result = execute(parse(part), db)
+                print(_format_rows(result.rows, result.columns)
+                      if isinstance(result, RowResult) else result)
             except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
                 print(f"Error: {e}")
 

@@ -76,10 +76,9 @@ class TestDistinctAggregates(unittest.TestCase):
     def test_count_distinct_in_group_by(self):
         # GROUP BY cat: each group has 1 distinct val
         result = sql(self.db, "SELECT cat, COUNT(DISTINCT val) FROM t GROUP BY cat ORDER BY cat")
-        self.assertIn("(3 rows)", result)
-        data_lines = [l for l in result.splitlines() if "|" in l and "cat" not in l]
-        for line in data_lines:
-            self.assertIn("1", line)
+        self.assertEqual(len(result.rows), 3)
+        for row in result.rows:
+            self.assertEqual(row["COUNT(DISTINCT val)"], 1)
 
     def test_group_concat_distinct(self):
         result = sql(self.db, "SELECT GROUP_CONCAT(DISTINCT cat) FROM t")
@@ -87,13 +86,9 @@ class TestDistinctAggregates(unittest.TestCase):
         self.assertIn("a", result)
         self.assertIn("b", result)
         self.assertIn("c", result)
-        # Find the data value — it's the non-header, non-separator, non-count line
-        data = [l.strip() for l in result.splitlines()
-                if l.strip() and not l.startswith("-") and "GROUP" not in l
-                and "row" not in l]
-        self.assertTrue(data)
-        csv = data[0].strip("|").strip()
-        self.assertEqual(len(csv.split(",")), 3)
+        # The single returned value must be a comma-separated list of 3 items
+        csv_val = result.rows[0]["GROUP_CONCAT(DISTINCT cat)"]
+        self.assertEqual(len(str(csv_val).split(",")), 3)
 
 
 # ── Expression indexes ────────────────────────────────────────────────────────

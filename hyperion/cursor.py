@@ -338,14 +338,24 @@ class Cursor:
                 rows = explain_plan(stmt["stmt"], self._db)
                 self._set_select_result(iter(rows))
             else:
-                result_str = _exec(stmt, self._db)
-                self._iter = None
-                self.description = None
-                self.rowcount = _rowcount_from_result(result_str)
-                if op in ("INSERT", "INSERT_SELECT", "UPSERT"):
-                    self.lastrowid = get_last_insert_rowid()
+                from .executor import RowResult as _RowResult
+                result = _exec(stmt, self._db)
+                if isinstance(result, _RowResult):
+                    self._set_select_result(iter(result.rows))
+                    if result.rowcount >= 0:
+                        self.rowcount = result.rowcount
+                    if op in ("INSERT", "INSERT_SELECT", "UPSERT"):
+                        self.lastrowid = get_last_insert_rowid()
+                    else:
+                        self.lastrowid = None
                 else:
-                    self.lastrowid = None
+                    self._iter = None
+                    self.description = None
+                    self.rowcount = _rowcount_from_result(result)
+                    if op in ("INSERT", "INSERT_SELECT", "UPSERT"):
+                        self.lastrowid = get_last_insert_rowid()
+                    else:
+                        self.lastrowid = None
         finally:
             self._db._query_deadline = None
 

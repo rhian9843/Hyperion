@@ -138,7 +138,7 @@ from .errors import (
     CheckConstraintError, ForeignKeyConstraintError,
     DataError, TransactionError, AuthorizationError, InternalError,
 )
-from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError
+from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError, RowResult
 from .async_db import AsyncDatabase, AsyncCursor
 from .server import Server
 from .client import connect
