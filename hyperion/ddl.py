@@ -208,7 +208,8 @@ class DDLMixin:
         for fp in old_overflow_pages:
             self._free_overflow(fp)
 
-    def create_index(self, idx_name: str, table: str, cols: list[str]) -> None:
+    def create_index(self, idx_name: str, table: str, cols: list[str],
+                     unique: bool = False) -> None:
         if idx_name in self._catalog.indexes:
             raise IndexExistsError(f"Index '{idx_name}' already exists")
         meta = self._meta(table)
@@ -219,7 +220,8 @@ class DDLMixin:
         BTree.init_root_leaf(self._pager, root)
         idx_meta = IndexMeta(table_name=table, columns=cols,
                              root_page=root,
-                             next_page=self._catalog.next_free_page)
+                             next_page=self._catalog.next_free_page,
+                             unique=unique)
         self._catalog.indexes[idx_name] = idx_meta
         tree      = self._table_btree(meta)
         itree     = self._index_btree(idx_meta)

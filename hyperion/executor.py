@@ -948,6 +948,8 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
 def _is_unique_index(idx_name: str, idx_meta, db: Database) -> bool:
     if idx_name.startswith("_pk_"):
         return True
+    if idx_meta.unique:
+        return True
     tname = idx_meta.table_name
     if tname in db.tables:
         schema = db._meta(tname).schema
@@ -1360,7 +1362,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
     if op == "CREATE_INDEX":
         if stmt.get("if_not_exists") and stmt["idx_name"] in db.indexes:
             return f"Index '{stmt['idx_name']}' already exists."
-        db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"])
+        db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"],
+                        unique=stmt.get("unique", False))
         cols_str = ", ".join(stmt["cols"])
         return f"Index '{stmt['idx_name']}' created on {stmt['table']}({cols_str})."
 
@@ -1580,7 +1583,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
 _SCALAR_SQ_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
 
 
-def _would_conflict(schema, existing: dict, new_row: dict) -> bool:
+def _would_conflict(schema, existing: dict, new_row: dict,
+                    db: "Database | None" = None) -> bool:
     """Return True if existing row conflicts with new_row on any UNIQUE/PK constraint."""
     for col in schema.columns:
         if not (col.unique or col.primary_key):
@@ -1614,6 +1618,28 @@ def _would_conflict(schema, existing: dict, new_row: dict) -> bool:
             continue
         if [existing.get(c) for c in uc_cols] == new_vals:
             return True
+    # Check user-created UNIQUE indexes
+    if db is not None:
+        for idx_meta in db._catalog.indexes.values():
+            if idx_meta.table_name != schema.name or not idx_meta.unique:
+                continue
+            new_vals = []
+            for c in idx_meta.columns:
+                v = new_row.get(c)
+                col_obj = next((x for x in schema.columns if x.name == c), None)
+                if v is not None and col_obj:
+                    if col_obj.type == INTEGER:
+                        try: v = int(v)
+                        except (ValueError, TypeError): pass
+                    elif col_obj.type == REAL:
+                        try: v = float(v)
+                        except (ValueError, TypeError): pass
+                new_vals.append(v)
+            if any(v is None for v in new_vals):
+                continue
+            ex_vals = [existing.get(c) for c in idx_meta.columns]
+            if ex_vals == new_vals:
+                return True
     return False
 
 
@@ -1623,7 +1649,7 @@ def _remove_conflicting_rows(db: "Database", meta, new_row: dict) -> None:
     victims: list[tuple[int, dict]] = []
     for rowid, raw in db._table_btree(meta).scan():
         existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if _would_conflict(schema, existing, new_row):
+        if _would_conflict(schema, existing, new_row, db):
             victims.append((rowid, existing))
     if not victims:
         return
@@ -1647,7 +1673,7 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
     schema = meta.schema
     for rowid, raw in db._table_btree(meta).scan():
         existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if not _would_conflict(schema, existing, new_row):
+        if not _would_conflict(schema, existing, new_row, db):
             continue
         updated = dict(existing)
         for col_name, val in assignments.items():

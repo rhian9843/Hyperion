@@ -12,6 +12,7 @@
 - [x] Fix `SELECT id AS uid FROM t` — the column parser treats `AS` and `uid` as additional column names instead of recognising the alias; columns list becomes `['id', 'AS', 'uid']`
 - [x] Fix `DROP INDEX IF EXISTS idx_name` — parser puts `IF` as the index name instead of skipping the `IF EXISTS` guard
 - [x] Fix VARCHAR(n) silent truncation — inserting a value longer than the column size silently truncates instead of raising an error
+- [x] Fix `CREATE UNIQUE INDEX` not enforcing uniqueness on INSERT/UPDATE — `CREATE UNIQUE INDEX idx ON t(col)` creates the index but duplicate values are silently accepted; only `col UNIQUE` column constraints and multi-column `UNIQUE(a,b)` constraints are checked today
 
 ## Performance
 

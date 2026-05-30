@@ -810,7 +810,7 @@ def _parse_create_view(t: list[str], i: int, or_replace: bool) -> dict:
             "if_not_exists": if_not_exists, "or_replace": or_replace}
 
 
-def _parse_create_index(t: list[str], i: int) -> dict:
+def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
     if_not_exists = False
     if i < len(t) and t[i].upper() == "IF":
         if i + 2 < len(t) and t[i+1].upper() == "NOT" and t[i+2].upper() == "EXISTS":
@@ -841,7 +841,8 @@ def _parse_create_index(t: list[str], i: int) -> dict:
     if not cols:
         raise ParseError("Expected at least one column in index")
     return {"op": "CREATE_INDEX", "idx_name": idx_name,
-            "table": table, "cols": cols, "if_not_exists": if_not_exists}
+            "table": table, "cols": cols, "if_not_exists": if_not_exists,
+            "unique": unique}
 
 
 def _parse_create_trigger(t: list[str], i: int) -> dict:
@@ -943,7 +944,7 @@ def _parse_create(t: list[str]) -> dict:
     if sub == "INDEX":
         return _parse_create_index(t, 2)
     if sub == "UNIQUE" and len(t) > 2 and t[2].upper() == "INDEX":
-        return _parse_create_index(t, 3)
+        return _parse_create_index(t, 3, unique=True)
     if sub == "TRIGGER":
         return _parse_create_trigger(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
