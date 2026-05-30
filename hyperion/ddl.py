@@ -7,7 +7,7 @@ from .errors import (NoSuchTableError, NoSuchColumnError, NoSuchIndexError,
 from .schema import Schema, Column, ForeignKey, serialize_row, deserialize_row
 from .btree import BTree
 from .catalog import TableMeta, IndexMeta, TriggerMeta
-from .encoding import _encode_composite_key, _make_index_key, _IDX_KEY_SZ
+from .encoding import _encode_composite_key, _make_index_key, _idx_key_sz
 from .expr import eval_expr, is_expr
 from .constants import TEXT
 
@@ -48,8 +48,9 @@ class DDLMixin:
         to_drop = [n for n, m in self._catalog.indexes.items()
                    if m.table_name == name]
         for n in to_drop:
-            for pn in self._collect_tree_pages(self._catalog.indexes[n].root_page,
-                                               key_sz=_IDX_KEY_SZ):
+            idx = self._catalog.indexes[n]
+            for pn in self._collect_tree_pages(idx.root_page,
+                                               key_sz=_idx_key_sz(len(idx.columns))):
                 self._free_page(pn)
             del self._catalog.indexes[n]
         del self._catalog.tables[name]
@@ -137,7 +138,7 @@ class DDLMixin:
                        for col in idx.columns):
                 continue
             old_idx_pages.extend(self._collect_tree_pages(idx.root_page,
-                                                          key_sz=_IDX_KEY_SZ))
+                                                          key_sz=_idx_key_sz(len(idx.columns))))
             idx_root = self._alloc_page()
             BTree.init_root_leaf(self._pager, idx_root)
             idx.root_page = idx_root
@@ -202,7 +203,8 @@ class DDLMixin:
     def drop_index(self, idx_name: str) -> None:
         if idx_name not in self._catalog.indexes:
             raise NoSuchIndexError(f"Index '{idx_name}' does not exist")
-        for pn in self._collect_tree_pages(self._catalog.indexes[idx_name].root_page,
-                                           key_sz=_IDX_KEY_SZ):
+        idx = self._catalog.indexes[idx_name]
+        for pn in self._collect_tree_pages(idx.root_page,
+                                           key_sz=_idx_key_sz(len(idx.columns))):
             self._free_page(pn)
         del self._catalog.indexes[idx_name]

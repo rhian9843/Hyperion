@@ -13,7 +13,7 @@ from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
 from .catalog import Catalog, TableMeta, IndexMeta
 from .pager import Pager, MemoryPager
-from .encoding import _IDX_KEY_SZ
+from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
 from .ddl import DDLMixin
 from .dml import DMLMixin
@@ -665,7 +665,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
     def _index_btree(self, idx: IndexMeta) -> BTree:
         return BTree(self._pager, idx.root_page, 8, self._make_idx_alloc(idx),
-                     key_sz=_IDX_KEY_SZ)
+                     key_sz=_idx_key_sz(len(idx.columns)))
 
     def _make_alloc(self, meta: TableMeta) -> Callable[[], int]:
         def alloc() -> int:
