@@ -233,16 +233,157 @@
 ## Phase 1.5 — CLI & Developer Experience
 
 - [x] Run `.sql` files from the CLI
-- [x] REST API / HTTP server mode — `python -m hyperion --http --port 8080 mydb.hdb`; no external dependencies (built on `http.server`); full feature parity with the embedded API:
-  - `POST /query` — execute single or multi-statement SQL with optional `params` (positional `?` or named `:name`); returns `{rows, rowcount, lastrowid, description}`
-  - `GET /tables` — list all tables
-  - `GET /tables/{name}` — schema for a specific table (columns, types, constraints)
-  - `GET /indexes` — list all indexes
-  - `POST /vacuum` — compact the database file
-  - `POST /analyze` — collect optimizer statistics
-  - `GET /health` — server status and database info
-  - Typed JSON error responses matching the `HyperionError` hierarchy — `{error_type, message}`
-  - CORS headers so browser clients and notebooks can query directly — `python -m hyperion mydb.hdb script.sql` executes all statements in the file against the database and prints any SELECT results; useful for schema migrations, seeding, and scripted setup without writing Python
+- [x] REST API / HTTP server mode — `python -m hyperion http mydb.hdb --port 8080`; full feature parity with the embedded API
+
+### Transactions
+
+- [ ] `SELECT FOR UPDATE` — row-level locking within a transaction; `SELECT * FROM t WHERE id = 1 FOR UPDATE` acquires an exclusive lock on matched rows, blocking concurrent writers until `COMMIT` or `ROLLBACK`; required for safe read-modify-write patterns
+- [ ] Transaction isolation levels — `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ|SERIALIZABLE`; current engine uses a readers-writer lock but exposes no user-visible isolation level; `SHOW TRANSACTIONS` lists active transactions with their isolation level and start time
+
+### Network
+
+- [ ] MySQL wire protocol server — `python -m hyperion mysql mydb.hdb --port 4406`; implements the MySQL client/server protocol so any MySQL-compatible client connects without a Hyperion-specific driver:
+  - Server greeting / capability handshake — send server version string and capability flags; accept unauthenticated or password-bypass connections (`--skip-ssl`, empty password)
+  - `COM_QUERY` — receive SQL string, execute against the database, return column-definition packets + row data packets + EOF/OK packet
+  - `COM_PING` — respond with OK packet (keepalive)
+  - `COM_QUIT` — close connection cleanly
+  - Result set encoding — column count packet, one `ColumnDefinition41` packet per column (name, type, flags), one text-protocol row packet per result row, `EOF` to terminate
+  - Error packet — `ERR_Packet` with SQL state and typed message on any exception
+  - `COM_INIT_DB` — handle `USE database` command sent by MySQL clients on connection or schema switch
+  - Compatible clients: `mysql` CLI (`mysql -h 127.0.0.1 -P 4406 -u root --skip-ssl`), `mysql-connector-python`, `PyMySQL`, SQLAlchemy MySQL dialect
+- [ ] Web Dashboard — browser UI served at `GET /` by the HTTP server; shows database stats, table list, schema browser, and an interactive SQL query editor; no external JS dependencies (single self-contained HTML page)
+- [ ] DSN connection strings — `hyperion://host:port/dbname` format parsed by a `connect(dsn=...)` helper; standard format for ORMs and connection pool libraries
+- [ ] Server-side connection pooling — configurable pool size and max queue depth on the TCP server; reuses cursors across requests rather than spawning a new thread per connection; `SHOW PROCESSLIST` lists active connections with current query, user, and elapsed time
+
+### Analytics — Column Store
+
+- [ ] `CREATE COLUMN TABLE` — alternative storage layout where each column is stored as a contiguous array rather than row-by-row; enables vectorised `SUM/AVG/COUNT/MIN/MAX` scans that skip irrelevant columns entirely
+- [ ] Columnar aggregate scans — when the query touches only a subset of columns and the table is a column table, scan only those column arrays; `GROUP BY` fallback to row-store path when needed
+- [ ] `SHOW STORAGE FORMAT` — introspection command returning `ROW` or `COLUMN` for each table
+
+### Replication
+
+- [ ] Logical replication — `CREATE PUBLICATION pub FOR TABLE t1, t2` on the primary; `CREATE SUBSCRIPTION sub CONNECTION '...' PUBLICATION pub` on the replica; changes are streamed as an append-only change log and applied on the subscriber
+- [ ] Physical replication — binary-level WAL streaming from primary to replica with auto-sync every 500ms; auto-reconnect on connection loss; replica runs in read-only mode (any write raises `ReadOnlyError`); `SHOW MASTER STATUS`, `SHOW SLAVE STATUS`, `SHOW BINLOG`, `START SLAVE`, `STOP SLAVE`; replica can be promoted to primary on failure
+
+### Row-Level Security
+
+- [ ] `ENABLE ROW LEVEL SECURITY` / `DISABLE ROW LEVEL SECURITY` per table — when enabled, all queries against the table are filtered by active policies; superuser-level connections bypass RLS
+- [ ] `CREATE POLICY name ON table USING (expr)` — defines a filter expression applied transparently to every `SELECT`, `UPDATE`, and `DELETE` on the table; multiple policies are OR-combined
+- [ ] `CURRENT_USER_ID()` scalar function — returns the active user identity set via `db.set_user(id)`; used inside policy expressions for per-tenant row filtering
+
+### Event Scheduler
+
+- [ ] `CREATE EVENT name ON SCHEDULE EVERY n SECOND|MINUTE|HOUR|DAY DO sql` — registers a background job that fires on the given interval; event definitions persist in the catalog
+- [ ] `CREATE EVENT name ON SCHEDULE AT timestamp DO sql` — one-shot event fires once at the given datetime then auto-drops
+- [ ] `SHOW EVENTS` / `DROP EVENT` — list and remove scheduled events
+- [ ] `ALTER EVENT name ENABLE|DISABLE` — pause or resume a scheduled event without dropping it
+- [ ] Background event loop — a daemon thread in `Database` checks due events and executes them; honors the readers-writer lock so events never corrupt concurrent queries
+
+### Functions — Missing
+
+- [ ] Regex functions — `REGEXP_REPLACE(str, pattern, replacement)`, `REGEXP_EXTRACT(str, pattern)`, `REGEXP` / `RLIKE` infix operators for pattern matching in `WHERE` clauses; backed by Python `re` module; no external dependency
+- [ ] Date manipulation functions — `NOW()` (alias for `CURRENT_TIMESTAMP`), `DATEDIFF(date1, date2)` returns days between two dates, `DATE_ADD(date, INTERVAL n UNIT)` / `DATE_SUB(date, INTERVAL n UNIT)` for date arithmetic, `DATE_FORMAT(date, format)` for strftime-style formatting; MySQL-compatible signatures
+- [ ] `TIME` standalone data type — `HH:MM:SS` storage separate from `DATE` and `DATETIME`; already have `CURRENT_TIME` scalar but no `TIME` column type
+
+### Introspection — Missing
+
+- [ ] `EXPLAIN ANALYZE` — runs the query and annotates the execution plan with actual row counts, loop iterations, and elapsed time per node; complements `EXPLAIN` (estimated plan) and `EXPLAIN QUERY PLAN` (textual plan) with real execution statistics
+- [ ] `SHOW RECOVERY STATUS` — reports the current WAL state: last committed LSN, whether a recovery replay occurred on startup, WAL file size, and checkpoint timestamp; useful for diagnosing crash recovery
+- [ ] `SHOW MATERIALIZED VIEWS` — lists all materialized views with their name, defining query, last refresh timestamp, and row count; complements `SHOW TABLES` and `INFORMATION_SCHEMA`
+- [ ] `SHOW LOGICAL LOG` — display the last N entries from the logical replication change log; shows table name, operation (INSERT/UPDATE/DELETE), and column values; useful for debugging replication lag
+
+### Adaptive Query Optimizer
+
+- [ ] Automatic query rewriting — simplify trivially true/false conditions before planning (`WHERE 1=1` → strip, `WHERE 1=0` → empty scan); normalize redundant `AND`/`OR` combinations; rewrite `WHERE col IN (SELECT ...)` to an equivalent JOIN when the subquery is non-correlated and the planner estimates the join path is cheaper
+- [ ] `EXPLAIN REWRITTEN` — show the query as it looks after the rewriter has transformed it, before the planner runs; lets developers see exactly what optimizations were applied and verify the rewriter is not changing query semantics
+- [ ] Access statistics tracking — record per-table and per-index scan counts, hit rates, and last-used timestamps in the catalog; updated on every query execution
+- [ ] `SHOW INDEX SUGGESTIONS` — analyse access statistics and current schema to recommend missing indexes; output lists candidate columns, estimated selectivity, and projected query speedup
+- [ ] `SHOW QUERY STATS` — per-table query frequency and column filter counts
+- [ ] `SHOW PROFILES` / `PROFILE ON|OFF` — per-query execution timing; `SHOW PROFILE FOR QUERY n` shows breakdown for a specific query
+- [ ] Hash JOIN and Merge JOIN strategies — planner selects `NESTED_LOOP` for small tables, `HASH_JOIN` for large unsorted inputs, `MERGE_JOIN` when both sides are index-ordered; current engine only does nested loop
+- [ ] Query result cache — LRU cache of recent `SELECT` results with a configurable TTL; cache key is the normalised SQL + params; invalidated on any write to a referenced table; `SHOW CACHE STATUS`, `SET CACHE ON|OFF`
+- [ ] Parallel query execution — split table scans and aggregations across multiple CPU threads on the same machine; `SET MAX_PARALLEL_WORKERS n` controls thread count; `SET PARALLEL_THRESHOLD n` sets minimum row count before parallelism kicks in; `/*+ PARALLEL(N) */` query hint forces a specific degree; `SHOW PARALLEL STATUS`; planner chooses parallel path automatically for large scans
+
+### DDL — Advanced Schema
+
+- [ ] Schemas / namespaces — `CREATE SCHEMA s`, `DROP SCHEMA s`, `USE s`; tables qualified as `schema.table`; default schema is `public`; required for multi-tenant isolation at the schema level
+- [ ] Materialized views — `CREATE MATERIALIZED VIEW name AS SELECT ...`; result is physically stored and queryable like a table; `REFRESH MATERIALIZED VIEW name` re-executes the query and replaces stored rows; `DROP MATERIALIZED VIEW`
+- [ ] Stored procedures — `CREATE PROCEDURE name(params) BEGIN ... END`; `CALL name(args)`; `DROP PROCEDURE`; body supports local variables, `IF/ELSE`, `LOOP/LEAVE`, and `CURSOR` declarations for row-by-row processing; `SHOW PROCEDURES`
+- [ ] Named prepared statements — SQL-level `PREPARE stmt FROM 'SELECT ... WHERE id = ?'`; `EXECUTE stmt USING val`; `DEALLOCATE PREPARE stmt`; complements the existing Python-level `?` binding with a session-scoped statement handle
+- [ ] Table partitioning — `CREATE TABLE t (...) PARTITION BY RANGE|LIST|HASH (col)`; rows routed to the correct partition on insert; queries with matching predicates scan only relevant partitions; `SHOW PARTITIONS`; `DROP PARTITION`
+- [ ] Table inheritance — `CREATE TABLE child INHERITS (parent)`; child inherits all parent columns; `SELECT * FROM parent` includes child rows; `SELECT * FROM ONLY parent` excludes them; `SHOW INHERITANCE`
+
+### Security — User Management
+
+- [ ] `CREATE USER 'name' IDENTIFIED BY 'password'` / `DROP USER` / `SHOW USERS` — per-user identity stored in the catalog; passwords hashed (SHA-256)
+- [ ] `GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON table TO user` / `REVOKE` / `SHOW GRANTS FOR user` — table-level privilege enforcement; any operation by a user without the required privilege raises `AuthorizationError`
+
+### Concurrency
+
+- [ ] `LOCK TABLE t READ|WRITE` / `UNLOCK TABLES` / `SHOW LOCKS` — explicit advisory table locks; `READ` allows concurrent reads, blocks writes; `WRITE` blocks all other access; complements the existing RWLock with user-visible locking
+- [ ] Buffer pool manager — configurable LRU page cache with dirty-page tracking and write-behind flushing; `SET BUFFER_POOL_SIZE n` (in MB); `SHOW BUFFER POOL STATUS` returns hit rate, dirty page count, eviction count; `FLUSH BUFFER POOL` forces all dirty pages to disk; reduces I/O under read-heavy workloads by keeping hot pages in memory
+
+### Operational
+
+- [ ] `BACKUP DATABASE TO 'file.sql'` / `BACKUP TABLE t TO 'file.sql'` — SQL-dump backup with schema + data; header includes timestamp and version metadata; complements `iterdump()` with a CLI-accessible SQL command
+- [ ] `RESTORE DATABASE FROM 'file.sql'` — replay a backup file against the current database; drops existing tables that conflict before recreating
+- [ ] `LOAD DATA INFILE 'path' INTO TABLE t SEPARATOR ',' SKIP HEADER` — bulk CSV import with auto-separator detection (comma, semicolon, tab) and quoted-field handling
+- [ ] `SELECT * FROM t INTO OUTFILE 'path' SEPARATOR ','` — export query results to CSV
+- [ ] `LISTEN channel` / `NOTIFY channel, 'payload'` / `UNLISTEN channel` — lightweight pub/sub messaging between connections; notifications delivered to all listeners on the named channel; `SHOW LISTEN` lists active subscriptions; useful for cache invalidation and real-time agent coordination
+- [ ] `BENCHMARK 'SELECT ...' [n]` — run a statement n times and report total and per-iteration timing; useful for regression testing query performance
+- [ ] `SHOW VARIABLES` — list all configurable runtime settings and their current values
+- [ ] `INFORMATION_SCHEMA.TABLES` and `INFORMATION_SCHEMA.COLUMNS` virtual tables — standard SQL information schema views; `INFORMATION_SCHEMA.TABLES` returns `(TABLE_NAME, TABLE_ROWS, TABLE_TYPE)`; `INFORMATION_SCHEMA.COLUMNS` returns `(TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY)`
+- [ ] `DESCRIBE table` / `SHOW CREATE TABLE table` — MySQL-compatible aliases for schema introspection; `DESCRIBE` returns column name, type, nullable, key, default; `SHOW CREATE TABLE` returns the full `CREATE TABLE` statement that would recreate the table
+- [ ] `SHOW TABLES` / `SHOW DATABASES` / `SHOW SCHEMAS` — MySQL-compatible aliases for listing objects; currently requires `SELECT name FROM _hyperion_master` or the Python API
+
+### GPU / MPS Acceleration
+
+- [ ] Hardware detection at startup — probe for CUDA (NVIDIA), MPS (Apple Silicon), and ROCm (AMD) availability using optional libraries (`cupy`, `torch`, `mlx`); if none present, silently fall back to CPU; expose detected backend via `SHOW VARIABLES` (`gpu_backend = cuda|mps|rocm|none`)
+- [ ] GPU-accelerated column store scans — when a query targets a `COLUMN TABLE`, transfer column arrays to GPU memory and execute `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` as massively parallel reductions; fall back to CPU path for row-store tables or when GPU unavailable
+- [ ] GPU-accelerated aggregations — `GROUP BY` aggregations on large row-store tables offloaded to GPU when table exceeds `gpu_threshold` rows (configurable via `SET GPU_THRESHOLD n`); GPU builds hash-grouped partial aggregates, CPU merges
+- [ ] GPU-accelerated hash joins — when both sides of a join exceed `gpu_threshold`, build the hash table on GPU memory and probe in parallel; orders of magnitude faster than CPU nested-loop for large equijoins
+- [ ] GPU-accelerated sorting — `ORDER BY` on large result sets offloaded to GPU parallel sort (bitonic sort / radix sort); CPU sort retained for small results where GPU transfer overhead exceeds compute savings
+- [ ] MPS backend (Apple Silicon) — uses `mlx` or `torch` MPS device; zero-copy transfers via unified memory on M-series chips where CPU and GPU share the same physical RAM; automatic selection when running on macOS with Apple Silicon
+- [ ] `SHOW GPU STATUS` — report backend name, device name, total VRAM, used VRAM, current `gpu_threshold`, and whether GPU is actively being used
+- [ ] Phase 2 bridge — GPU backend reused for vector similarity operators (`<->`, `<=>`, `<#>`) and HNSW index construction/search in Phase 2; scoped here so the acceleration layer is in place before vector workloads arrive
+
+### Spatial
+
+- [ ] `POINT(lat, lng)` column type — stores a 2D geographic coordinate as two REAL values
+- [ ] `ST_DISTANCE(p1, p2)` — Haversine distance in km between two POINT values
+- [ ] `ST_WITHIN(point, center, radius_km)` — returns true if point is within radius of center; enables geo-radius queries without full table scans
+- [ ] `ST_X(point)` / `ST_Y(point)` — extract latitude / longitude from a POINT value
+- [ ] `ST_ASTEXT(point)` — return WKT string representation `POINT(lat lng)`
+- [ ] `CREATE SPATIAL INDEX idx ON t(col)` — index on a POINT column to accelerate `ST_WITHIN` queries
+
+## Phase 1.75 — C Extension Hot Path
+
+> **Goal** — keep 95% of the codebase in Python; rewrite only the innermost loop functions that appear at the top of a profiler trace as a thin C extension (`_hyperion_core.so`). Users still `pip install hyperion` — the extension compiles on install via `setup.py`. No new runtime dependencies.
+
+### Profiling & Baseline
+
+- [ ] Establish benchmark suite — scripts that measure row encode/decode throughput, B-tree lookup latency, bulk insert speed, and full table scan speed at 100k / 1M / 10M rows; results recorded as baseline before any C work begins
+- [ ] Profile-guided targeting — run the benchmark suite under `cProfile` / `py-spy` to confirm which functions dominate; only rewrite functions that account for >10% of total query time
+
+### C Extension — Core Functions
+
+- [ ] `encode_row(row_dict, schema) → bytes` — pack a Python dict into the fixed-width binary row format; replaces the pure-Python implementation in `encoding.py`; called on every INSERT and UPDATE
+- [ ] `decode_row(buf, schema) → dict` — unpack raw page bytes back into a Python dict; replaces the pure-Python deserialisation path; called on every row read during scans and lookups
+- [ ] `btree_compare_keys(a: bytes, b: bytes) → int` — low-level byte-level key comparison used in every B-tree traversal; eliminates per-comparison Python overhead in the innermost search loop
+- [ ] `btree_search_page(page_bytes, key: bytes) → int` — binary search within a single 4KB B-tree page; returns the cell offset of the matching or nearest key; replaces the Python loop in `btree.py`
+- [ ] `page_checksum(page_bytes) → int` — CRC-32 computation for page integrity; currently calls Python `struct` and `zlib`; a C version eliminates interpreter overhead on every page read and write
+
+### Build & Integration
+
+- [ ] `setup.py` / `pyproject.toml` C extension target — defines the `_hyperion_core` extension module with optional build; if a C compiler is unavailable, falls back to pure-Python implementations transparently with a warning
+- [ ] Pure-Python fallback shim — each C function has a Python equivalent behind a `try: from _hyperion_core import X` / `except ImportError: X = _python_X` guard; the rest of the codebase calls the name, never the module directly
+- [ ] CI build matrix — compile and test the extension on Linux (gcc), macOS (clang / Apple Silicon), and Windows (MSVC) via GitHub Actions; pure-Python fallback tested in the same matrix
+
+### Validation
+
+- [ ] Correctness test suite — run the full existing test suite against the C extension build; any divergence from pure-Python results is a bug in the C code, not an acceptable trade-off
+- [ ] Benchmark regression gate — re-run the baseline benchmark suite after each C function is introduced; document speedup per function; flag any function where the C version is slower than Python (likely a marshalling overhead issue)
 
 ## Phase 2
 
