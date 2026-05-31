@@ -141,13 +141,48 @@ def repl(db: Database) -> None:
                 print(f"Error: {e}")
 
 
+def _strip_comments(sql: str) -> str:
+    """Remove -- line comments from SQL text."""
+    lines = []
+    for line in sql.splitlines():
+        idx = line.find("--")
+        lines.append(line[:idx] if idx != -1 else line)
+    return "\n".join(lines)
+
+
+def run_sql_file(db: Database, path: str) -> None:
+    """Execute every statement in a .sql file and print SELECT results."""
+    try:
+        sql = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error reading '{path}': {e}", file=sys.stderr)
+        sys.exit(1)
+    sql = _strip_comments(sql)
+    for part in _split_statements(sql):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result = execute(parse(part), db)
+            if isinstance(result, RowResult) and result.rows:
+                print(_format_rows(result.rows, result.columns))
+        except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python -m hyperion <database_file>")
+        print("Usage: python -m hyperion <database_file> [script.sql]")
         sys.exit(1)
     db = Database(sys.argv[1])
     try:
-        repl(db)
+        if len(sys.argv) >= 3:
+            run_sql_file(db, sys.argv[2])
+            if db.in_transaction:
+                db.commit()
+        else:
+            repl(db)
     finally:
         db.close()
 
