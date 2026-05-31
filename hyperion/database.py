@@ -142,6 +142,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
 
+    def _exec_stmt_with_ctes(self, stmt: dict, ctes: dict) -> list[dict]:
+        from .executor import _rows_for_stmt
+        return _rows_for_stmt(stmt, self, ctes)
+
     # ── Read-only toggle ──────────────────────────────────────────────────────
 
     @property

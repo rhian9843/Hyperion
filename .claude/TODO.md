@@ -242,6 +242,8 @@
 - [x] Fix `SUM/MIN/MAX/AVG` of cross-table expressions in GROUP BY — `SUM(p.price * o.quantity)` returned NULL because aggregation used dict key lookup instead of `eval_expr` for expression arguments
 - [x] Fix `UPDATE SET col = 'string-with-hyphen'` — string literal `'555-0001'` evaluated as arithmetic `555-1=554`; parser now preserves quotes on string literals in SET assignments so `eval_expr` correctly identifies them as strings
 - [x] Fix `ALTER TABLE ADD COLUMN ... DEFAULT value` — default value not applied to existing rows; parser never parsed the DEFAULT clause in ADD COLUMN; fixed by parsing DEFAULT token and passing value through `_rewrite_table`
+- [x] Fix chained CTEs — second CTE referencing first CTE in a WHERE IN subquery raised `No such table`; root cause: `_exec_subquery` in `where.py` called `db.select()` directly without any CTE context; fixed by threading `_active_ctes` onto the db object in `_rows_for_stmt` so subquery executors in `where.py` can resolve CTE names
+- [x] Fix `WITH RECURSIVE` without explicit column aliases — `WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n<5)` raised `Unknown column: 'n'`; recursive step output kept key `"n + 1"` instead of `"n"` because `_apply_aliases` only fires when column aliases are declared in the CTE name (e.g. `cnt(n)`); fixed by normalising recursive step output columns to match base case column names
 
 ### Transactions
 

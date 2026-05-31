@@ -429,11 +429,20 @@ def _exec_recursive_cte(cte_def: dict, db: "Database", ctes: dict) -> list[dict]
     union_all = cte_def.get("union_all", True)
 
     working = [_apply_aliases(r) for r in _rows_for_stmt(cte_def["base"], db, ctes)]
+    # Derive canonical column names from base case (used when no explicit col aliases)
+    base_keys: list[str] = list(working[0].keys()) if working else []
     for row in working:
         k = _row_key(row)
         if union_all or k not in seen:
             accumulated.append(row)
             seen.append(k)
+
+    def _normalize_to_base(row: dict) -> dict:
+        """Rename recursive step output columns to match base case column names."""
+        if col_aliases or not base_keys:
+            return row
+        vals = list(row.values())
+        return {base_keys[i]: vals[i] for i in range(min(len(base_keys), len(vals)))}
 
     max_iterations = 1000
     for _ in range(max_iterations):
@@ -441,7 +450,7 @@ def _exec_recursive_cte(cte_def: dict, db: "Database", ctes: dict) -> list[dict]
             break
         step_ctes = {**ctes, cte_key: {"op": "INLINE_ROWS", "rows": working}}
         raw = _rows_for_stmt(cte_def["recursive"], db, step_ctes)
-        working = [_apply_aliases(r) for r in raw]
+        working = [_normalize_to_base(_apply_aliases(r)) for r in raw]
         new_rows: list[dict] = []
         for row in working:
             k = _row_key(row)
@@ -746,7 +755,19 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     _tls.user_aggs  = db._user_aggs
     _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
-    op = stmt["op"]
+    _prev_active_ctes = getattr(db, '_active_ctes', None)
+    if ctes:
+        db._active_ctes = {**(_prev_active_ctes or {}), **ctes}
+    try:
+        return _rows_for_stmt_inner(stmt, db, ctes, op=stmt["op"])
+    finally:
+        if _prev_active_ctes is None:
+            db.__dict__.pop('_active_ctes', None)
+        else:
+            db._active_ctes = _prev_active_ctes
+
+
+def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> list[dict]:
     if op == "INLINE_ROWS":
         return stmt["rows"]
     if op == "RECURSIVE_CTE":
@@ -891,6 +912,9 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
     """
     _check_timeout(db)
     merged_ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
+    if merged_ctes:
+        _prev = getattr(db, '_active_ctes', None)
+        db._active_ctes = {**(_prev or {}), **merged_ctes}
     op = stmt.get("op", "")
 
     if op == "SELECT" and not stmt.get("subquery_from"):

@@ -313,6 +313,9 @@ def _exec_subquery(stmt: "dict | None", db: Any) -> list[dict]:
     """Execute an already-instantiated subquery AST (no correlated substitution)."""
     if stmt is None or db is None:
         return []
+    ctes = getattr(db, '_active_ctes', None) or {}
+    if ctes:
+        return db._exec_stmt_with_ctes(stmt, ctes)
     op = stmt["op"]
     where = stmt.get("where")
     if op == "SELECT":
@@ -343,8 +346,12 @@ def _exec_correlated_subquery(stmt: "dict | None", db: Any,
     """
     if stmt is None or db is None:
         return []
-    op = stmt["op"]
+    ctes = getattr(db, '_active_ctes', None) or {}
     inst_where = _instantiate_correlated(stmt.get("where"), outer_row)
+    inst_stmt = {**stmt, "where": inst_where}
+    if ctes:
+        return db._exec_stmt_with_ctes(inst_stmt, ctes)
+    op = stmt["op"]
     if op == "SELECT":
         return db.select(stmt["table"], stmt["columns"], inst_where,
                          stmt.get("order_by"), stmt.get("limit"),
