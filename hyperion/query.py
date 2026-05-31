@@ -50,23 +50,24 @@ def _project_row(row: dict, columns: list[str]) -> dict:
             if bare in row:
                 result[col] = row[bare]
             else:
-                # scan for any key whose bare name matches
                 matches = [v for k, v in row.items() if k.split(".")[-1] == bare]
                 if matches:
                     result[col] = matches[0]
-                elif is_expr(col):
-                    result[col] = eval_expr(col, row)
                 else:
-                    raise NoSuchColumnError(f"Unknown column: '{col}'")
+                    try:
+                        result[col] = eval_expr(col, row)
+                    except Exception:
+                        raise NoSuchColumnError(f"Unknown column: '{col}'")
         else:
-            # bare col → try table-qualified scan before treating as expr
+            # bare col → try table-qualified scan, then evaluate as expression/literal
             matches = [v for k, v in row.items() if k.split(".")[-1] == col]
             if matches:
                 result[col] = matches[0]
-            elif is_expr(col):
-                result[col] = eval_expr(col, row)
             else:
-                raise NoSuchColumnError(f"Unknown column: '{col}'")
+                try:
+                    result[col] = eval_expr(col, row)
+                except Exception:
+                    raise NoSuchColumnError(f"Unknown column: '{col}'")
     return result
 
 
@@ -213,8 +214,15 @@ class QueryMixin:
                     agg_obj.step(v)
                 result[col] = agg_obj.finalize()
             else:
-                vals = [r[arg] for r in bucket_rows
-                        if r.get(arg) is not None and arg in r]
+                def _agg_val(r: dict, a: str):
+                    if a in r:
+                        return r[a]
+                    try:
+                        return eval_expr(a, r)
+                    except Exception:
+                        return None
+                vals = [v for r in bucket_rows
+                        if (v := _agg_val(r, arg)) is not None]
                 if distinct:
                     vals = list(dict.fromkeys(vals))
                 if not vals:
@@ -334,8 +342,16 @@ class QueryMixin:
             use_inlj = False
             lcol = rcol = None
         else:
-            lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
-            rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
+            raw_left  = on_left.split(".")[-1]   # type: ignore[union-attr]
+            raw_right = on_right.split(".")[-1]  # type: ignore[union-attr]
+            # Resolve which bare column belongs to which side by checking alias prefix.
+            # ON may be written as "right_alias.col = left_alias.col" — detect the swap.
+            left_prefix  = on_left.split(".")[0]  if "." in on_left  else ""  # type: ignore
+            on_left_is_right = left_prefix in (ra, right_table)
+            if on_left_is_right:
+                lcol, rcol = raw_right, raw_left   # swapped: on_left refers to right table
+            else:
+                lcol, rcol = raw_left, raw_right
             use_inlj = (join_type in ("INNER", "LEFT", "LEFT OUTER")
                         and find_eq_index(self, right_table, rcol) is not None)
 

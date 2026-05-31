@@ -1,5 +1,11 @@
 # Hyperion — Work Backlog
 
+## Bugs — Phase 1.5
+
+- [x] Fix `INSERT INTO t SELECT ..., literal, ... FROM ...` — literal constants in SELECT list treated as column names instead of values; fixed by routing through `eval_expr` in `_project_row`
+- [x] Fix JOIN ON column side resolution — `ON right_alias.col = left_alias.col` resolved incorrectly when right table's column appeared on the left side of `=`; fixed by checking alias prefix to determine which side each column belongs to
+- [x] Fix `SUM/MIN/MAX/AVG` of cross-table expressions in GROUP BY — `SUM(p.price * o.quantity)` returned NULL because aggregation used dict key lookup instead of `eval_expr` for expression arguments — literal constants in the SELECT list of an INSERT INTO SELECT are treated as column names instead of values; `INSERT INTO t SELECT x, 99 FROM src` raises `NoSuchColumnError: Unknown column: '99'`; fix by evaluating SELECT list items through `eval_expr` rather than treating them as raw column name strings
+
 ## Bugs (silent wrong behaviour)
 
 - [x] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
