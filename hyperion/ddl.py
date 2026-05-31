@@ -174,7 +174,11 @@ class DDLMixin:
         meta.schema    = new_schema
         new_tree = self._table_btree(meta)
         for rowid, old_row in saved:
-            new_row = {c.name: old_row.get(c.name) for c in new_schema.columns}
+            new_row = {
+                c.name: old_row[c.name] if c.name in old_row
+                else (c.default if c.default is not None else None)
+                for c in new_schema.columns
+            }
             if cast_map:
                 for cname, fn in cast_map.items():
                     if cname in new_row and new_row[cname] is not None:

@@ -975,13 +975,26 @@ def _parse_alter(t: list[str]) -> dict:
         col_type, col_size = _parse_col_type(t[6])
         i = 7
         nullable = True
-        if i < len(t) and t[i].upper() == "NOT":
-            if i + 1 < len(t) and t[i + 1].upper() == "NULL":
-                nullable = False
+        default = None
+        while i < len(t):
+            kw = t[i].upper()
+            if kw == "NOT" and i + 1 < len(t) and t[i + 1].upper() == "NULL":
+                nullable = False; i += 2
+            elif kw == "DEFAULT" and i + 1 < len(t):
+                raw = t[i + 1]
+                default = _unquote_token(raw)
+                try:
+                    default = int(default)
+                except (ValueError, TypeError):
+                    try:
+                        default = float(default)
+                    except (ValueError, TypeError):
+                        pass
+                i += 2
             else:
-                raise ParseError("Expected NULL after NOT")
+                break
         return {"op": "ALTER_ADD_COLUMN", "table": table,
-                "col": Column(col_name, col_type, col_size, nullable)}
+                "col": Column(col_name, col_type, col_size, nullable, default=default)}
     if sub == "DROP":
         if len(t) < 6 or t[4].upper() != "COLUMN":
             raise ParseError("Expected: DROP COLUMN <name>")
@@ -1435,7 +1448,10 @@ def _parse_update(t: list[str]) -> dict:
         token = t[i]
         if "=" in token:
             col, val = token.split("=", 1)
-            assignments[col] = _unquote_token(val); i += 1
+            # Preserve quotes on string literals so eval_expr can distinguish
+            # '555-0001' (string) from 555-0001 (arithmetic).
+            assignments[col] = val if val.startswith("'") else _unquote_token(val)
+            i += 1
         elif i + 2 < len(t) and t[i + 1] == "=":
             col_name = t[i]; i += 2
             val_toks: list[str] = []
@@ -1444,8 +1460,11 @@ def _parse_update(t: list[str]) -> dict:
                    and t[i] != ","):
                 val_toks.append(t[i]); i += 1
             val_raw = " ".join(val_toks)
-            assignments[col_name] = (_unquote_token(val_toks[0])
-                                     if len(val_toks) == 1 else val_raw)
+            if len(val_toks) == 1:
+                raw = val_toks[0]
+                assignments[col_name] = raw if raw.startswith("'") else _unquote_token(raw)
+            else:
+                assignments[col_name] = val_raw
         else:
             raise ParseError(f"Expected col=val near '{token}'")
     where, pos = _parse_where(t, i)

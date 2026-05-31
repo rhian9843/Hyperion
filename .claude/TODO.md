@@ -1,11 +1,5 @@
 # Hyperion — Work Backlog
 
-## Bugs — Phase 1.5
-
-- [x] Fix `INSERT INTO t SELECT ..., literal, ... FROM ...` — literal constants in SELECT list treated as column names instead of values; fixed by routing through `eval_expr` in `_project_row`
-- [x] Fix JOIN ON column side resolution — `ON right_alias.col = left_alias.col` resolved incorrectly when right table's column appeared on the left side of `=`; fixed by checking alias prefix to determine which side each column belongs to
-- [x] Fix `SUM/MIN/MAX/AVG` of cross-table expressions in GROUP BY — `SUM(p.price * o.quantity)` returned NULL because aggregation used dict key lookup instead of `eval_expr` for expression arguments — literal constants in the SELECT list of an INSERT INTO SELECT are treated as column names instead of values; `INSERT INTO t SELECT x, 99 FROM src` raises `NoSuchColumnError: Unknown column: '99'`; fix by evaluating SELECT list items through `eval_expr` rather than treating them as raw column name strings
-
 ## Bugs (silent wrong behaviour)
 
 - [x] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
@@ -240,6 +234,14 @@
 
 - [x] Run `.sql` files from the CLI
 - [x] REST API / HTTP server mode — `python -m hyperion http mydb.hdb --port 8080`; full feature parity with the embedded API
+
+### Bugs Fixed in Phase 1.5
+
+- [x] Fix `INSERT INTO t SELECT ..., literal, ... FROM ...` — literal constants in SELECT list treated as column names instead of values; fixed by routing through `eval_expr` in `_project_row`
+- [x] Fix JOIN ON column side resolution — `ON right_alias.col = left_alias.col` resolved incorrectly when right table's column appeared on the left side of `=`; fixed by checking alias prefix to determine which side each column belongs to
+- [x] Fix `SUM/MIN/MAX/AVG` of cross-table expressions in GROUP BY — `SUM(p.price * o.quantity)` returned NULL because aggregation used dict key lookup instead of `eval_expr` for expression arguments
+- [x] Fix `UPDATE SET col = 'string-with-hyphen'` — string literal `'555-0001'` evaluated as arithmetic `555-1=554`; parser now preserves quotes on string literals in SET assignments so `eval_expr` correctly identifies them as strings
+- [x] Fix `ALTER TABLE ADD COLUMN ... DEFAULT value` — default value not applied to existing rows; parser never parsed the DEFAULT clause in ADD COLUMN; fixed by parsing DEFAULT token and passing value through `_rewrite_table`
 
 ### Transactions
 
