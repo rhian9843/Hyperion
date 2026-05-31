@@ -232,7 +232,17 @@
 
 ## Phase 1.5 — CLI & Developer Experience
 
-- [x] Run `.sql` files from the CLI — `python -m hyperion mydb.hdb script.sql` executes all statements in the file against the database and prints any SELECT results; useful for schema migrations, seeding, and scripted setup without writing Python
+- [x] Run `.sql` files from the CLI
+- [x] REST API / HTTP server mode — `python -m hyperion --http --port 8080 mydb.hdb`; no external dependencies (built on `http.server`); full feature parity with the embedded API:
+  - `POST /query` — execute single or multi-statement SQL with optional `params` (positional `?` or named `:name`); returns `{rows, rowcount, lastrowid, description}`
+  - `GET /tables` — list all tables
+  - `GET /tables/{name}` — schema for a specific table (columns, types, constraints)
+  - `GET /indexes` — list all indexes
+  - `POST /vacuum` — compact the database file
+  - `POST /analyze` — collect optimizer statistics
+  - `GET /health` — server status and database info
+  - Typed JSON error responses matching the `HyperionError` hierarchy — `{error_type, message}`
+  - CORS headers so browser clients and notebooks can query directly — `python -m hyperion mydb.hdb script.sql` executes all statements in the file against the database and prints any SELECT results; useful for schema migrations, seeding, and scripted setup without writing Python
 
 ## Phase 2
 

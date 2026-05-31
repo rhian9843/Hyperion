@@ -144,6 +144,7 @@ from .errors import (
 from .executor import execute, _execute_inner, _rows_for_stmt, _format_rows, QueryTimeoutError, ReadOnlyError, TooManyRowsError, RowResult
 from .async_db import AsyncDatabase, AsyncCursor
 from .server import Server
+from .http_server import HTTPServerMode
 from .client import connect
 from .optimizer import estimate_rows, find_eq_index, probe_index, optimize_join, get_ndv
 from .triggers import (fire_triggers, has_triggers, has_instead_of,
