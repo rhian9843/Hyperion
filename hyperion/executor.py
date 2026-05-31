@@ -1786,17 +1786,31 @@ def _cell_str(v: Any) -> str:
     return "NULL" if v is None else str(v)
 
 
-def _format_rows(rows: list[dict], requested_cols: list[str] | None) -> str:
+def _format_rows(rows: list[dict], requested_cols: list[str] | None, *, fancy: bool = False) -> str:
     if not rows:
         return "(no rows)"
     cols   = requested_cols if requested_cols else list(rows[0].keys())
     widths = {c: max(len(c), max(len(_cell_str(r.get(c))) for r in rows))
               for c in cols}
+    n = len(rows)
+
+    if fancy:
+        def _pad(val: str, w: int) -> str:
+            return val.ljust(w)
+        top   = "┌" + "┬".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┐"
+        hdr   = "│" + "│".join(f" {c.ljust(widths[c])} " for c in cols) + "│"
+        mid   = "├" + "┼".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┤"
+        rows_ = [
+            "│" + "│".join(f" {_pad(_cell_str(r.get(c)), widths[c])} " for c in cols) + "│"
+            for r in rows
+        ]
+        bot   = "└" + "┴".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┘"
+        return "\n".join([top, hdr, mid, *rows_, bot, f"({n} row{'s' if n != 1 else ''})"])
+
     header = " | ".join(c.ljust(widths[c]) for c in cols)
     sep    = "-+-".join("-" * widths[c] for c in cols)
     body   = "\n".join(
         " | ".join(_cell_str(r.get(c)).ljust(widths[c]) for c in cols)
         for r in rows
     )
-    n = len(rows)
     return f"{header}\n{sep}\n{body}\n({n} row{'s' if n != 1 else ''})"

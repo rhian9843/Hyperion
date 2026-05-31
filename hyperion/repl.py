@@ -102,11 +102,39 @@ def _split_statements(text: str) -> list[str]:
     return stmts
 
 
+_BANNER = """\
+╔══════════════════════════════════════════════╗
+║            Hyperion Database                 ║
+║   Type '.help' for commands, '.exit' to quit ║
+╚══════════════════════════════════════════════╝"""
+
+_HELP = """\
+Commands:
+  .tables           List all tables
+  .indexes          List all indexes
+  .schema <table>   Show table definition
+  .exit / .quit     Exit the REPL
+
+Separate multiple statements with ;"""
+
+
+def _print_result(result, /, *, fancy: bool = False) -> None:
+    """Print the result of a single statement."""
+    if isinstance(result, RowResult):
+        print(_format_rows(result.rows, result.columns, fancy=fancy))
+    elif result is not None:
+        print(result)
+
+
 def repl(db: Database) -> None:
+    _tty = sys.stdout.isatty()
+    if _tty:
+        print(_BANNER)
+        print()
     buf: list[str] = []
     while True:
         try:
-            text = input("H > " if not buf else "... ").strip()
+            text = input("hyperion> " if not buf else "       -> ").strip()
         except KeyboardInterrupt:
             print()
             buf = []
@@ -116,17 +144,22 @@ def repl(db: Database) -> None:
             break
         if not text:
             if buf:
-                buf = []   # empty line abandons incomplete buffer
+                buf = []
             continue
         if text.startswith("."):
             if buf:
                 buf = []
+            if text.lower() in (".help", ".h"):
+                print(_HELP)
+                continue
             if handle_meta(text, db) is None:
+                if _tty:
+                    print("Bye.")
                 break
             continue
         buf.append(text)
         if _needs_continuation(text):
-            continue     # show "... " prompt for next line
+            continue
         combined = " ".join(buf)
         buf = []
         for part in _split_statements(combined):
@@ -135,8 +168,7 @@ def repl(db: Database) -> None:
                 continue
             try:
                 result = execute(parse(part), db)
-                print(_format_rows(result.rows, result.columns)
-                      if isinstance(result, RowResult) else result)
+                _print_result(result, fancy=_tty)
             except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
                 print(f"Error: {e}")
 
