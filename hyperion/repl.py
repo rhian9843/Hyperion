@@ -78,24 +78,54 @@ def _needs_continuation(sql: str) -> bool:
 
 
 def _split_statements(text: str) -> list[str]:
-    """Split SQL text on ';' outside string literals."""
+    """Split SQL text on ';' outside string literals and BEGIN...END blocks."""
     stmts: list[str] = []
     buf: list[str] = []
     in_str = False
+    begin_depth = 0
     i = 0
-    while i < len(text):
+    n = len(text)
+    while i < n:
         ch = text[i]
         if ch == "'" and not in_str:
             in_str = True; buf.append(ch)
         elif ch == "'" and in_str:
             buf.append(ch)
-            if i + 1 < len(text) and text[i + 1] == "'":
+            if i + 1 < n and text[i + 1] == "'":
                 buf.append(text[i + 1]); i += 2; continue
             in_str = False
         elif ch == ";" and not in_str:
-            stmts.append("".join(buf)); buf = []
+            if begin_depth == 0:
+                stmts.append("".join(buf)); buf = []
+            else:
+                buf.append(ch)
         else:
             buf.append(ch)
+            if not in_str:
+                # Check for BEGIN / END keyword boundaries
+                joined = "".join(buf)
+                upper = joined.upper()
+                # A keyword ends at the current position and is preceded by
+                # a non-word character (or start of text).
+                def _is_keyword_end(word: str) -> bool:
+                    wl = len(word)
+                    if not upper.endswith(word):
+                        return False
+                    pos = len(upper) - wl - 1
+                    if pos >= 0 and (upper[pos].isalnum() or upper[pos] == '_'):
+                        return False
+                    nxt = i + 1
+                    if nxt < n and (text[nxt].isalnum() or text[nxt] == '_'):
+                        return False
+                    return True
+                if _is_keyword_end("BEGIN"):
+                    # BEGIN TRANSACTION or BEGIN; → SQL transaction, not a block
+                    rest = text[i + 1:].lstrip()
+                    if (not rest.upper().startswith("TRANSACTION")
+                            and not rest.startswith(";")):
+                        begin_depth += 1
+                elif _is_keyword_end("END") and begin_depth > 0:
+                    begin_depth -= 1
         i += 1
     if buf:
         stmts.append("".join(buf))

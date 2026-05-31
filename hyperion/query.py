@@ -21,6 +21,11 @@ _AGG_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NESTED_AGG_RE = re.compile(
+    r'\b(COUNT|MIN|MAX|SUM|AVG)\s*\(\s*(DISTINCT\s+)?([^()]+?)\s*\)',
+    re.IGNORECASE,
+)
+
 _USER_AGG_CALL_RE = re.compile(
     r'^(\w+)\(\s*(DISTINCT\s+)?(.+?)\s*\)$', re.IGNORECASE
 )
@@ -181,6 +186,9 @@ class QueryMixin:
                 continue
             agg = _parse_agg(col)
             if agg is None:
+                # Defer columns containing nested aggregates to the second pass
+                if _NESTED_AGG_RE.search(col):
+                    continue
                 result[col] = bucket_rows[0].get(col) if bucket_rows else None
                 continue
             func, arg, distinct = agg
@@ -231,6 +239,51 @@ class QueryMixin:
                 elif func == "MAX":  result[col] = max(vals)
                 elif func == "SUM":  result[col] = sum(vals)
                 elif func == "AVG":  result[col] = sum(vals) / len(vals)
+
+        # Second pass: evaluate wrapper expressions containing nested aggregates
+        # e.g. COALESCE(SUM(col), 0), ROUND(AVG(col), 2)
+        for col in columns:
+            if col in result:
+                continue
+            if not _NESTED_AGG_RE.search(col):
+                continue
+            def _agg_val2(r: dict, a: str):
+                if a in r:
+                    return r[a]
+                if "." in a:
+                    bare = a.split(".")[-1]
+                    if bare in r:
+                        return r[bare]
+                    matches = [v for k, v in r.items() if k.split(".")[-1] == bare]
+                    if matches:
+                        return matches[0]
+                try:
+                    v = eval_expr(a, r)
+                    return None if (isinstance(v, str) and v == a) else v
+                except Exception:
+                    return None
+            def _replace_agg(m: re.Match) -> str:
+                func2 = m.group(1).upper()
+                arg2  = m.group(3).strip()
+                raw2 = [v for r in bucket_rows
+                        if (v := _agg_val2(r, arg2)) is not None]
+                try:
+                    vals2 = [float(v) for v in raw2]
+                except (TypeError, ValueError):
+                    vals2 = raw2
+                if func2 == "COUNT": v2 = len(bucket_rows) if arg2 == "*" else len(vals2)
+                elif func2 == "SUM": v2 = sum(vals2) if vals2 else None
+                elif func2 == "MIN": v2 = min(vals2) if vals2 else None
+                elif func2 == "MAX": v2 = max(vals2) if vals2 else None
+                elif func2 == "AVG": v2 = sum(vals2) / len(vals2) if vals2 else None
+                else: v2 = None
+                return "NULL" if v2 is None else repr(v2)
+            expanded = _NESTED_AGG_RE.sub(_replace_agg, col)
+            try:
+                result[col] = eval_expr(expanded, {})
+            except Exception:
+                result[col] = None
+
         return result
 
     def _aggregate_select(self, meta, columns: list[str],
