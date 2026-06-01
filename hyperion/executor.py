@@ -1234,15 +1234,23 @@ def _exec_instead_of_insert(stmt: dict, db: Database) -> str:
             raise SchemaError(
                 f"Cannot determine columns for INSERT on view '{tname}' "
                 f"— specify column names explicitly")
+    _IIOT_CONST = frozenset({"TRUE", "FALSE", "CURRENT_TIMESTAMP",
+                              "CURRENT_DATE", "CURRENT_TIME"})
     count = 0
     for values in stmt["rows"]:
         if len(col_names) != len(values):
             raise DataError(
                 f"Column/value mismatch: {len(col_names)} columns, {len(values)} values")
-        parsed: dict[str, Any] = {
-            n: (None if v.upper() == "NULL" else v)
-            for n, v in zip(col_names, values)
-        }
+        parsed: dict[str, Any] = {}
+        for n, v in zip(col_names, values):
+            if v.upper() == "NULL":
+                parsed[n] = None
+            elif _is_single_string_literal(v):
+                parsed[n] = v[1:-1].replace("''", "'")
+            elif " " in v or v.upper() in _IIOT_CONST or "(" in v:
+                parsed[n] = eval_expr(v, {})
+            else:
+                parsed[n] = v
         fire_triggers(db, tname, "INSTEAD OF", "INSERT", parsed, None)
         count += 1
     return f"{count} row{'s' if count != 1 else ''} inserted."
@@ -1472,6 +1480,10 @@ def _execute_inner(stmt: dict, db: Database) -> str:
             return _exec_instead_of_insert(stmt, db)
         meta            = db._meta(stmt["table"])
         col_names       = stmt["col_names"] or [c.name for c in meta.schema.columns]
+        for _cn in (stmt["col_names"] or []):
+            _cm = next((c for c in meta.schema.columns if c.name == _cn), None)
+            if _cm and _cm.is_generated:
+                raise ConstraintError(f"Cannot assign to generated column '{_cn}'")
         conflict_action = stmt.get("conflict_action")
         on_conflict_set = stmt.get("on_conflict_set") or {}
         returning_cols  = stmt.get("returning")

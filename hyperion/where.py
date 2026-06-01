@@ -33,6 +33,7 @@ class WhereClause:
     subquery_ast: "dict | None"        = None
     group_clause: "WhereClause | None" = None  # set when op == "GROUP"
     row_cols:     "list[str] | None"   = None  # multi-column (a,b) IN / = / !=
+    collate:      "str | None"         = None  # COLLATE NOCASE etc.
     _subq_cache:  dict = field(default_factory=dict, init=False,
                                repr=False, compare=False)
 
@@ -149,8 +150,14 @@ class WhereClause:
             except (ValueError, TypeError):
                 return False
         match self.op:
-            case "=":    return cell == val
-            case "!=":   return cell != val
+            case "=":
+                if self.collate == "NOCASE" and isinstance(cell, str) and isinstance(val, str):
+                    return cell.casefold() == val.casefold()
+                return cell == val
+            case "!=":
+                if self.collate == "NOCASE" and isinstance(cell, str) and isinstance(val, str):
+                    return cell.casefold() != val.casefold()
+                return cell != val
             case "<":    return cell < val
             case ">":    return cell > val
             case "<=":   return cell <= val
@@ -293,6 +300,7 @@ def _instantiate_correlated(where: "WhereClause | None",
         col=new_col, op=new_op, val=new_val,
         subquery_ast=where.subquery_ast,
         row_cols=where.row_cols,
+        collate=where.collate,
         group_clause=_instantiate_correlated(where.group_clause, outer_row),
         and_clause=_instantiate_correlated(where.and_clause, outer_row),
         or_clause=_instantiate_correlated(where.or_clause, outer_row),

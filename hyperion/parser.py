@@ -351,7 +351,13 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             raise ParseError("Expected escape character after ESCAPE")
         esc = _unquote_token(tokens[pos + 4])
         return WhereClause(col=col, op="LIKE", val=val + "\x00" + esc), pos + 5
-    return WhereClause(col=col, op=op, val=val), pos + 3
+    advance = 3
+    collate: str | None = None
+    if pos + 3 < len(tokens) and tokens[pos + 3].upper() == "COLLATE":
+        if pos + 4 < len(tokens):
+            collate = tokens[pos + 4].upper()
+            advance = 5
+    return WhereClause(col=col, op=op, val=val, collate=collate), pos + advance
 
 
 _ROW_CMP_OPS = frozenset({"IN", "NOT", "=", "!=", "<", ">", "<=", ">="})
