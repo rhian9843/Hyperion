@@ -1574,6 +1574,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
         rows = db.delete(stmt["table"], None)
         n = len(rows)
         _invalidate_rc(db, stmt["table"])
+        db._meta(stmt["table"]).next_key = 1
         return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
 
     if op == "UPDATE":
