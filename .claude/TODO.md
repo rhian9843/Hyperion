@@ -315,9 +315,9 @@
 
 #### Priority 3 — Performance
 
-- [ ] Optimize catalog ops flush — `ops_to_bytes()` serializes metadata for **all** tables on every commit regardless of which tables were touched; with 100 tables a single INSERT takes 3.8× longer than with 1 table; fix by tracking a dirty flag per `TableMeta`/`IndexMeta` and only serializing changed entries; or limit `ops_to_bytes()` to the single table touched by the current transaction
-- [ ] Fix plan cache eviction from FIFO to LRU — when the 512-entry cache is full, `cursor.py` evicts `oldest = next(iter(cache))` (insertion-order, not access-order); a workload with 513+ distinct query templates (common in AI/LLM applications) thrashes the cache and effectively disables it; fix by using `collections.OrderedDict` and calling `move_to_end(sql)` on cache hit before returning the cached plan
-- [ ] Add test: plan cache with 513 distinct query templates — verify that the 512nd+1 template evicts the least-recently-used entry, not the first-inserted one; verify the most-recently-used template is never evicted while less-used ones exist
+- [x] Optimize catalog ops flush — `ops_to_bytes()` serializes metadata for **all** tables on every commit regardless of which tables were touched; with 100 tables a single INSERT takes 3.8× longer than with 1 table; fix by tracking a dirty flag per `TableMeta`/`IndexMeta` and only serializing changed entries; or limit `ops_to_bytes()` to the single table touched by the current transaction
+- [x] Fix plan cache eviction from FIFO to LRU — when the 512-entry cache is full, `cursor.py` evicts `oldest = next(iter(cache))` (insertion-order, not access-order); a workload with 513+ distinct query templates (common in AI/LLM applications) thrashes the cache and effectively disables it; fix by using `collections.OrderedDict` and calling `move_to_end(sql)` on cache hit before returning the cached plan
+- [x] Add test: plan cache with 513 distinct query templates — verify that the 512nd+1 template evicts the least-recently-used entry, not the first-inserted one; verify the most-recently-used template is never evicted while less-used ones exist
 
 #### Priority 4 — Code Quality & Latent Bugs
 
