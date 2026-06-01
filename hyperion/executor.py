@@ -119,6 +119,22 @@ from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
 from .where import _instantiate_correlated
 
+_DEFAULT_CONST_EXPRS = frozenset({
+    "TRUE", "FALSE", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"
+})
+
+def _eval_default(val: Any) -> Any:
+    """Evaluate a column default value, resolving SQL constants at insert time."""
+    if not isinstance(val, str):
+        return val
+    if val.upper() in _DEFAULT_CONST_EXPRS or "(" in val or " " in val:
+        try:
+            return eval_expr(val, {})
+        except Exception:
+            pass
+    return val
+
+
 def _is_single_string_literal(val: str) -> bool:
     """True iff val is exactly one single-quoted SQL string (not a concat expression)."""
     if not (val.startswith("'") and val.endswith("'") and len(val) >= 2):
@@ -1482,7 +1498,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                     parsed[name] = val
             for col in meta.schema.columns:
                 if col.name not in parsed:
-                    parsed[col.name] = col.default
+                    parsed[col.name] = _eval_default(col.default)
             if _has_ins_trig:
                 fire_triggers(db, stmt["table"], "BEFORE", "INSERT", parsed, None)
             if conflict_action == "IGNORE":
@@ -1555,7 +1571,7 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                             for i in range(min(len(target_cols), len(src_vals)))}
             for col in meta.schema.columns:
                 if col.name not in data:
-                    data[col.name] = col.default
+                    data[col.name] = _eval_default(col.default)
             if _has_ins_trig2:
                 fire_triggers(db, stmt["table"], "BEFORE", "INSERT", data, None)
             row_out = db.insert(stmt["table"], data)

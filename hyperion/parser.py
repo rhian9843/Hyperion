@@ -1540,6 +1540,12 @@ def _parse_update(t: list[str]) -> dict:
         else:
             raise ParseError(f"Expected col=val near '{token}'")
     where, pos = _parse_where(t, i)
+    if pos < len(t) and t[pos].upper() == "ORDER":
+        pos += 1  # skip ORDER
+        if pos < len(t) and t[pos].upper() == "BY":
+            pos += 1  # skip BY
+        while pos < len(t) and t[pos].upper() not in ("LIMIT", "RETURNING"):
+            pos += 1  # skip sort column(s)
     limit_u: int | None = None
     if pos < len(t) and t[pos].upper() == "LIMIT":
         pos += 1
@@ -1564,6 +1570,12 @@ def _parse_delete(t: list[str]) -> dict:
     if len(t) < 3 or t[1].upper() != "FROM":
         raise ParseError("Expected: DELETE FROM <table> [WHERE ...]")
     where, pos = _parse_where(t, 3)
+    if pos < len(t) and t[pos].upper() == "ORDER":
+        pos += 1  # skip ORDER
+        if pos < len(t) and t[pos].upper() == "BY":
+            pos += 1  # skip BY
+        while pos < len(t) and t[pos].upper() not in ("LIMIT", "RETURNING"):
+            pos += 1  # skip sort column(s)
     limit_d: int | None = None
     if pos < len(t) and t[pos].upper() == "LIMIT":
         pos += 1
