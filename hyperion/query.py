@@ -17,7 +17,7 @@ from .optimizer import find_eq_index, probe_index as _probe_index
 
 _AGG_RE = re.compile(
     r"^(COUNT|MIN|MAX|SUM|AVG|GROUP_CONCAT|STRING_AGG)"
-    r"\(\s*(DISTINCT\s+)?(.+?)\s*\)$",
+    r"\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$",
     re.IGNORECASE,
 )
 
@@ -356,9 +356,17 @@ class QueryMixin:
             if where and not where.evaluate(row, self):
                 continue
             all_rows.append(row)
+        def _gb_val(c: str, r: dict) -> Any:
+            if c in r:
+                return r[c]
+            try:
+                return eval_expr(c, r)
+            except Exception:
+                return None
+
         buckets: dict[tuple, list[dict]] = {}
         for row in all_rows:
-            key = tuple(row.get(c) for c in group_by)
+            key = tuple(_gb_val(c, row) for c in group_by)
             if key not in buckets:
                 buckets[key] = []
             buckets[key].append(row)

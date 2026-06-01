@@ -105,6 +105,8 @@ def _parse_col_type(token: str) -> tuple[str, int]:
         return TEXT, 10
     if u in ("DATETIME", "TIMESTAMP"):
         return TEXT, 26
+    if u == "TIME":
+        return TEXT, 8
     # Binary types
     if u in (BLOB, "BYTES", "BINARY", "VARBINARY"):
         return BLOB, DEFAULT_TEXT_SIZE

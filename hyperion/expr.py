@@ -270,6 +270,8 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
     if fname in ("UPPER", "LOWER", "LENGTH", "TRIM", "LTRIM", "RTRIM"):
         if not args or args[0] is None:
             return None
+        if fname == "LENGTH" and isinstance(args[0], (bytes, bytearray)):
+            return len(args[0])
         s = str(args[0])
         if fname == "UPPER":   return s.upper()
         if fname == "LOWER":   return s.lower()
