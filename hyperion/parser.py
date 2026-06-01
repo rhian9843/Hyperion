@@ -1308,6 +1308,8 @@ def _parse_select(t: list[str]) -> dict:
                                     "on_left": None, "on_right": None, "on_clause": None})
         else:
             nxt_tbl = t[i]; i += 1
+            if nxt_tbl.upper() in _TABLE_VALUED_FUNCS:
+                nxt_tbl, i = _collect_func_call(t, nxt_tbl, i)
             nxt_alias, i = _parse_table_alias(t, i, nxt_tbl)
             from_tables.append((nxt_tbl, nxt_alias))
     if len(from_tables) > 1 or extra_implicit:

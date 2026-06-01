@@ -138,6 +138,18 @@ def _json_merge_patch(target: Any, patch: Any) -> Any:
     return result
 
 
+def _maybe_json(v: Any) -> Any:
+    """If v is a string that is already a serialized JSON object or array, parse it
+    so it embeds as a JSON value rather than a quoted string (mirrors SQLite JSONB
+    subtype behaviour for json_object/json_array nesting)."""
+    if isinstance(v, str) and v and v[0] in ('{', '['):
+        try:
+            return json.loads(v)
+        except (json.JSONDecodeError, ValueError):
+            pass
+    return v
+
+
 # ── Scalar function dispatcher ────────────────────────────────────────────────
 
 def eval_json_func(fname: str, args: list[Any]) -> Any:
@@ -178,7 +190,7 @@ def eval_json_func(fname: str, args: list[Any]) -> Any:
         return _json_dump(results)
 
     if upper == "JSON_ARRAY":
-        return _json_dump(list(args))
+        return _json_dump([_maybe_json(a) for a in args])
 
     if upper == "JSON_OBJECT":
         if len(args) % 2 != 0:
@@ -187,7 +199,7 @@ def eval_json_func(fname: str, args: list[Any]) -> Any:
         for i in range(0, len(args), 2):
             if args[i] is None:
                 return None
-            obj[str(args[i])] = args[i + 1]
+            obj[str(args[i])] = _maybe_json(args[i + 1])
         return _json_dump(obj)
 
     if upper in ("JSON_SET", "JSON_INSERT", "JSON_REPLACE"):
@@ -240,15 +252,22 @@ def json_each_rows(json_val: Any, path: str = "$") -> list[dict]:
         return []
     if path != "$":
         obj = _path_get(obj, path)
+    def _cell(val: Any) -> Any:
+        if isinstance(val, (dict, list)):
+            return _json_dump(val)
+        if isinstance(val, bool):
+            return 1 if val else 0
+        return val
+
     rows: list[dict] = []
     if isinstance(obj, list):
         for idx, val in enumerate(obj):
-            atom = val if not isinstance(val, (dict, list)) else None
+            cell = _cell(val)
             rows.append({
                 "key":     idx,
-                "value":   _json_dump(val) if isinstance(val, (dict, list)) else val,
+                "value":   cell,
                 "type":    _json_type_name(val),
-                "atom":    atom,
+                "atom":    cell if not isinstance(val, (dict, list)) else None,
                 "id":      idx,
                 "parent":  None,
                 "fullkey": f"$[{idx}]",
@@ -256,12 +275,12 @@ def json_each_rows(json_val: Any, path: str = "$") -> list[dict]:
             })
     elif isinstance(obj, dict):
         for idx, (key, val) in enumerate(obj.items()):
-            atom = val if not isinstance(val, (dict, list)) else None
+            cell = _cell(val)
             rows.append({
                 "key":     key,
-                "value":   _json_dump(val) if isinstance(val, (dict, list)) else val,
+                "value":   cell,
                 "type":    _json_type_name(val),
-                "atom":    atom,
+                "atom":    cell if not isinstance(val, (dict, list)) else None,
                 "id":      idx,
                 "parent":  None,
                 "fullkey": f"$.{key}",
