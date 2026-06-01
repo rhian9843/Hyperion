@@ -2,6 +2,8 @@
 
 ## Bugs (silent wrong behaviour)
 
+- [x] Fix `CREATE INDEX ON t(expr)` with multi-token expressions — `CREATE INDEX ON users (age / 10)` raised `NoSuchColumnError: Column '10' not found`; the fallback index column parser appended each token individually, splitting `age / 10` into `['age', '/', '10']`; fixed by collecting tokens until `,` or `)` and joining them as a single expression string
+
 - [x] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
 - [x] Fix multi-row INSERT silently dropping extra rows — `VALUES (1,'a'), (2,'b')` only inserts the first tuple with no warning
 - [x] Fix `struct.error` leaking on integer overflow — wrap as user-facing `RuntimeError`

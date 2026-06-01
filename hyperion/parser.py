@@ -835,9 +835,14 @@ def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
             raise ParseError("Expected (<col>) after table name")
         i += 1; cols = []
         while i < len(t) and t[i] != ")":
-            if t[i] != ",":
-                cols.append(t[i])
-            i += 1
+            if t[i] == ",":
+                i += 1; continue
+            col_toks: list[str] = []
+            while i < len(t) and t[i] not in (",", ")"):
+                col_toks.append(t[i]); i += 1
+            col_expr = " ".join(col_toks).strip()
+            if col_expr:
+                cols.append(col_expr)
     if not cols:
         raise ParseError("Expected at least one column in index")
     return {"op": "CREATE_INDEX", "idx_name": idx_name,
