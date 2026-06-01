@@ -57,9 +57,12 @@ Thumbs.db
 *.db
 *.hdb
 *.wal
+database/
 
-# SQL scratch files
+# SQL scratch files and test coverage
 *.sql
+sql/
+.claude/SQL_TEST_COVERAGE.md
 
 # Logs
 *.log
