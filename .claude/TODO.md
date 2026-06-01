@@ -256,6 +256,10 @@
 - [x] Fix `SUM(...) OVER (ORDER BY ...)` returning full-partition total — SQL default frame when ORDER BY present is `ROWS UNBOUNDED PRECEDING TO CURRENT ROW`; code treated missing frame as full-partition; fixed by applying the default cumulative frame when `ob_spec` is non-empty
 - [x] Fix nested `CASE WHEN` returning wrong branch — branch token collector stopped at inner `WHEN`/`ELSE` keywords regardless of nesting depth; `THEN CASE WHEN ...` only collected `['CASE']`; fixed by tracking CASE/END depth in `_collect_case_branch_tokens`
 - [x] Fix `=` operator dropped in `_tokenize_expr` — `_TOK_RE` matched `<=`, `>=`, `!=` but not bare `=`; CASE WHEN conditions like `dept = 'Eng'` tokenized without the operator, making every condition True; fixed by adding bare `=` as a token alternative in the regex
+- [x] Fix `UNION ... ORDER BY` ignored — parser passed `t[right_start:]` (including `ORDER BY`) to the right SELECT parser which consumed it; outer UNION got `order_by: None`; fixed by stripping top-level ORDER BY/LIMIT/OFFSET from the right side and attaching them to the SET_OP node
+- [x] Fix multi-source UNION column name mismatch — `SELECT name ... UNION SELECT customer ...` produced rows with mixed keys (`name` and `customer`); SQL standard requires all rows to use the leftmost SELECT's column names; fixed by remapping right-side rows to left-side keys in `_apply_set_op`
+- [x] Fix function call on WHERE LHS — `WHERE UPPER(name) LIKE '%x%'` raised `Unknown operator: '('`; parser read `UPPER` as the column name and `(` as the operator; fixed by detecting `identifier(` pattern in `_parse_one_condition` and collecting the full function call expression before finding the comparison operator
+- [x] Fix `STRFTIME` / `DATE` / `DATETIME` / `TIME` returning NULL — date functions not implemented in `_eval_func`, falling through to `return None`; added full implementation using Python's `datetime` module with modifier support (`+30 days`, `-1 month`, etc.)
 
 ### Transactions
 

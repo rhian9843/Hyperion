@@ -909,7 +909,8 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
     if op == "SET_OP":
         left  = _rows_for_stmt(stmt["left"],  db, ctes)
         right = _rows_for_stmt(stmt["right"], db, ctes)
-        return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
+        rows  = _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
+        return _apply_order_limit(rows, stmt.get("order_by"), stmt.get("limit"), stmt.get("offset"))
     raise InternalError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
 
 

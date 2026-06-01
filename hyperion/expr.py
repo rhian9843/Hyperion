@@ -392,6 +392,81 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
             return "blob"
         return "text"
 
+    # ── Date / time functions ──────────────────────────────────────────────────
+
+    if fname in ("DATE", "DATETIME", "TIME", "JULIANDAY", "STRFTIME"):
+        from datetime import datetime as _dt, timedelta as _td
+        import re as _re
+
+        def _parse_dt(s: str) -> "_dt | None":
+            if s is None:
+                return None
+            s = str(s).strip()
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d", "%H:%M:%S"):
+                try:
+                    return _dt.strptime(s, fmt)
+                except ValueError:
+                    pass
+            return None
+
+        def _apply_modifier(d: "_dt", mod: str) -> "_dt":
+            mod = mod.strip()
+            m = _re.match(r'^([+-]?\d+)\s+(second|minute|hour|day|month|year)s?$',
+                          mod, _re.IGNORECASE)
+            if not m:
+                return d
+            n, unit = int(m.group(1)), m.group(2).lower()
+            if unit in ("second",): return d + _td(seconds=n)
+            if unit in ("minute",): return d + _td(minutes=n)
+            if unit in ("hour",):   return d + _td(hours=n)
+            if unit in ("day",):    return d + _td(days=n)
+            if unit == "month":
+                month = d.month + n
+                year  = d.year + (month - 1) // 12
+                month = (month - 1) % 12 + 1
+                import calendar as _cal
+                day = min(d.day, _cal.monthrange(year, month)[1])
+                return d.replace(year=year, month=month, day=day)
+            if unit == "year":
+                return d.replace(year=d.year + n)
+            return d
+
+        if not args:
+            return None
+
+        # STRFTIME: first arg is format string, second is date
+        if fname == "STRFTIME":
+            if len(args) < 2:
+                return None
+            fmt_str = str(args[0])
+            base2 = args[1]
+            if isinstance(base2, str) and base2.upper() in ("NOW", "CURRENT_TIMESTAMP"):
+                base2 = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            d2 = _parse_dt(base2)
+            if d2 is None:
+                return None
+            for mod in args[2:]:
+                if mod is not None:
+                    d2 = _apply_modifier(d2, str(mod))
+            return d2.strftime(fmt_str)
+
+        base = args[0]
+        if isinstance(base, str) and base.upper() in ("NOW", "CURRENT_TIMESTAMP"):
+            base = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+        d = _parse_dt(base)
+        if d is None:
+            return None
+        for mod in args[1:]:
+            if mod is not None:
+                d = _apply_modifier(d, str(mod))
+        if fname == "DATE":     return d.strftime("%Y-%m-%d")
+        if fname == "TIME":     return d.strftime("%H:%M:%S")
+        if fname == "DATETIME": return d.strftime("%Y-%m-%d %H:%M:%S")
+        if fname == "JULIANDAY":
+            epoch = _dt(4713, 11, 24)
+            return (d - epoch).days + 0.5
+        return d.strftime("%Y-%m-%d %H:%M:%S")
+
     # ── JSON functions ─────────────────────────────────────────────────────────
 
     if fname.upper().startswith("JSON"):

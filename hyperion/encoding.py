@@ -173,6 +173,17 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
 def _apply_set_op(op: str, all_flag: bool,
                   left: list[dict], right: list[dict]) -> list[dict]:
     """Combine two row-lists with UNION / INTERSECT / EXCEPT semantics."""
+    # SQL standard: output columns come from the leftmost SELECT; normalize
+    # right-side rows to use left-side column names (positional alignment).
+    if left and right:
+        left_keys = list(left[0].keys())
+        right_keys = list(right[0].keys())
+        if left_keys != right_keys:
+            def _remap(row: dict) -> dict:
+                vals = list(row.values())
+                return {left_keys[i]: vals[i] for i in range(min(len(left_keys), len(vals)))}
+            right = [_remap(r) for r in right]
+
     def _key(row: dict) -> tuple:
         return tuple(row.values())
 

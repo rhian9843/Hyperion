@@ -228,6 +228,41 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
         return WhereClause(col=" ".join(expr_parts), op=op,
                            val=_unquote_token(tokens[j + 1])), j + 2
 
+    # Function call or complex expression as LHS: UPPER(name) = val, TRIM(col) LIKE '%x%'
+    # Collect tokens until a comparison op at depth 0
+    _CMP_OPS_SET = frozenset({"=", "!=", "<", ">", "<=", ">=",
+                               "LIKE", "GLOB", "IS", "IN", "NOT", "BETWEEN"})
+    if pos + 1 < len(tokens) and tokens[pos + 1] == "(":
+        j = pos; pd = 0
+        while j < len(tokens):
+            if tokens[j] == "(": pd += 1
+            elif tokens[j] == ")": pd -= 1
+            elif pd == 0 and tokens[j].upper() in _CMP_OPS_SET:
+                break
+            j += 1
+        if j > pos:
+            expr_col = " ".join(tokens[pos:j])
+            if j < len(tokens):
+                cmp_op = tokens[j].upper()
+                if cmp_op == "IS":
+                    if j + 1 < len(tokens) and tokens[j + 1].upper() == "NULL":
+                        return WhereClause(col=expr_col, op="IS NULL", val=""), j + 2
+                    if (j + 2 < len(tokens) and tokens[j + 1].upper() == "NOT"
+                            and tokens[j + 2].upper() == "NULL"):
+                        return WhereClause(col=expr_col, op="IS NOT NULL", val=""), j + 3
+                if cmp_op in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+                    rhs = _unquote_token(tokens[j + 1]) if j + 1 < len(tokens) else ""
+                    return WhereClause(col=expr_col, op=cmp_op, val=rhs), j + 2
+                if cmp_op == "IN":
+                    if j + 1 < len(tokens) and tokens[j + 1] == "(":
+                        inner, new_pos = _extract_paren_tokens(tokens, j + 1)
+                        if inner and inner[0].upper() == "SELECT":
+                            return WhereClause(col=expr_col, op="IN", val="__subquery__",
+                                               subquery_ast=_parse_tokens(inner)), new_pos
+                        return WhereClause(col=expr_col, op="IN",
+                                           val=",".join(_unquote_token(v) for v in inner
+                                                        if v != ",")), new_pos
+
     col = tokens[pos]
 
     # Bare boolean literal: TRUE / FALSE with no following operator
@@ -1544,13 +1579,56 @@ def _parse_tokens(t: list[str]) -> dict:
             set_op = tok.upper()
             all_flag = idx + 1 < len(t) and t[idx + 1].upper() == "ALL"
             right_start = idx + 2 if all_flag else idx + 1
-            return {
-                "op":     "SET_OP",
-                "set_op": set_op,
-                "all":    all_flag,
-                "left":   _parse_tokens(t[:idx]),
-                "right":  _parse_tokens(t[right_start:]),
+            right_toks = t[right_start:]
+            # Strip top-level ORDER BY / LIMIT / OFFSET — they belong to the
+            # SET_OP result, not to the right-hand SELECT
+            order_by: list[dict] = []
+            limit_val: int | None = None
+            offset_val: int | None = None
+            rd = 0
+            suffix_start = len(right_toks)
+            for ri, rtok in enumerate(right_toks):
+                if rtok == "(": rd += 1
+                elif rtok == ")": rd -= 1
+                elif rd == 0 and rtok.upper() in ("ORDER", "LIMIT", "OFFSET"):
+                    suffix_start = ri; break
+            if suffix_start < len(right_toks):
+                suffix = right_toks[suffix_start:]
+                right_toks = right_toks[:suffix_start]
+                # parse suffix for order_by / limit / offset
+                si = 0
+                while si < len(suffix):
+                    kw2 = suffix[si].upper()
+                    if kw2 == "ORDER" and si + 1 < len(suffix) and suffix[si+1].upper() == "BY":
+                        si += 2
+                        while si < len(suffix) and suffix[si].upper() not in ("LIMIT", "OFFSET"):
+                            col = suffix[si]; si += 1
+                            desc = si < len(suffix) and suffix[si].upper() == "DESC"
+                            if desc: si += 1
+                            elif si < len(suffix) and suffix[si].upper() == "ASC": si += 1
+                            order_by.append({"col": col, "desc": desc})
+                            if si < len(suffix) and suffix[si] == ",": si += 1
+                    elif kw2 == "LIMIT" and si + 1 < len(suffix):
+                        si += 1
+                        try: limit_val = int(suffix[si]); si += 1
+                        except ValueError: pass
+                    elif kw2 == "OFFSET" and si + 1 < len(suffix):
+                        si += 1
+                        try: offset_val = int(suffix[si]); si += 1
+                        except ValueError: pass
+                    else:
+                        si += 1
+            node: dict = {
+                "op":       "SET_OP",
+                "set_op":   set_op,
+                "all":      all_flag,
+                "left":     _parse_tokens(t[:idx]),
+                "right":    _parse_tokens(right_toks),
+                "order_by": order_by or None,
+                "limit":    limit_val,
+                "offset":   offset_val,
             }
+            return node
 
     kw = t[0].upper()
 
