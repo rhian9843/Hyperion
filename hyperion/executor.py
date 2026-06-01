@@ -536,8 +536,21 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     on_clause   = join_info.get("on_clause")
     on_left     = join_info.get("on_left")
     on_right    = join_info.get("on_right")
-    rcol        = on_right.split(".")[-1] if on_right else None
     lat_sub     = join_info.get("lateral_subquery")
+
+    # Normalise on_left/on_right so that on_left is always the column from the
+    # LEFT combined rows and on_right is always the column from the RIGHT (new)
+    # table.  The parser sets them by position in the ON "=" expression, which
+    # can place the right-table column on the left side (e.g. ON i.col = o.col
+    # where i is the new right table).
+    if on_left and on_right:
+        left_prefix  = on_left.split(".")[0]  if "." in on_left  else ""
+        right_prefix = on_right.split(".")[0] if "." in on_right else ""
+        # If the on_left prefix matches the right_alias, they need to be swapped.
+        if left_prefix == right_alias and right_prefix != right_alias:
+            on_left, on_right = on_right, on_left
+
+    rcol = on_right.split(".")[-1] if on_right else None
 
     # LATERAL: for each left row, re-execute the subquery with outer context
     if lat_sub is not None:

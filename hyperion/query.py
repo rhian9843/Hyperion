@@ -192,7 +192,17 @@ class QueryMixin:
                 # Defer columns containing nested aggregates to the second pass
                 if _NESTED_AGG_RE.search(col):
                     continue
-                result[col] = bucket_rows[0].get(col) if bucket_rows else None
+                if bucket_rows:
+                    _first = bucket_rows[0]
+                    _v = _first.get(col)
+                    if _v is None and col not in _first:
+                        try:
+                            _v = eval_expr(col, _first)
+                        except Exception:
+                            pass
+                    result[col] = _v
+                else:
+                    result[col] = None
                 continue
             func, arg, distinct = agg
             if func == "COUNT":
@@ -204,7 +214,18 @@ class QueryMixin:
                         vals = list(dict.fromkeys(vals))
                     result[col] = len(vals)
             elif func in ("GROUP_CONCAT", "STRING_AGG"):
-                parts = [p.strip() for p in arg.split(",", 1)]
+                # Extract optional ORDER BY clause before parsing col/sep
+                _gc_order_col: str | None = None
+                _gc_order_desc = False
+                _gc_arg = arg
+                _m_gc_ob = re.search(
+                    r'\bORDER\s+BY\s+(.+?)(?:\s+(ASC|DESC))?\s*$',
+                    arg, re.IGNORECASE)
+                if _m_gc_ob:
+                    _gc_order_col = _m_gc_ob.group(1).strip()
+                    _gc_order_desc = (_m_gc_ob.group(2) or "ASC").upper() == "DESC"
+                    _gc_arg = arg[:_m_gc_ob.start()].rstrip().rstrip(",").rstrip()
+                parts = [p.strip() for p in _gc_arg.split(",", 1)]
                 col_name = parts[0]
                 if len(parts) > 1:
                     sep_raw = parts[1].strip()
@@ -212,8 +233,26 @@ class QueryMixin:
                                             and sep_raw.endswith("'")) else sep_raw
                 else:
                     sep = ","
-                str_vals = [str(r[col_name]) for r in bucket_rows
-                            if col_name in r and r.get(col_name) is not None]
+                _gc_rows = bucket_rows
+                if _gc_order_col:
+                    def _gc_key(r: dict):
+                        v = r.get(_gc_order_col)  # type: ignore[arg-type]
+                        if v is None:
+                            try:
+                                v = eval_expr(_gc_order_col, r)  # type: ignore[arg-type]
+                            except Exception:
+                                pass
+                        return (v is None, v)
+                    _gc_rows = sorted(bucket_rows, key=_gc_key, reverse=_gc_order_desc)
+                def _gc_val(r: dict) -> str | None:
+                    v = r.get(col_name)
+                    if v is None and col_name not in r:
+                        try:
+                            v = eval_expr(col_name, r)
+                        except Exception:
+                            return None
+                    return str(v) if v is not None else None
+                str_vals = [s for r in _gc_rows if (s := _gc_val(r)) is not None]
                 if distinct:
                     str_vals = list(dict.fromkeys(str_vals))
                 result[col] = sep.join(str_vals) if str_vals else None
@@ -361,7 +400,7 @@ class QueryMixin:
             return m
 
         def _project(merged: dict) -> dict:
-            return {c: merged[c] for c in columns if c in merged} if columns else merged
+            return _project_row(merged, columns) if columns else merged
 
         def _emit(merged: dict) -> dict | None:
             if where and not where.evaluate(merged, self):
