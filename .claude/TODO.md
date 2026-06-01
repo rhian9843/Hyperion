@@ -247,6 +247,13 @@
 - [x] Fix trigger body split on `;` — `_split_statements` cut trigger bodies at every `;` inside `BEGIN...END`, leaving `END` as a bare unrecognised statement; fixed by tracking `BEGIN`/`END` depth in the splitter (while excluding `BEGIN TRANSACTION`)
 - [x] Fix `COALESCE(SUM(...), 0)` returning NULL in GROUP BY — `_compute_aggregates` only recognised top-level aggregates; a function wrapped around an aggregate (e.g. `COALESCE(SUM(col), 0)`) was never computed; fixed with a second pass that substitutes inner aggregate results and re-evaluates the outer expression via `eval_expr`
 - [x] Fix trigger `NEW.col` arithmetic — values in `new_row` at trigger fire time are Python strings (e.g. `"3"` not int `3`); `_sql_literal` wrapped them as quoted SQL strings (`'3'`), breaking expressions like `stock - NEW.quantity` with `int - str`; fixed by detecting numeric strings in `_sql_literal` and returning bare number tokens
+- [x] Fix `ON CONFLICT DO UPDATE SET col = col + n` — parser only captured one token for upsert assignments, losing multi-token expressions like `qty + 3`; fixed by reading full token sequence until comma/semicolon
+- [x] Fix `ON CONFLICT DO UPDATE` expression not evaluated — `_apply_on_conflict_update` tried `int(val)` which fails for expressions; fixed by falling back to `eval_expr(val, existing_row)`
+- [x] Fix `_parse_agg` matching window functions as GROUP BY aggregates — `_AGG_RE` matched `SUM(x) OVER (...)` because lazy `.+?` stretched to last `)`; caused JOIN + window function queries to collapse all rows into one; fixed by rejecting columns containing `OVER (`
+- [x] Fix window functions in JOIN queries silently dropped — `has_window` check only existed in SELECT path; JOIN path had no equivalent so LAG/LEAD/SUM OVER etc. were ignored; fixed by adding `has_window_j` detection and `_apply_window_functions` call in the JOIN code path
+- [x] Fix `SUM(...) OVER (ORDER BY ...)` returning full-partition total — SQL default frame when ORDER BY present is `ROWS UNBOUNDED PRECEDING TO CURRENT ROW`; code treated missing frame as full-partition; fixed by applying the default cumulative frame when `ob_spec` is non-empty
+- [x] Fix nested `CASE WHEN` returning wrong branch — branch token collector stopped at inner `WHEN`/`ELSE` keywords regardless of nesting depth; `THEN CASE WHEN ...` only collected `['CASE']`; fixed by tracking CASE/END depth in `_collect_case_branch_tokens`
+- [x] Fix `=` operator dropped in `_tokenize_expr` — `_TOK_RE` matched `<=`, `>=`, `!=` but not bare `=`; CASE WHEN conditions like `dept = 'Eng'` tokenized without the operator, making every condition True; fixed by adding bare `=` as a token alternative in the regex
 
 ### Transactions
 

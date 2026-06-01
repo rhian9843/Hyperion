@@ -33,6 +33,9 @@ _USER_AGG_CALL_RE = re.compile(
 
 def _parse_agg(col: str) -> tuple[str, str, bool] | None:
     """If col is an aggregate call, return (FUNC_UPPER, arg, distinct). Else None."""
+    # Window functions look like AGG(...) OVER (...) — not a GROUP BY aggregate
+    if re.search(r'\bOVER\s*\(', col, re.IGNORECASE):
+        return None
     m = _AGG_RE.match(col)
     if m:
         return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))

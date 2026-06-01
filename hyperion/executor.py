@@ -327,6 +327,11 @@ def _apply_one_window(rows: list[dict], col: str, wf: dict) -> None:
             tcol    = fn_args[0].strip() if fn_args else None
             is_star = not tcol or tcol == "*"
             frame   = wf.get("frame")
+            # SQL default: ORDER BY with no explicit frame → ROWS UNBOUNDED PRECEDING TO CURRENT ROW
+            if frame is None and ob_spec:
+                frame = {"mode": "ROWS",
+                         "lo": ("UNBOUNDED", "PRECEDING"),
+                         "hi": ("CURRENT", "ROW")}
             if frame is not None:
                 # Per-row frame: each row gets its own aggregate over its frame window
                 for pos, idx in enumerate(indices):
@@ -847,14 +852,17 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
         ltbl = s.get("left_table", "")
         rtbl = s.get("right_table", "")
         group_by = s.get("group_by")
+        stmt_cols_j = s.get("columns") or []
         has_agg  = (group_by or (s.get("having") is not None) or any(
-            _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*"))
+            _q_parse_agg(c) for c in stmt_cols_j if c != "*"))
+        has_window_j = any(_WINDOW_RE.search(c) or _WINDOW_NAMED_RE.search(c)
+                           for c in stmt_cols_j if c != "*")
         multi_cond_on = s.get("on_clause") is not None and s.get("on_left") is None
         has_lateral = (rtbl == "__lateral__" or s.get("lateral_subquery") is not None
                        or any(ej.get("lateral_subquery") for ej in (s.get("extra_joins") or [])))
         if (ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views
                 or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl)
-                or has_agg or multi_cond_on or has_lateral):
+                or has_agg or has_window_j or multi_cond_on or has_lateral):
             raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
             raw_rows = _exec_in_memory_join(raw_stmt, db, ctes)
             for ej in (s.get("extra_joins") or []):
@@ -862,6 +870,11 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
             if has_agg:
                 raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
                                               group_by, s.get("having"), db)
+            elif has_window_j:
+                nw_j = stmt.get("named_windows") or {}
+                raw_rows = [_normalize_row(r) for r in raw_rows]
+                raw_rows = _apply_window_functions(raw_rows, stmt_cols_j, nw_j)
+                raw_rows = [_project_row(r, stmt_cols_j) for r in raw_rows] if stmt_cols_j else raw_rows
             elif s.get("columns"):
                 raw_rows = [_project_row(_normalize_row(r), s["columns"]) for r in raw_rows]
             rows = _apply_order_limit(raw_rows, s.get("order_by"), s.get("limit"), s.get("offset"))
@@ -1704,13 +1717,20 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
             else:
                 col_obj = next((c for c in schema.columns if c.name == col_name), None)
                 if col_obj and col_obj.type == INTEGER:
-                    try: updated[col_name] = int(val)
-                    except (ValueError, TypeError): updated[col_name] = val
+                    try:
+                        updated[col_name] = int(val)
+                    except (ValueError, TypeError):
+                        try: updated[col_name] = int(eval_expr(str(val), updated))
+                        except Exception: updated[col_name] = val
                 elif col_obj and col_obj.type == REAL:
-                    try: updated[col_name] = float(val)
-                    except (ValueError, TypeError): updated[col_name] = val
+                    try:
+                        updated[col_name] = float(val)
+                    except (ValueError, TypeError):
+                        try: updated[col_name] = float(eval_expr(str(val), updated))
+                        except Exception: updated[col_name] = val
                 else:
-                    updated[col_name] = val
+                    try: updated[col_name] = eval_expr(str(val), updated)
+                    except Exception: updated[col_name] = val
         db._table_btree(meta).update({rowid: db._pack_row_cell(serialize_row(schema, updated))})
         for im in db._indexes_for(schema.name):
             if not any(c in assignments for c in im.columns):

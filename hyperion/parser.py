@@ -1117,8 +1117,17 @@ def _parse_insert(t: list[str]) -> dict:
                                 i += 1; continue
                             col_n = t[i]
                             if i + 2 < len(t) and t[i + 1] == "=":
-                                on_conflict_set[col_n] = _unquote_token(t[i + 2])
-                                i += 3
+                                i += 2
+                                val_toks: list[str] = []
+                                while (i < len(t) and t[i] not in (";", ",")
+                                       and t[i].upper() != "WHERE"):
+                                    val_toks.append(t[i]); i += 1
+                                val_raw = " ".join(val_toks)
+                                on_conflict_set[col_n] = (
+                                    val_toks[0] if val_toks[0].startswith("'") and len(val_toks) == 1
+                                    else _unquote_token(val_toks[0]) if len(val_toks) == 1
+                                    else val_raw
+                                )
                             elif "=" in t[i]:
                                 parts = t[i].split("=", 1)
                                 on_conflict_set[parts[0]] = _unquote_token(parts[1])
