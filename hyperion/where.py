@@ -229,24 +229,30 @@ class WhereClause:
         rvals_raw = self.val.split("\x1f")
 
         def _coerce(cell: Any, raw: str) -> Any:
-            if cell is None:
+            if raw.upper() == "NULL":
                 return None
-            if isinstance(cell, int):
+            if isinstance(cell, (int, float)) or cell is None:
                 try:
                     return int(raw)
                 except ValueError:
-                    return raw
-            if isinstance(cell, float):
+                    pass
                 try:
                     return float(raw)
                 except ValueError:
-                    return raw
+                    pass
             return raw
 
         rvals = tuple(_coerce(lvals[i], rvals_raw[i]) for i in range(len(lvals)))
         match op:
-            case "=":  return lvals == rvals
-            case "!=": return lvals != rvals
+            case "=":
+                # NULL in either operand → UNKNOWN → False
+                if any(v is None for v in lvals) or any(v is None for v in rvals):
+                    return False
+                return lvals == rvals
+            case "!=":
+                if any(v is None for v in lvals) or any(v is None for v in rvals):
+                    return False
+                return lvals != rvals
             case "<":  return lvals < rvals  # type: ignore[operator]
             case ">":  return lvals > rvals  # type: ignore[operator]
             case "<=": return lvals <= rvals  # type: ignore[operator]

@@ -723,7 +723,9 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
 
     def _right_rows_for(lr: dict) -> list[dict]:
         if _lat_sub is not None:
-            inst = {**_lat_sub, "where": _instantiate_correlated(_lat_sub.get("where"), lr)}
+            inst = {**_lat_sub,
+                    "where": _instantiate_correlated(_lat_sub.get("where"), lr),
+                    "_outer_row": lr}
             return _rows_for_stmt(inst, db, ctes)
         if not _rtbl_is_tvf:
             return right_rows_static  # type: ignore[return-value]
@@ -808,7 +810,8 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
         return _exec_recursive_cte(stmt, db, ctes)
     if op == "SELECT_NOFROM":
         col_aliases = stmt.get("col_aliases") or {}
-        result = {col: eval_expr(col, {}) for col in (stmt.get("columns") or [])}
+        outer = stmt.get("_outer_row") or {}
+        result = {col: eval_expr(col, outer) for col in (stmt.get("columns") or [])}
         return [{col_aliases.get(k, k): v for k, v in result.items()}]
     if op == "SELECT":
         s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))

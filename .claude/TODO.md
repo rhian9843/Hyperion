@@ -292,6 +292,8 @@
 - [x] Fix `PRAGMA foreign_keys` (read, no value) returning a plain string instead of a fetchable RowResult — executor returned `f"foreign_keys = {val}"` string; fixed by returning `RowResult([{"foreign_keys": val}], ["foreign_keys"])` to match SQLite behaviour
 - [x] Fix `PRAGMA table_info(missing_table)` raising `NoSuchTableError` — SQLite returns 0 rows for unknown tables; fixed by returning an empty `RowResult` with the correct column list instead of raising
 - [x] Fix `col NOT LIKE pattern` raising `ParseError` — `_parse_one_condition` only handled `NOT IN` and `NOT BETWEEN`; added `NOT LIKE` and `NOT GLOB` (with ESCAPE support) by wrapping a LIKE/GLOB clause in a NOT group node
+- [x] Fix LATERAL subquery column expressions not resolving outer row references — `SELECT_NOFROM` evaluated columns with `eval_expr(col, {})` (empty dict); LATERAL subquery passed outer row to `_instantiate_correlated` for WHERE but not for SELECT columns; fixed by storing `_outer_row` on the instantiated subquery AST and using it in `SELECT_NOFROM` evaluation
+- [x] Fix `(a, b) = (v1, v2)` row comparison with NULLs returning wrong results — `_coerce` copied `None` from the cell to the target value, so `(NULL, 10) == (1, 10)` became `(None, 10) == (None, 10)` → True; fixed by coercing the raw value independently of cell type; added explicit NULL-in-either-operand → False guard for `=` and `!=` operators
 
 ### Transactions
 
