@@ -289,6 +289,9 @@
 - [x] Fix `json_array(json_object(...))` double-encoding nested JSON — `json_array` passed args directly to `json.dumps`, which encoded already-serialized JSON strings as quoted strings; added `_maybe_json` helper that pre-parses string args starting with `{` or `[`; applied to both `json_array` and `json_object` value args to match SQLite JSONB subtype nesting behaviour
 - [x] Fix `json_each` returning Python `True`/`False` for JSON booleans — `json_each_rows` stored raw Python bools in `value`/`atom`; SQLite returns `1`/`0`; fixed by converting bools to integers in `_cell` helper inside `json_each_rows`
 - [x] Fix `json_each(fn(...))` in comma-join FROM not recognised — parser called `_collect_func_call` for the primary table but not for subsequent comma-joined tables; `json_each` was parsed as a bare table name; fixed by adding the same `_TABLE_VALUED_FUNCS` check in the comma-join loop
+- [x] Fix `PRAGMA foreign_keys` (read, no value) returning a plain string instead of a fetchable RowResult — executor returned `f"foreign_keys = {val}"` string; fixed by returning `RowResult([{"foreign_keys": val}], ["foreign_keys"])` to match SQLite behaviour
+- [x] Fix `PRAGMA table_info(missing_table)` raising `NoSuchTableError` — SQLite returns 0 rows for unknown tables; fixed by returning an empty `RowResult` with the correct column list instead of raising
+- [x] Fix `col NOT LIKE pattern` raising `ParseError` — `_parse_one_condition` only handled `NOT IN` and `NOT BETWEEN`; added `NOT LIKE` and `NOT GLOB` (with ESCAPE support) by wrapping a LIKE/GLOB clause in a NOT group node
 
 ### Transactions
 

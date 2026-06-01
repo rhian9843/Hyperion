@@ -75,9 +75,9 @@ class TestPragmaTableInfo(unittest.TestCase):
         self.assertIsNotNone(id_row, "No data row found for 'id' column")
         self.assertIn("1", id_row)  # pk=1 for id
 
-    def test_unknown_table_raises(self):
+    def test_unknown_table_returns_no_rows(self):
         _, lines = db_run(["PRAGMA table_info(nonexistent)", ".exit"], self.db)
-        self.assertIn("Error", " ".join(lines))
+        self.assertIn("no rows", " ".join(lines))
 
 
 # ── PRAGMA index_list ──────────────────────────────────────────────────────────

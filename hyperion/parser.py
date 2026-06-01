@@ -308,8 +308,21 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             inner.or_clause = WhereClause(col=col, op=">", val=hi_val)
             return WhereClause(col="", op="GROUP", val="",
                                group_clause=inner), pos + 6
+        if pos + 2 < len(tokens) and tokens[pos + 2].upper() in ("LIKE", "GLOB"):
+            if pos + 3 >= len(tokens):
+                raise ParseError(f"Expected pattern after NOT {tokens[pos + 2].upper()}")
+            op2 = tokens[pos + 2].upper()
+            val2 = _unquote_token(tokens[pos + 3])
+            advance = 4
+            if op2 == "LIKE" and pos + 4 < len(tokens) and tokens[pos + 4].upper() == "ESCAPE":
+                if pos + 5 >= len(tokens):
+                    raise ParseError("Expected escape character after ESCAPE")
+                val2 = val2 + "\x00" + _unquote_token(tokens[pos + 5])
+                advance = 6
+            inner2 = WhereClause(col=col, op=op2, val=val2)
+            return WhereClause(col="", op="NOT", val="", group_clause=inner2), pos + advance
         _got = tokens[pos + 2] if pos + 2 < len(tokens) else ""
-        raise ParseError(f"Expected IN or BETWEEN after NOT, got '{_got}'")
+        raise ParseError(f"Expected IN, BETWEEN, LIKE, or GLOB after NOT, got '{_got}'")
 
     if op == "IN":
         if pos + 2 >= len(tokens) or tokens[pos + 2] != "(":

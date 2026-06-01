@@ -1044,12 +1044,14 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
         if value in ("OFF", "0", "FALSE"):
             db.fk_enforcement = False
             return "foreign_keys = 0"
-        return f"foreign_keys = {1 if db.fk_enforcement else 0}"
+        val = 1 if db.fk_enforcement else 0
+        return RowResult([{"foreign_keys": val}], ["foreign_keys"])
 
     if name == "table_info":
         tname = stmt.get("arg") or ""
         if tname not in db.tables:
-            raise NoSuchTableError(f"No such table: '{tname}'")
+            cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+            return RowResult([], cols)
         schema = db._meta(tname).schema
         pk_cols = set(schema.primary_key_columns or [])
         rows = []
