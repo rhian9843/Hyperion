@@ -31,7 +31,7 @@ _AGG_RE = re.compile(
 # Keywords that cannot be bare table aliases
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
-    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW",
+    "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW",
     "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM",
 })
 
@@ -536,7 +536,7 @@ def _parse_order_limit(tokens: list[str], pos: int
         if pos >= len(tokens) or tokens[pos].upper() != "BY":
             raise ParseError("Expected BY after ORDER")
         pos += 1
-        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT",):
+        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT", "OFFSET"):
             col = tokens[pos]; pos += 1
             desc = False
             collation: str | None = None

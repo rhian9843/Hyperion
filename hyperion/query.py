@@ -167,18 +167,25 @@ class QueryMixin:
         schema  = meta.schema
         results = []
         seen: set[tuple] = set()
+        # Collect full rows first so ORDER BY can reference columns not in SELECT list.
+        # Projection and DISTINCT dedup happen after sorting/limiting.
+        _need_full = bool(order_by and columns)
         for _, raw in self._table_btree(meta).scan():
             row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
+            results.append(row)
+        results = _apply_order_limit(results, order_by, limit, offset)
+        out = []
+        for row in results:
             projected = _project_row(row, columns) if columns else row
             if distinct:
                 key = tuple(projected.get(k) for k in (columns or list(row.keys())))
                 if key in seen:
                     continue
                 seen.add(key)
-            results.append(projected)
-        return _apply_order_limit(results, order_by, limit, offset)
+            out.append(projected)
+        return out
 
     def _compute_aggregates(self, bucket_rows: list[dict],
                             columns: list[str]) -> dict[str, Any]:
@@ -192,17 +199,14 @@ class QueryMixin:
                 # Defer columns containing nested aggregates to the second pass
                 if _NESTED_AGG_RE.search(col):
                     continue
-                if bucket_rows:
-                    _first = bucket_rows[0]
-                    _v = _first.get(col)
-                    if _v is None and col not in _first:
-                        try:
-                            _v = eval_expr(col, _first)
-                        except Exception:
-                            pass
-                    result[col] = _v
-                else:
-                    result[col] = None
+                _first = bucket_rows[0] if bucket_rows else {}
+                _v = _first.get(col)
+                if _v is None and col not in _first:
+                    try:
+                        _v = eval_expr(col, _first)
+                    except Exception:
+                        pass
+                result[col] = _v
                 continue
             func, arg, distinct = agg
             if func == "COUNT":

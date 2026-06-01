@@ -803,7 +803,14 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
         has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
         tbl = s.get("table") or ""
         if s.get("subquery_from"):
-            rows = _exec_derived_table(s, db, ctes)
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_derived_table(raw_stmt, db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
+                                          s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_derived_table(s, db, ctes)
         elif tbl == "_hyperion_master":
             rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
                                         "rows": _hyperion_master_rows(db)}, db, ctes)
@@ -980,14 +987,14 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
                 if skipped < offset:
                     skipped += 1
                     continue
+                if limit is not None and count >= limit:
+                    return
                 projected = _project_row(row, cols) if cols else row
                 if col_aliases:
                     projected = {col_aliases.get(k, k): v
                                  for k, v in projected.items()}
                 yield projected
                 count += 1
-                if limit is not None and count >= limit:
-                    return
             return
 
     yield from _rows_for_stmt(stmt, db, merged_ctes)
