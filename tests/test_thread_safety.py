@@ -1,5 +1,6 @@
 """Thread safety tests: concurrent access to a shared Database instance."""
 import threading
+import time
 from hyperion import Database
 from hyperion.database import _RWLock
 
@@ -353,6 +354,72 @@ def test_lastrowid_file_backed_concurrent(tmp_path):
     assert all(v is not None for v in results.values())
     assert len(set(results.values())) == 10, \
         f"Duplicate lastrowids in file-backed DB: {results}"
+
+
+def test_no_dirty_reads_across_threads():
+    """A thread doing SELECT must never see uncommitted data written by another thread.
+
+    Thread A opens an explicit transaction, UPDATEs a row, then sleeps while still
+    inside the transaction.  Thread B issues repeated SELECTs on the same connection
+    during that window.  Thread B must always see the pre-UPDATE committed value (100),
+    never the uncommitted value (999).  After A rolls back, all readers see 100.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 100)")
+
+    dirty_reads: list = []
+    barrier = threading.Barrier(2)
+
+    def writer():
+        barrier.wait()
+        db.begin()
+        db.execute("UPDATE t SET val = 999 WHERE id = 1")
+        time.sleep(0.05)   # hold the transaction open
+        db.rollback()      # never commits — dirty reads must not leak
+
+    def reader():
+        barrier.wait()
+        time.sleep(0.01)   # let writer start its transaction
+        for _ in range(20):
+            row = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+            if row and row["val"] == 999:
+                dirty_reads.append(row["val"])
+            time.sleep(0.005)
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=reader)
+    t1.start(); t2.start()
+    t1.join();  t2.join()
+
+    assert dirty_reads == [], (
+        f"Dirty read detected: reader saw uncommitted value 999 "
+        f"({len(dirty_reads)} time(s)) during writer's uncommitted transaction"
+    )
+    final = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert final["val"] == 100, "Value should be 100 after rollback"
+
+
+def test_writer_reads_own_uncommitted_writes():
+    """The writing thread must see its own uncommitted writes (write-own-reads).
+
+    This ensures the dirty-read fix does not accidentally break the writer's ability
+    to read back its own in-progress changes within the same transaction.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 100)")
+
+    db.begin()
+    db.execute("UPDATE t SET val = 999 WHERE id = 1")
+    row = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert row["val"] == 999, (
+        "Writer should see its own uncommitted write (999), got " + str(row["val"])
+    )
+    db.rollback()
+
+    row_after = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert row_after["val"] == 100, "Rollback should restore 100"
 
 
 def test_explicit_transaction_serialised():

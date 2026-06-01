@@ -1,4 +1,5 @@
 import struct
+import threading
 from pathlib import Path
 
 from .errors import TransactionError
@@ -52,8 +53,9 @@ class Pager:
         self._cache:   dict[int, bytearray] = {}  # committed pages (stable snapshot)
         self._working: dict[int, bytearray] = {}  # in-transaction copy-on-write pages
         self._dirty:   set[int] = set()
-        self._wal:     WAL | None = None          # opened lazily on first begin()
-        self._in_txn:  bool = False
+        self._wal:       WAL | None = None        # opened lazily on first begin()
+        self._in_txn:    bool = False
+        self._write_tid: int | None = None        # thread-id that owns the write txn
         self._wal_txn_offset: int = 0             # WAL offset at transaction start
 
     def _load(self, num: int) -> bytearray:
@@ -69,12 +71,14 @@ class Pager:
     def read_page(self, num: int) -> bytearray:
         """Return the current view of a page without marking it dirty.
 
-        During a write transaction returns the working (in-progress) copy so
-        the writer can read its own writes.  Outside a transaction — including
-        concurrent streaming readers on the same connection — returns the
-        committed snapshot from _cache, preventing dirty reads.
+        Only the thread that owns the current write transaction sees uncommitted
+        (_working) pages — this prevents dirty reads when other threads share the
+        same connection and issue SELECTs while an explicit transaction is open.
+        All other callers always receive the committed snapshot from _cache.
         """
-        if self._in_txn and num in self._working:
+        if (self._in_txn
+                and num in self._working
+                and self._write_tid == threading.get_ident()):
             return self._working[num]
         return self._load(num)
 
@@ -105,7 +109,8 @@ class Pager:
         if self._wal is None:
             self._wal = WAL(self._path.with_suffix(".wal"))
         self._wal_txn_offset = self._wal.begin_offset()
-        self._in_txn = True
+        self._in_txn  = True
+        self._write_tid = threading.get_ident()
 
     def commit(self) -> None:
         if not self._in_txn:
@@ -124,6 +129,7 @@ class Pager:
         # can safely skip WAL replay.  (WAL still provides crash durability for
         # the commit_txn fsync that preceded this.)
         self._wal.checkpoint(self._file)
+        self._write_tid = None
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
     def rollback(self) -> None:
@@ -133,7 +139,8 @@ class Pager:
         self._wal.rollback_txn(self._wal_txn_offset)
         self._working.clear()
         self._dirty.clear()
-        self._in_txn = False
+        self._in_txn    = False
+        self._write_tid = None
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after abort
 
     def close(self) -> None:
@@ -164,12 +171,13 @@ class MemoryPager:
     """
 
     def __init__(self) -> None:
-        self._path    = Path(":memory:")
+        self._path     = Path(":memory:")
         self._cache:   dict[int, bytearray] = {}  # committed pages
         self._working: dict[int, bytearray] = {}  # in-transaction CoW pages
         self._dirty:   set[int] = set()
         self._wal      = None  # API compatibility with Pager
-        self._in_txn:  bool = False
+        self._in_txn:    bool = False
+        self._write_tid: int | None = None        # thread-id that owns the write txn
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -179,11 +187,13 @@ class MemoryPager:
     def read_page(self, num: int) -> bytearray:
         """Return the current view of a page (read-only path).
 
-        Returns the working copy when the caller is a writer reading its own
-        writes; otherwise returns the committed snapshot so that concurrent
-        streaming readers never see uncommitted data.
+        Only the thread that owns the current write transaction sees uncommitted
+        (_working) pages — prevents dirty reads from concurrent threads sharing
+        the same connection while an explicit transaction is open.
         """
-        if self._in_txn and num in self._working:
+        if (self._in_txn
+                and num in self._working
+                and self._write_tid == threading.get_ident()):
             return self._working[num]
         return self._load(num)
 
@@ -210,7 +220,8 @@ class MemoryPager:
             raise TransactionError("Transaction already active")
         self._working.clear()
         self._dirty.clear()
-        self._in_txn = True
+        self._in_txn    = True
+        self._write_tid = threading.get_ident()
 
     def commit(self) -> None:
         if not self._in_txn:
@@ -218,7 +229,8 @@ class MemoryPager:
         self._cache.update(self._working)
         self._working.clear()
         self._dirty.clear()
-        self._in_txn = False
+        self._in_txn    = False
+        self._write_tid = None
 
     def rollback(self) -> None:
         if not self._in_txn:
@@ -226,7 +238,8 @@ class MemoryPager:
         # Discard working pages — _cache is untouched, so no restore needed.
         self._working.clear()
         self._dirty.clear()
-        self._in_txn = False
+        self._in_txn    = False
+        self._write_tid = None
 
     def close(self) -> None:
         pass
