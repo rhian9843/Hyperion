@@ -166,3 +166,73 @@ class TestEncodingSortOrder:
         ]
         # All keys must be strictly increasing
         assert keys == sorted(set(keys)), "composite keys for consecutive ints are not distinct/ordered"
+
+
+class TestInt64BoundaryKeys:
+    """INT64_MIN (-2^63) as a primary key or index column must not crash.
+
+    Before the fix, _make_index_key(-2^63, -2^63) returned a negative Python int
+    because the _KEY_SIGN bias exactly cancelled the encoded value and the rowid
+    was negative.  btree._pack_key then called key.to_bytes(key_sz, 'big') without
+    signed=True, raising OverflowError.
+    """
+
+    INT64_MIN = -(2 ** 63)
+    INT64_MAX =  (2 ** 63) - 1
+
+    def test_make_index_key_never_negative(self):
+        """_make_index_key must return a non-negative integer for all int64 inputs."""
+        from hyperion.encoding import _encode_index_key, _make_index_key
+        from hyperion.constants import INTEGER
+        for val in [self.INT64_MIN, self.INT64_MIN + 1, -1, 0, 1,
+                    self.INT64_MAX - 1, self.INT64_MAX]:
+            for rowid in [self.INT64_MIN, -1, 0, 1, self.INT64_MAX]:
+                ek = _encode_index_key(val, INTEGER)
+                k = _make_index_key(ek, rowid)
+                assert k >= 0, (
+                    f"_make_index_key({val}, {rowid}) returned negative key {k}"
+                )
+
+    def test_int64_min_as_primary_key_insert_select(self):
+        """INSERT with INT64_MIN as an INTEGER PRIMARY KEY must not raise OverflowError."""
+        db = Database(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (?, ?)", (self.INT64_MIN, "min"))
+        db.execute("INSERT INTO t VALUES (?, ?)", (self.INT64_MAX, "max"))
+        db.execute("INSERT INTO t VALUES (0, 'zero')")
+        rows = db.execute("SELECT id FROM t ORDER BY id").fetchall()
+        ids = [r["id"] for r in rows]
+        assert ids == [self.INT64_MIN, 0, self.INT64_MAX], \
+            f"Expected sorted INT64 boundary keys, got {ids}"
+
+    def test_int64_min_primary_key_lookup(self):
+        """Point-lookup of INT64_MIN via WHERE id = ? must return the correct row."""
+        db = Database(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        db.execute("INSERT INTO t VALUES (?, 'edge')", (self.INT64_MIN,))
+        row = db.execute("SELECT v FROM t WHERE id = ?", (self.INT64_MIN,)).fetchone()
+        assert row is not None and row["v"] == "edge"
+
+    def test_int64_boundary_values_sort_correctly(self):
+        """All INT64 boundary values stored as PK must be returned in ascending order."""
+        db = Database(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+        extremes = [self.INT64_MIN, self.INT64_MIN + 1, -1, 0, 1,
+                    self.INT64_MAX - 1, self.INT64_MAX]
+        for v in extremes:
+            db.execute("INSERT INTO t VALUES (?)", (v,))
+        rows = db.execute("SELECT id FROM t ORDER BY id").fetchall()
+        assert [r["id"] for r in rows] == sorted(extremes)
+
+    def test_int64_min_in_non_pk_index(self):
+        """INT64_MIN in a non-PK indexed column must not crash and must be findable."""
+        db = Database(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, score INTEGER)")
+        db.execute("CREATE INDEX idx_score ON t(score)")
+        db.execute("INSERT INTO t (score) VALUES (?)", (self.INT64_MIN,))
+        db.execute("INSERT INTO t (score) VALUES (0)")
+        db.execute("INSERT INTO t (score) VALUES (?)", (self.INT64_MAX,))
+        rows = db.execute(
+            "SELECT score FROM t WHERE score = ?", (self.INT64_MIN,)
+        ).fetchall()
+        assert len(rows) == 1 and rows[0]["score"] == self.INT64_MIN
