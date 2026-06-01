@@ -179,6 +179,11 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if self._txn_depth > 0:
                 raise TransactionError("Transaction already active")
             self._pager.begin()
+            # If the pager found pending WAL frames and updated _cache, reload
+            # the catalog so this transaction starts with up-to-date next_key /
+            # root pages from a previous connection's lazy-checkpointed commit.
+            if getattr(self._pager, '_wal_had_pending', False):
+                self._reload_catalog()
             self._txn_depth = 1
 
     def commit(self) -> None:

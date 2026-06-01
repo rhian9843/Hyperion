@@ -450,3 +450,47 @@ def test_explicit_transaction_serialised():
     # All non-conflicting transactions must have committed
     row = db.execute("SELECT COUNT(*) AS n FROM t").fetchone()
     assert row["n"] >= 1  # at least one thread succeeded
+
+
+def test_sequential_explicit_transactions_all_commit(tmp_path):
+    """When threads take turns with explicit transactions, every transaction
+    must commit exactly once and all rows must be present afterwards.
+
+    This catches cases where concurrent BEGIN/COMMIT racing causes silent
+    data loss or corrupts the transaction-depth counter.
+    """
+    db_path = tmp_path / "seq_txn.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, tid INTEGER)")
+
+    n_threads  = 6
+    rows_each  = 5
+    errors: list = []
+    # Serialise via a lock so each thread holds the full txn before the next starts
+    mutex = threading.Lock()
+
+    def worker(thread_id: int) -> None:
+        try:
+            with mutex:
+                db.begin()
+                for j in range(rows_each):
+                    db.execute(
+                        "INSERT INTO t VALUES (?, ?)",
+                        (thread_id * 100 + j, thread_id),
+                    )
+                db.commit()
+        except Exception as e:
+            errors.append((thread_id, e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Thread errors: {errors}"
+    total = db.execute("SELECT COUNT(*) AS n FROM t").fetchone()["n"]
+    assert total == n_threads * rows_each, (
+        f"Expected {n_threads * rows_each} rows, got {total}"
+    )
+    db.close()

@@ -308,10 +308,10 @@
 
 #### Priority 2 — Durability & Reliability
 
-- [ ] Remove dead `CHECKPOINT_PAGES = 64` constant and `WAL.needs_checkpoint()` method, or implement lazy checkpointing — `needs_checkpoint()` is defined in `wal.py:81` but is **never called anywhere in the codebase**; `pager.commit()` unconditionally calls `self._wal.checkpoint()` on every commit making the threshold mechanism a no-op; either delete both (the WAL always-checkpoint behaviour is intentional) or implement lazy checkpointing: only call `checkpoint()` when `needs_checkpoint()` returns True and force a full checkpoint at `close()`, which would significantly improve bulk-insert throughput
-- [ ] Add test: concurrent explicit transactions — two threads each doing `BEGIN` / `INSERT` / `COMMIT` serially must not produce `TransactionError` inside a single thread; current `test_explicit_transaction_serialised` accepts `"already active"` silently, masking cross-thread state leakage
-- [ ] Add test: `CHECKPOINT_PAGES` threshold — verify `needs_checkpoint()` returns False below the threshold and True at/above it; verify checkpoint is triggered at the right boundary (currently untestable because the threshold is never checked)
-- [ ] Add test: multi-connection WAL replay — process A writes 100 rows and closes; a left-behind WAL is manually constructed; process B opens the same file and must replay the WAL and see all 100 rows; currently no test covers the two-process open scenario
+- [x] Remove dead `CHECKPOINT_PAGES = 64` constant and `WAL.needs_checkpoint()` method, or implement lazy checkpointing — `needs_checkpoint()` is defined in `wal.py:81` but is **never called anywhere in the codebase**; `pager.commit()` unconditionally calls `self._wal.checkpoint()` on every commit making the threshold mechanism a no-op; either delete both (the WAL always-checkpoint behaviour is intentional) or implement lazy checkpointing: only call `checkpoint()` when `needs_checkpoint()` returns True and force a full checkpoint at `close()`, which would significantly improve bulk-insert throughput
+- [x] Add test: concurrent explicit transactions — two threads each doing `BEGIN` / `INSERT` / `COMMIT` serially must not produce `TransactionError` inside a single thread; current `test_explicit_transaction_serialised` accepts `"already active"` silently, masking cross-thread state leakage
+- [x] Add test: `CHECKPOINT_PAGES` threshold — verify `needs_checkpoint()` returns False below the threshold and True at/above it; verify checkpoint is triggered at the right boundary (currently untestable because the threshold is never checked)
+- [x] Add test: multi-connection WAL replay — process A writes 100 rows and closes; a left-behind WAL is manually constructed; process B opens the same file and must replay the WAL and see all 100 rows; currently no test covers the two-process open scenario
 
 #### Priority 3 — Performance
 
