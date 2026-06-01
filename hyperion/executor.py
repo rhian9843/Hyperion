@@ -1475,8 +1475,8 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 elif _is_single_string_literal(val):
                     # Quoted string literal — unquote (handle '' escape sequences)
                     parsed[name] = val[1:-1].replace("''", "'")
-                elif " " in val or val.upper() in _CONST_EXPRS:
-                    # Multi-token expression (joined with spaces) or SQL constant
+                elif " " in val or val.upper() in _CONST_EXPRS or "(" in val:
+                    # Multi-token expression, SQL constant, or function call
                     parsed[name] = eval_expr(val, {})
                 else:
                     parsed[name] = val

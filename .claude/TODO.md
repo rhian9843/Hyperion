@@ -272,6 +272,7 @@
 - [x] Fix `ORDER BY non_select_col LIMIT n` returning wrong rows — full-table-scan path projected rows to selected columns before sorting, so ORDER BY columns absent from SELECT list were silently NULL during sort; fixed by collecting full rows, sorting and limiting, then projecting at the end
 - [x] Fix `SELECT COUNT(*) FROM (subquery) t` returning per-row NULLs — the `subquery_from` branch in `_rows_for_stmt_inner` called `_exec_derived_table` without detecting aggregates; the projection loop in `_exec_derived_table` called `_project_row` for each row with `COUNT(*)` which isn't a row key, returning NULL per row; fixed by adding an aggregate-detection branch that routes to `_apply_groupby_agg` (same as the CTE/view paths)
 - [x] Fix string literal SELECT columns returning NULL when aggregate source has 0 rows — `_compute_aggregates` used `bucket_rows[0].get(col)` falling back to `None` when bucket is empty, even for constant literals like `'label'` that don't need row context; fixed by trying `eval_expr(col, {})` as fallback even for empty buckets
+- [x] Fix function calls in `INSERT VALUES` not evaluated — single-token function calls like `UPPER('xyz')` and `ABS(-4.99)` have no space so the VALUES handler fell through to `else: parsed[name] = val`, storing the raw string; `ABS(-4.99)` then crashed `serialize_row` with `ValueError: could not convert string to float`; fixed by adding `"(" in val` to the `eval_expr` routing condition in `_execute_inner`
 
 ### Transactions
 
