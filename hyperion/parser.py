@@ -711,6 +711,15 @@ def _parse_create_table(t: list[str], i: int, temporary: bool) -> dict:
                 i += 1
             continue
 
+        _m_uc = re.fullmatch(r"UNIQUE\s*\(([^)]*)\)", t[i], re.IGNORECASE)
+        if _m_uc:
+            uc_cols = [c.strip() for c in _m_uc.group(1).split(",") if c.strip()]
+            uc_constraints.append(uc_cols)
+            i += 1
+            if i < len(t) and t[i] == ",":
+                i += 1
+            continue
+
         if t[i].upper() == "UNIQUE" and i + 1 < len(t) and t[i + 1] == "(":
             i += 1
             uc_cols, i = _parse_col_list(t, i)
@@ -749,9 +758,16 @@ def _parse_create_table(t: list[str], i: int, temporary: bool) -> dict:
                 i += 1
             else:
                 generated_stored = False
-        while i < len(t) and t[i].upper() in (
-                "NOT", "UNIQUE", "DEFAULT", "CHECK", "REFERENCES",
-                "PRIMARY", "AUTOINCREMENT", "AUTO_INCREMENT"):
+        while i < len(t) and (
+                t[i].upper() in ("NOT", "UNIQUE", "DEFAULT", "CHECK",
+                                  "REFERENCES", "PRIMARY", "AUTOINCREMENT",
+                                  "AUTO_INCREMENT")
+                or re.match(r"CHECK\s*\(", t[i], re.IGNORECASE)):
+            _m_check_tok = re.fullmatch(r"CHECK\s*\((.+)\)", t[i], re.IGNORECASE | re.DOTALL)
+            if _m_check_tok:
+                check = _m_check_tok.group(1)
+                i += 1
+                continue
             col_kw = t[i].upper()
             if col_kw == "PRIMARY":
                 if i + 1 < len(t) and t[i + 1].upper() == "KEY":
@@ -1487,9 +1503,16 @@ def _parse_select(t: list[str]) -> dict:
 
 
 def _parse_update(t: list[str]) -> dict:
-    if len(t) < 4 or t[2].upper() != "SET":
+    i = 1
+    conflict_action: str | None = None
+    if i < len(t) and t[i].upper() == "OR":
+        if i + 1 >= len(t):
+            raise ParseError("Expected conflict action after OR in UPDATE OR ...")
+        conflict_action = t[i + 1].upper()
+        i += 2
+    if i + 1 >= len(t) or t[i + 1].upper() != "SET":
         raise ParseError("Expected: UPDATE <table> SET col=val ...")
-    table = t[1]; i = 3
+    table = t[i]; i += 2
     assignments: dict[str, str] = {}
     while i < len(t) and t[i].upper() not in ("WHERE", "LIMIT", "RETURNING"):
         if t[i] == ",":
@@ -1533,7 +1556,8 @@ def _parse_update(t: list[str]) -> dict:
             pos += 1
     return {"op": "UPDATE", "table": table, "assignments": assignments,
             "where": where, "limit": limit_u,
-            "returning": returning_u or None}
+            "returning": returning_u or None,
+            "conflict_action": conflict_action}
 
 
 def _parse_delete(t: list[str]) -> dict:

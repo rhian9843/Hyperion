@@ -1565,19 +1565,25 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 raise SchemaError(
                     f"Cannot update view '{tname}' without an INSTEAD OF trigger")
             return _exec_instead_of_update(stmt, db)
-        if has_triggers(db, tname, "UPDATE"):
-            changed_cols = list(stmt["assignments"].keys())
-            old_rows = scan_matching_rows(db, tname, stmt["where"])
-            _upd_meta = db._meta(tname)
-            for old_row in old_rows:
-                new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
-                fire_triggers(db, tname, "BEFORE", "UPDATE", new_row, old_row, changed_cols)
-            rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
-            for old_row in old_rows:
-                new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
-                fire_triggers(db, tname, "AFTER", "UPDATE", new_row, old_row, changed_cols)
-        else:
-            rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
+        _update_conflict = (stmt.get("conflict_action") or "").upper()
+        try:
+            if has_triggers(db, tname, "UPDATE"):
+                changed_cols = list(stmt["assignments"].keys())
+                old_rows = scan_matching_rows(db, tname, stmt["where"])
+                _upd_meta = db._meta(tname)
+                for old_row in old_rows:
+                    new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
+                    fire_triggers(db, tname, "BEFORE", "UPDATE", new_row, old_row, changed_cols)
+                rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
+                for old_row in old_rows:
+                    new_row = apply_update_row(old_row, stmt["assignments"], _upd_meta.schema)
+                    fire_triggers(db, tname, "AFTER", "UPDATE", new_row, old_row, changed_cols)
+            else:
+                rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
+        except ConstraintError:
+            if _update_conflict != "IGNORE":
+                raise
+            rows = []
         n = len(rows)
         _invalidate_rc(db, tname)
         if stmt.get("returning"):
