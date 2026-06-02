@@ -41,7 +41,6 @@ class Pager:
         if readonly:
             self._file = open(path, "rb")
             _flock(self._file.fileno(), 1)   # LOCK_SH — read-only, no WAL replay
-            self._needs_wal_catchup = False
         else:
             self._file = open(path, "r+b" if path.exists() else "w+b")
             # Try non-blocking LOCK_EX for WAL crash recovery.  If another connection
@@ -51,19 +50,17 @@ class Pager:
             if _ex_acquired:
                 WAL.replay_if_exists(wal_path, self._file)
             # _flock(LOCK_SH) is blocking: we wait here until any active writer
-            # releases LOCK_EX.  If another connection held LOCK_EX we may have
-            # read a stale main file, so record that we need a WAL catch-up on
-            # the first begin().
+            # releases LOCK_EX.
             _flock(self._file.fileno(), 1)   # LOCK_SH — hold while open
-            self._needs_wal_catchup = not _ex_acquired
         self._path    = path
         self._cache:   dict[int, bytearray] = {}  # committed pages (stable snapshot)
         self._working: dict[int, bytearray] = {}  # in-transaction copy-on-write pages
         self._dirty:   set[int] = set()
-        self._wal:         WAL | None = None      # opened lazily on first begin()
-        self._in_txn:      bool = False
-        self._write_tid:   int | None = None      # thread-id that owns the write txn
+        self._wal:            WAL | None = None   # opened lazily on first begin()
+        self._in_txn:         bool = False
+        self._write_tid:      int | None = None   # thread-id that owns the write txn
         self._wal_txn_offset: int = 0             # WAL offset at transaction start
+        self._wal_applied_offset: int = WAL.HDR_SIZE  # WAL tail already in _cache
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -108,23 +105,24 @@ class Pager:
         self._dirty.add(num)
 
     def _apply_wal_to_cache(self) -> None:
-        """Apply committed WAL frames to _cache without writing to the main file.
+        """Apply committed WAL frames newer than _wal_applied_offset to _cache.
 
-        Called at begin() time so every new transaction starts from a consistent
-        in-memory snapshot that includes any committed data that was left in the
-        WAL by the lazy-checkpoint policy of a previous commit.  This keeps
-        multi-connection behaviour correct: two connections to the same file always
-        see each other's committed data once a new transaction begins.
+        Called at begin() time whenever the WAL tail has advanced past the last
+        position we already ingested.  Reads only the new frames, so cost is
+        O(new_bytes) rather than O(total_WAL_size).  Updates _wal_applied_offset
+        to the new tail so the next call is equally incremental.
         """
         if self._wal is None:
             return
         wf = self._wal._file
-        wf.seek(WAL.HDR_SIZE)
+        wf.seek(self._wal_applied_offset)
+        read_pos = self._wal_applied_offset
         pending: list[tuple[int, bytearray]] = []
         while True:
             frame = wf.read(WAL.FRAME_SZ)
             if len(frame) < WAL.FRAME_SZ:
                 break
+            read_pos += WAL.FRAME_SZ
             pn = struct.unpack_from("<I", frame)[0]
             if pn == WAL.COMMIT_PN:
                 for ppn, data in pending:
@@ -132,6 +130,7 @@ class Pager:
                 pending.clear()
             else:
                 pending.append((pn, bytearray(frame[4:])))
+        self._wal_applied_offset = read_pos  # last complete frame boundary
         wf.seek(0, 2)   # leave the write head at end for the next commit_txn
 
     def begin(self) -> None:
@@ -143,17 +142,15 @@ class Pager:
         if self._wal is None:
             self._wal = WAL(self._path.with_suffix(".wal"))
         self._wal_txn_offset = self._wal.begin_offset()
-        # If another connection was active when we opened the file, our catalog
-        # may be stale (the other connection may have committed and used lazy
-        # checkpointing, leaving updated frames in the WAL but not in main file).
-        # Apply those frames to _cache so this transaction starts up-to-date.
-        # Only needed once per connection (single-connection path: cache is always
-        # current via _cache.update(_working) at commit time, no catchup needed).
-        self._wal_had_pending = False
-        if self._needs_wal_catchup and self._wal_txn_offset > WAL.HDR_SIZE:
+        # Apply any WAL frames written by other connections since the last time
+        # we synced.  _wal_applied_offset tracks how far we have already read,
+        # so this is O(new_bytes) and correctly catches every inter-connection
+        # commit — not just the first one.
+        if self._wal_txn_offset > self._wal_applied_offset:
             self._apply_wal_to_cache()
             self._wal_had_pending = True
-            self._needs_wal_catchup = False  # done: cache is now current
+        else:
+            self._wal_had_pending = False
         self._in_txn  = True
         self._write_tid = threading.get_ident()
 
@@ -176,6 +173,10 @@ class Pager:
         # so no committed data is ever left unreachable.
         if self._wal.needs_checkpoint():
             self._wal.checkpoint(self._file)
+        # Advance the applied watermark: our pages are already in _cache via
+        # _cache.update(_working), so the next begin() must not re-apply them.
+        # After a checkpoint begin_offset() returns HDR_SIZE (WAL truncated).
+        self._wal_applied_offset = self._wal.begin_offset()
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
     def rollback(self) -> None:
