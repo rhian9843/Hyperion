@@ -52,7 +52,32 @@ class Catalog:
     # e.g. meta["table"]["users"]["description"] = "User account records"
     meta:           dict[str, dict]           = field(default_factory=dict)
 
+    # ── Ops-serialization snippet cache ───────────────────────────────────────
+    # Pre-computed JSON fragments per table/index so ops_to_bytes() only
+    # re-serializes entries that actually changed (O(dirty) instead of O(all)).
+    _t_snippets: dict[str, str] = field(default_factory=dict, repr=False,
+                                        compare=False)
+    _i_snippets: dict[str, str] = field(default_factory=dict, repr=False,
+                                        compare=False)
+    _ops_dirty_tables:  set     = field(default_factory=set,  repr=False,
+                                        compare=False)
+    _ops_dirty_indexes: set     = field(default_factory=set,  repr=False,
+                                        compare=False)
+    _ops_global_dirty:  bool    = field(default=True,         repr=False,
+                                        compare=False)
+    _ops_global_snippet: str    = field(default="",           repr=False,
+                                        compare=False)
+
     CATALOG_PAGE = 0
+
+    def mark_table_ops_dirty(self, name: str) -> None:
+        self._ops_dirty_tables.add(name)
+
+    def mark_index_ops_dirty(self, name: str) -> None:
+        self._ops_dirty_indexes.add(name)
+
+    def mark_global_ops_dirty(self) -> None:
+        self._ops_global_dirty = True
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
@@ -87,25 +112,50 @@ class Catalog:
     def ops_to_bytes(self) -> bytes:
         """Operational-state JSON: page counters and per-table/index runtime data.
 
-        This blob changes on every write (INSERT increments next_key; B-tree
-        splits update root/next page).  It is intentionally tiny — O(n_tables)
-        integers, independent of schema complexity — so writing it on every
-        commit is cheap regardless of how many columns each table has.
+        Uses a snippet cache to avoid O(n_tables) JSON re-encoding on every
+        commit.  Only dirty entries (those whose ops fields actually changed)
+        are re-serialized; all others reuse their cached JSON fragment.
+        This keeps per-INSERT cost O(1) regardless of total table count.
         """
-        return json.dumps({
-            "next_free_page": self.next_free_page,
-            "free_pages":     self.free_pages,
-            "table_ops": {
-                n: {"root_page": m.root_page,
-                    "next_page": m.next_page,
-                    "next_key":  m.next_key}
-                for n, m in self.tables.items() if not m.temporary
-            },
-            "index_ops": {
-                n: {"root_page": m.root_page, "next_page": m.next_page}
-                for n, m in self.indexes.items()
-            },
-        }).encode()
+        # Re-encode only dirty table snippets
+        for name in self._ops_dirty_tables:
+            m = self.tables.get(name)
+            if m is None or m.temporary:
+                self._t_snippets.pop(name, None)
+            else:
+                self._t_snippets[name] = (
+                    f'"{name}":{{\"root_page\":{m.root_page},'
+                    f'\"next_page\":{m.next_page},\"next_key\":{m.next_key}}}'
+                )
+        self._ops_dirty_tables.clear()
+
+        # Re-encode only dirty index snippets
+        for name in self._ops_dirty_indexes:
+            m = self.indexes.get(name)
+            if m is None:
+                self._i_snippets.pop(name, None)
+            else:
+                self._i_snippets[name] = (
+                    f'"{name}":{{\"root_page\":{m.root_page},'
+                    f'\"next_page\":{m.next_page}}}'
+                )
+        self._ops_dirty_indexes.clear()
+
+        # Re-encode global state only when next_free_page / free_pages changed
+        if self._ops_global_dirty:
+            self._ops_global_snippet = (
+                f'"next_free_page":{self.next_free_page},'
+                f'"free_pages":{json.dumps(self.free_pages)}'
+            )
+            self._ops_global_dirty = False
+
+        table_part = ",".join(self._t_snippets.values())
+        index_part = ",".join(self._i_snippets.values())
+        return (
+            f'{{{self._ops_global_snippet},'
+            f'"table_ops":{{{table_part}}},'
+            f'"index_ops":{{{index_part}}}}}'
+        ).encode()
 
     # ── Combined format (used by savepoints and backward-compat load) ─────────
 

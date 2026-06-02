@@ -110,12 +110,13 @@ def _make_index_key(val_key: "int | list[int]", rowid: int) -> int:
     Each column key is biased by +2^63 to map the full signed range to unsigned
     while preserving sort order, so keys compare correctly as plain Python ints.
     """
+    rowid_u = rowid & 0xFFFF_FFFF_FFFF_FFFF  # treat as unsigned so result stays non-negative
     if isinstance(val_key, list):
         result = 0
         for vk in val_key:
             result = (result << 64) | (vk + _KEY_SIGN)
-        return (result << 64) | rowid
-    return ((val_key + _KEY_SIGN) << 64) | rowid
+        return (result << 64) | rowid_u
+    return ((val_key + _KEY_SIGN) << 64) | rowid_u
 
 
 def _split_index_key(composite: int) -> tuple[int, int]:
@@ -173,6 +174,17 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
 def _apply_set_op(op: str, all_flag: bool,
                   left: list[dict], right: list[dict]) -> list[dict]:
     """Combine two row-lists with UNION / INTERSECT / EXCEPT semantics."""
+    # SQL standard: output columns come from the leftmost SELECT; normalize
+    # right-side rows to use left-side column names (positional alignment).
+    if left and right:
+        left_keys = list(left[0].keys())
+        right_keys = list(right[0].keys())
+        if left_keys != right_keys:
+            def _remap(row: dict) -> dict:
+                vals = list(row.values())
+                return {left_keys[i]: vals[i] for i in range(min(len(left_keys), len(vals)))}
+            right = [_remap(r) for r in right]
+
     def _key(row: dict) -> tuple:
         return tuple(row.values())
 

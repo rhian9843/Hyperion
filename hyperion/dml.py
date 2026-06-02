@@ -110,7 +110,12 @@ class DMLMixin:
                 if val is None or (isinstance(val, str) and val.upper() == "NULL"):
                     new_row[col] = None
                     continue
-                resolved = eval_expr(str(val), new_row) if is_expr(str(val)) else val
+                if isinstance(val, str) and val.startswith("'") and val.endswith("'") and len(val) >= 2:
+                    resolved = val[1:-1].replace("''", "'")
+                elif is_expr(str(val)):
+                    resolved = eval_expr(str(val), new_row)
+                else:
+                    resolved = val
                 if col_obj.type == INTEGER:
                     try:
                         new_row[col] = int(resolved)

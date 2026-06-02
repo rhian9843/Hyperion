@@ -14,7 +14,8 @@ import struct
 from typing import Any
 
 from .schema import deserialize_row
-from .encoding import _encode_composite_key, _make_index_key
+from .encoding import (_encode_composite_key, _make_index_key,
+                       _encode_index_key, _MIN_VAL_KEY, _MAX_VAL_KEY)
 from .constants import INTEGER, REAL
 
 
@@ -99,12 +100,17 @@ def probe_index(db, right_table: str, right_col: str, val) -> list[dict] | None:
             val = int(val)
         elif col_obj.type == REAL:
             val = float(val)
-        val_key = _encode_composite_key([val], [col_obj.type])
+        encoded = _encode_index_key(val, col_obj.type)
     except (ValueError, TypeError):
         return None
 
-    lo    = _make_index_key(val_key, 0)
-    hi    = _make_index_key(val_key, 0xFFFFFFFFFFFFFFFF)
+    n_extra = len(idx_meta.columns) - 1  # trailing columns in composite index
+    if n_extra > 0:
+        lo = _make_index_key([encoded] + [_MIN_VAL_KEY] * n_extra, 0)
+        hi = _make_index_key([encoded] + [_MAX_VAL_KEY] * n_extra, 0xFFFFFFFFFFFFFFFF)
+    else:
+        lo = _make_index_key(encoded, 0)
+        hi = _make_index_key(encoded, 0xFFFFFFFFFFFFFFFF)
     itree = db._index_btree(idx_meta)
     ptree = db._table_btree(meta)
     rows  = []

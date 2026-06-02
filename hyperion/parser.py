@@ -6,6 +6,10 @@ from .schema import Column, ForeignKey, Schema
 from .where import WhereClause
 
 
+# Characters that end a non-quoted, non-special token in _tokenize (steps 5 & 9).
+# Mirrors the complement of _TOKEN_RE's [^\s(),;*=<>!]+ catchall rule.
+_TOK_STOP = frozenset(" \t\n\r(),;*=<>!'\"` ")
+
 _TOKEN_RE = re.compile(
     r"'(?:[^']|'')*'"          # single-quoted strings
     r'|"[^"]*"'                # double-quoted identifiers
@@ -31,7 +35,7 @@ _AGG_RE = re.compile(
 # Keywords that cannot be bare table aliases
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
-    "WHERE", "GROUP", "ORDER", "LIMIT", "HAVING", "WINDOW",
+    "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW",
     "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM",
 })
 
@@ -77,14 +81,143 @@ def _parse_agg(col: str) -> tuple[str, str] | None:
 
 
 def _tokenize(sql: str) -> list[str]:
-    tokens = []
-    for t in _TOKEN_RE.findall(sql):
-        if t.startswith('"') and t.endswith('"'):
-            tokens.append(t[1:-1])   # double-quoted identifiers: strip quotes
-        elif t.startswith('`') and t.endswith('`'):
-            tokens.append(t[1:-1])   # backtick-quoted identifiers: strip quotes
-        else:
-            tokens.append(t)         # keep single-quoted strings as-is for expression building
+    """Hand-written lexer that produces the same token stream as _TOKEN_RE for
+    flat function calls, and additionally collapses nested function calls like
+    ROUND(SUM(col), 2) or json_each(json_extract(t.col, '$.k')) into a single
+    token.  This eliminates the entire class of bugs caused by _TOKEN_RE's
+    [^()]* pattern stopping at the first nested parenthesis.
+
+    Rules (processed left-to-right, first match wins):
+      1. Whitespace            — skip
+      2. 'single-quoted str'   — emit as-is (handles '' escapes)
+      3. "double-quoted ident" — emit without quotes
+      4. `backtick ident`      — emit without quotes
+      5. word_chars(...)       — depth-track and emit as a single function token
+      6. ( ) , ; *             — emit as single-char tokens
+      7. !=  <>  <=  >=        — emit as two-char operator tokens
+      8. =  <  >  !            — emit as single-char operator tokens
+      9. everything else       — collect non-whitespace/non-special run
+    """
+    tokens: list[str] = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        c = sql[i]
+
+        # 1. Whitespace
+        if c in ' \t\n\r':
+            i += 1
+            continue
+
+        # 2. Single-quoted string (handles '' escape sequences)
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2          # escaped quote — keep going
+                    else:
+                        j += 1          # closing quote
+                        break
+                else:
+                    j += 1
+            tokens.append(sql[i:j])
+            i = j
+            continue
+
+        # 3. Double-quoted identifier — strip outer quotes
+        if c == '"':
+            j = i + 1
+            while j < n and sql[j] != '"':
+                j += 1
+            tokens.append(sql[i + 1:j])
+            i = j + 1
+            continue
+
+        # 4. Backtick-quoted identifier — strip outer quotes
+        if c == '`':
+            j = i + 1
+            while j < n and sql[j] != '`':
+                j += 1
+            tokens.append(sql[i + 1:j])
+            i = j + 1
+            continue
+
+        # 5. Non-special run starting with an alnum/_  character.
+        #    Collects the same characters as _TOKEN_RE's [^\s(),;*=<>!]+ rule,
+        #    which includes %, $, -, +, etc. that can appear in SQL tokens.
+        #    After collecting the run we check if it's immediately followed by
+        #    '(' with no whitespace — if so, treat as a function call and
+        #    depth-track everything up to the matching ')'.
+        if c.isalnum() or c == '_':
+            j = i + 1
+            while j < n and sql[j] not in _TOK_STOP:
+                j += 1
+            word = sql[i:j]
+            i = j
+            # If the VERY next character (no whitespace) is '(', this is a
+            # function call — collect everything up to and including the
+            # matching ')' using depth tracking.
+            if i < n and sql[i] == '(':
+                buf = [word, '(']
+                i += 1
+                depth = 1
+                while i < n and depth > 0:
+                    ch = sql[i]
+                    if ch == "'":           # string literal inside call
+                        start = i
+                        i += 1
+                        while i < n:
+                            if sql[i] == "'":
+                                if i + 1 < n and sql[i + 1] == "'":
+                                    i += 2
+                                else:
+                                    i += 1
+                                    break
+                            else:
+                                i += 1
+                        buf.append(sql[start:i])
+                    elif ch == '(':
+                        depth += 1
+                        buf.append(ch); i += 1
+                    elif ch == ')':
+                        depth -= 1
+                        buf.append(ch); i += 1
+                    else:
+                        buf.append(ch); i += 1
+                tokens.append(''.join(buf))
+            else:
+                tokens.append(word)
+            continue
+
+        # 6. Single-char punctuation
+        if c in '(),;*':
+            tokens.append(c)
+            i += 1
+            continue
+
+        # 7. Two-char operators (check longest match first)
+        if c in '!=<>' and i + 1 < n:
+            two = sql[i:i + 2]
+            if two in ('!=', '<>', '<=', '>='):
+                tokens.append(two)
+                i += 2
+                continue
+
+        # 8. Single-char operators
+        if c in '=<>!':
+            tokens.append(c)
+            i += 1
+            continue
+
+        # 9. Everything else: collect a run of non-whitespace/non-special chars
+        j = i + 1
+        while j < n and sql[j] not in _TOK_STOP:
+            j += 1
+        tokens.append(sql[i:j])
+        i = j
+
     return tokens
 
 
@@ -105,6 +238,8 @@ def _parse_col_type(token: str) -> tuple[str, int]:
         return TEXT, 10
     if u in ("DATETIME", "TIMESTAMP"):
         return TEXT, 26
+    if u == "TIME":
+        return TEXT, 8
     # Binary types
     if u in (BLOB, "BYTES", "BINARY", "VARBINARY"):
         return BLOB, DEFAULT_TEXT_SIZE
@@ -228,6 +363,41 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
         return WhereClause(col=" ".join(expr_parts), op=op,
                            val=_unquote_token(tokens[j + 1])), j + 2
 
+    # Function call or complex expression as LHS: UPPER(name) = val, TRIM(col) LIKE '%x%'
+    # Collect tokens until a comparison op at depth 0
+    _CMP_OPS_SET = frozenset({"=", "!=", "<", ">", "<=", ">=",
+                               "LIKE", "GLOB", "IS", "IN", "NOT", "BETWEEN"})
+    if pos + 1 < len(tokens) and tokens[pos + 1] == "(":
+        j = pos; pd = 0
+        while j < len(tokens):
+            if tokens[j] == "(": pd += 1
+            elif tokens[j] == ")": pd -= 1
+            elif pd == 0 and tokens[j].upper() in _CMP_OPS_SET:
+                break
+            j += 1
+        if j > pos:
+            expr_col = " ".join(tokens[pos:j])
+            if j < len(tokens):
+                cmp_op = tokens[j].upper()
+                if cmp_op == "IS":
+                    if j + 1 < len(tokens) and tokens[j + 1].upper() == "NULL":
+                        return WhereClause(col=expr_col, op="IS NULL", val=""), j + 2
+                    if (j + 2 < len(tokens) and tokens[j + 1].upper() == "NOT"
+                            and tokens[j + 2].upper() == "NULL"):
+                        return WhereClause(col=expr_col, op="IS NOT NULL", val=""), j + 3
+                if cmp_op in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+                    rhs = _unquote_token(tokens[j + 1]) if j + 1 < len(tokens) else ""
+                    return WhereClause(col=expr_col, op=cmp_op, val=rhs), j + 2
+                if cmp_op == "IN":
+                    if j + 1 < len(tokens) and tokens[j + 1] == "(":
+                        inner, new_pos = _extract_paren_tokens(tokens, j + 1)
+                        if inner and inner[0].upper() == "SELECT":
+                            return WhereClause(col=expr_col, op="IN", val="__subquery__",
+                                               subquery_ast=_parse_tokens(inner)), new_pos
+                        return WhereClause(col=expr_col, op="IN",
+                                           val=",".join(_unquote_token(v) for v in inner
+                                                        if v != ",")), new_pos
+
     col = tokens[pos]
 
     # Bare boolean literal: TRUE / FALSE with no following operator
@@ -271,8 +441,21 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             inner.or_clause = WhereClause(col=col, op=">", val=hi_val)
             return WhereClause(col="", op="GROUP", val="",
                                group_clause=inner), pos + 6
+        if pos + 2 < len(tokens) and tokens[pos + 2].upper() in ("LIKE", "GLOB"):
+            if pos + 3 >= len(tokens):
+                raise ParseError(f"Expected pattern after NOT {tokens[pos + 2].upper()}")
+            op2 = tokens[pos + 2].upper()
+            val2 = _unquote_token(tokens[pos + 3])
+            advance = 4
+            if op2 == "LIKE" and pos + 4 < len(tokens) and tokens[pos + 4].upper() == "ESCAPE":
+                if pos + 5 >= len(tokens):
+                    raise ParseError("Expected escape character after ESCAPE")
+                val2 = val2 + "\x00" + _unquote_token(tokens[pos + 5])
+                advance = 6
+            inner2 = WhereClause(col=col, op=op2, val=val2)
+            return WhereClause(col="", op="NOT", val="", group_clause=inner2), pos + advance
         _got = tokens[pos + 2] if pos + 2 < len(tokens) else ""
-        raise ParseError(f"Expected IN or BETWEEN after NOT, got '{_got}'")
+        raise ParseError(f"Expected IN, BETWEEN, LIKE, or GLOB after NOT, got '{_got}'")
 
     if op == "IN":
         if pos + 2 >= len(tokens) or tokens[pos + 2] != "(":
@@ -314,7 +497,13 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             raise ParseError("Expected escape character after ESCAPE")
         esc = _unquote_token(tokens[pos + 4])
         return WhereClause(col=col, op="LIKE", val=val + "\x00" + esc), pos + 5
-    return WhereClause(col=col, op=op, val=val), pos + 3
+    advance = 3
+    collate: str | None = None
+    if pos + 3 < len(tokens) and tokens[pos + 3].upper() == "COLLATE":
+        if pos + 4 < len(tokens):
+            collate = tokens[pos + 4].upper()
+            advance = 5
+    return WhereClause(col=col, op=op, val=val, collate=collate), pos + advance
 
 
 _ROW_CMP_OPS = frozenset({"IN", "NOT", "=", "!=", "<", ">", "<=", ">="})
@@ -501,7 +690,7 @@ def _parse_order_limit(tokens: list[str], pos: int
         if pos >= len(tokens) or tokens[pos].upper() != "BY":
             raise ParseError("Expected BY after ORDER")
         pos += 1
-        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT",):
+        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT", "OFFSET"):
             col = tokens[pos]; pos += 1
             desc = False
             collation: str | None = None
@@ -676,6 +865,15 @@ def _parse_create_table(t: list[str], i: int, temporary: bool) -> dict:
                 i += 1
             continue
 
+        _m_uc = re.fullmatch(r"UNIQUE\s*\(([^)]*)\)", t[i], re.IGNORECASE)
+        if _m_uc:
+            uc_cols = [c.strip() for c in _m_uc.group(1).split(",") if c.strip()]
+            uc_constraints.append(uc_cols)
+            i += 1
+            if i < len(t) and t[i] == ",":
+                i += 1
+            continue
+
         if t[i].upper() == "UNIQUE" and i + 1 < len(t) and t[i + 1] == "(":
             i += 1
             uc_cols, i = _parse_col_list(t, i)
@@ -714,9 +912,16 @@ def _parse_create_table(t: list[str], i: int, temporary: bool) -> dict:
                 i += 1
             else:
                 generated_stored = False
-        while i < len(t) and t[i].upper() in (
-                "NOT", "UNIQUE", "DEFAULT", "CHECK", "REFERENCES",
-                "PRIMARY", "AUTOINCREMENT", "AUTO_INCREMENT"):
+        while i < len(t) and (
+                t[i].upper() in ("NOT", "UNIQUE", "DEFAULT", "CHECK",
+                                  "REFERENCES", "PRIMARY", "AUTOINCREMENT",
+                                  "AUTO_INCREMENT")
+                or re.match(r"CHECK\s*\(", t[i], re.IGNORECASE)):
+            _m_check_tok = re.fullmatch(r"CHECK\s*\((.+)\)", t[i], re.IGNORECASE | re.DOTALL)
+            if _m_check_tok:
+                check = _m_check_tok.group(1)
+                i += 1
+                continue
             col_kw = t[i].upper()
             if col_kw == "PRIMARY":
                 if i + 1 < len(t) and t[i + 1].upper() == "KEY":
@@ -825,19 +1030,37 @@ def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
     i += 1
     if i >= len(t):
         raise ParseError("Expected table name after ON in CREATE INDEX")
-    m = re.fullmatch(r"(\w+)\(([^)]+)\)", t[i])
+    m = re.fullmatch(r"(\w+)\((.+)\)", t[i], re.DOTALL)
     if m:
         table = m.group(1)
-        cols  = [c.strip() for c in m.group(2).split(",")]
+        # Split on commas that are NOT inside parentheses (handles expression cols)
+        raw = m.group(2)
+        cols = []
+        depth2 = 0
+        start2 = 0
+        for ci, ch in enumerate(raw):
+            if ch == '(':
+                depth2 += 1
+            elif ch == ')':
+                depth2 -= 1
+            elif ch == ',' and depth2 == 0:
+                cols.append(raw[start2:ci].strip())
+                start2 = ci + 1
+        cols.append(raw[start2:].strip())
     else:
         table = t[i]; i += 1
         if i >= len(t) or t[i] != "(":
             raise ParseError("Expected (<col>) after table name")
         i += 1; cols = []
         while i < len(t) and t[i] != ")":
-            if t[i] != ",":
-                cols.append(t[i])
-            i += 1
+            if t[i] == ",":
+                i += 1; continue
+            col_toks: list[str] = []
+            while i < len(t) and t[i] not in (",", ")"):
+                col_toks.append(t[i]); i += 1
+            col_expr = " ".join(col_toks).strip()
+            if col_expr:
+                cols.append(col_expr)
     if not cols:
         raise ParseError("Expected at least one column in index")
     return {"op": "CREATE_INDEX", "idx_name": idx_name,
@@ -975,13 +1198,26 @@ def _parse_alter(t: list[str]) -> dict:
         col_type, col_size = _parse_col_type(t[6])
         i = 7
         nullable = True
-        if i < len(t) and t[i].upper() == "NOT":
-            if i + 1 < len(t) and t[i + 1].upper() == "NULL":
-                nullable = False
+        default = None
+        while i < len(t):
+            kw = t[i].upper()
+            if kw == "NOT" and i + 1 < len(t) and t[i + 1].upper() == "NULL":
+                nullable = False; i += 2
+            elif kw == "DEFAULT" and i + 1 < len(t):
+                raw = t[i + 1]
+                default = _unquote_token(raw)
+                try:
+                    default = int(default)
+                except (ValueError, TypeError):
+                    try:
+                        default = float(default)
+                    except (ValueError, TypeError):
+                        pass
+                i += 2
             else:
-                raise ParseError("Expected NULL after NOT")
+                break
         return {"op": "ALTER_ADD_COLUMN", "table": table,
-                "col": Column(col_name, col_type, col_size, nullable)}
+                "col": Column(col_name, col_type, col_size, nullable, default=default)}
     if sub == "DROP":
         if len(t) < 6 or t[4].upper() != "COLUMN":
             raise ParseError("Expected: DROP COLUMN <name>")
@@ -1104,8 +1340,17 @@ def _parse_insert(t: list[str]) -> dict:
                                 i += 1; continue
                             col_n = t[i]
                             if i + 2 < len(t) and t[i + 1] == "=":
-                                on_conflict_set[col_n] = _unquote_token(t[i + 2])
-                                i += 3
+                                i += 2
+                                val_toks: list[str] = []
+                                while (i < len(t) and t[i] not in (";", ",")
+                                       and t[i].upper() != "WHERE"):
+                                    val_toks.append(t[i]); i += 1
+                                val_raw = " ".join(val_toks)
+                                on_conflict_set[col_n] = (
+                                    val_toks[0] if val_toks[0].startswith("'") and len(val_toks) == 1
+                                    else _unquote_token(val_toks[0]) if len(val_toks) == 1
+                                    else val_raw
+                                )
                             elif "=" in t[i]:
                                 parts = t[i].split("=", 1)
                                 on_conflict_set[parts[0]] = _unquote_token(parts[1])
@@ -1222,6 +1467,8 @@ def _parse_select(t: list[str]) -> dict:
                                     "on_left": None, "on_right": None, "on_clause": None})
         else:
             nxt_tbl = t[i]; i += 1
+            if nxt_tbl.upper() in _TABLE_VALUED_FUNCS:
+                nxt_tbl, i = _collect_func_call(t, nxt_tbl, i)
             nxt_alias, i = _parse_table_alias(t, i, nxt_tbl)
             from_tables.append((nxt_tbl, nxt_alias))
     if len(from_tables) > 1 or extra_implicit:
@@ -1425,9 +1672,16 @@ def _parse_select(t: list[str]) -> dict:
 
 
 def _parse_update(t: list[str]) -> dict:
-    if len(t) < 4 or t[2].upper() != "SET":
+    i = 1
+    conflict_action: str | None = None
+    if i < len(t) and t[i].upper() == "OR":
+        if i + 1 >= len(t):
+            raise ParseError("Expected conflict action after OR in UPDATE OR ...")
+        conflict_action = t[i + 1].upper()
+        i += 2
+    if i + 1 >= len(t) or t[i + 1].upper() != "SET":
         raise ParseError("Expected: UPDATE <table> SET col=val ...")
-    table = t[1]; i = 3
+    table = t[i]; i += 2
     assignments: dict[str, str] = {}
     while i < len(t) and t[i].upper() not in ("WHERE", "LIMIT", "RETURNING"):
         if t[i] == ",":
@@ -1435,7 +1689,10 @@ def _parse_update(t: list[str]) -> dict:
         token = t[i]
         if "=" in token:
             col, val = token.split("=", 1)
-            assignments[col] = _unquote_token(val); i += 1
+            # Preserve quotes on string literals so eval_expr can distinguish
+            # '555-0001' (string) from 555-0001 (arithmetic).
+            assignments[col] = val if val.startswith("'") else _unquote_token(val)
+            i += 1
         elif i + 2 < len(t) and t[i + 1] == "=":
             col_name = t[i]; i += 2
             val_toks: list[str] = []
@@ -1444,11 +1701,20 @@ def _parse_update(t: list[str]) -> dict:
                    and t[i] != ","):
                 val_toks.append(t[i]); i += 1
             val_raw = " ".join(val_toks)
-            assignments[col_name] = (_unquote_token(val_toks[0])
-                                     if len(val_toks) == 1 else val_raw)
+            if len(val_toks) == 1:
+                raw = val_toks[0]
+                assignments[col_name] = raw if raw.startswith("'") else _unquote_token(raw)
+            else:
+                assignments[col_name] = val_raw
         else:
             raise ParseError(f"Expected col=val near '{token}'")
     where, pos = _parse_where(t, i)
+    if pos < len(t) and t[pos].upper() == "ORDER":
+        pos += 1  # skip ORDER
+        if pos < len(t) and t[pos].upper() == "BY":
+            pos += 1  # skip BY
+        while pos < len(t) and t[pos].upper() not in ("LIMIT", "RETURNING"):
+            pos += 1  # skip sort column(s)
     limit_u: int | None = None
     if pos < len(t) and t[pos].upper() == "LIMIT":
         pos += 1
@@ -1465,13 +1731,20 @@ def _parse_update(t: list[str]) -> dict:
             pos += 1
     return {"op": "UPDATE", "table": table, "assignments": assignments,
             "where": where, "limit": limit_u,
-            "returning": returning_u or None}
+            "returning": returning_u or None,
+            "conflict_action": conflict_action}
 
 
 def _parse_delete(t: list[str]) -> dict:
     if len(t) < 3 or t[1].upper() != "FROM":
         raise ParseError("Expected: DELETE FROM <table> [WHERE ...]")
     where, pos = _parse_where(t, 3)
+    if pos < len(t) and t[pos].upper() == "ORDER":
+        pos += 1  # skip ORDER
+        if pos < len(t) and t[pos].upper() == "BY":
+            pos += 1  # skip BY
+        while pos < len(t) and t[pos].upper() not in ("LIMIT", "RETURNING"):
+            pos += 1  # skip sort column(s)
     limit_d: int | None = None
     if pos < len(t) and t[pos].upper() == "LIMIT":
         pos += 1
@@ -1511,13 +1784,56 @@ def _parse_tokens(t: list[str]) -> dict:
             set_op = tok.upper()
             all_flag = idx + 1 < len(t) and t[idx + 1].upper() == "ALL"
             right_start = idx + 2 if all_flag else idx + 1
-            return {
-                "op":     "SET_OP",
-                "set_op": set_op,
-                "all":    all_flag,
-                "left":   _parse_tokens(t[:idx]),
-                "right":  _parse_tokens(t[right_start:]),
+            right_toks = t[right_start:]
+            # Strip top-level ORDER BY / LIMIT / OFFSET — they belong to the
+            # SET_OP result, not to the right-hand SELECT
+            order_by: list[dict] = []
+            limit_val: int | None = None
+            offset_val: int | None = None
+            rd = 0
+            suffix_start = len(right_toks)
+            for ri, rtok in enumerate(right_toks):
+                if rtok == "(": rd += 1
+                elif rtok == ")": rd -= 1
+                elif rd == 0 and rtok.upper() in ("ORDER", "LIMIT", "OFFSET"):
+                    suffix_start = ri; break
+            if suffix_start < len(right_toks):
+                suffix = right_toks[suffix_start:]
+                right_toks = right_toks[:suffix_start]
+                # parse suffix for order_by / limit / offset
+                si = 0
+                while si < len(suffix):
+                    kw2 = suffix[si].upper()
+                    if kw2 == "ORDER" and si + 1 < len(suffix) and suffix[si+1].upper() == "BY":
+                        si += 2
+                        while si < len(suffix) and suffix[si].upper() not in ("LIMIT", "OFFSET"):
+                            col = suffix[si]; si += 1
+                            desc = si < len(suffix) and suffix[si].upper() == "DESC"
+                            if desc: si += 1
+                            elif si < len(suffix) and suffix[si].upper() == "ASC": si += 1
+                            order_by.append({"col": col, "desc": desc})
+                            if si < len(suffix) and suffix[si] == ",": si += 1
+                    elif kw2 == "LIMIT" and si + 1 < len(suffix):
+                        si += 1
+                        try: limit_val = int(suffix[si]); si += 1
+                        except ValueError: pass
+                    elif kw2 == "OFFSET" and si + 1 < len(suffix):
+                        si += 1
+                        try: offset_val = int(suffix[si]); si += 1
+                        except ValueError: pass
+                    else:
+                        si += 1
+            node: dict = {
+                "op":       "SET_OP",
+                "set_op":   set_op,
+                "all":      all_flag,
+                "left":     _parse_tokens(t[:idx]),
+                "right":    _parse_tokens(right_toks),
+                "order_by": order_by or None,
+                "limit":    limit_val,
+                "offset":   offset_val,
             }
+            return node
 
     kw = t[0].upper()
 

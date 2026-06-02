@@ -109,27 +109,31 @@ class BTree:
         """Remove all rows whose key is in *keys*.  Returns count deleted."""
         if not keys:
             return 0
-        # Phase 1: compact every leaf (safe to do in chain order)
+        # Phase 1: compact every leaf, collecting underfull candidates in chain order.
         deleted, pn = 0, self._leftmost_leaf()
+        candidates: list[int] = []
         while pn:
-            page     = self._p.get_page(pn)
-            nxt      = self._sibling(page)
-            before   = self._num_cells(page)
+            page   = self._p.get_page(pn)
+            nxt    = self._sibling(page)
+            before = self._num_cells(page)
             self._compact_leaf(page, keys)
-            deleted += before - self._num_cells(page)
-            pn       = nxt
-        # Phase 2: rebalance underfull leaves (restart from leftmost after each fix)
-        changed = True
-        while changed:
-            changed, pn = False, self._leftmost_leaf()
-            while pn:
-                page = self._p.get_page(pn)
-                nxt  = self._sibling(page)
-                if not page[1] and self._num_cells(page) < self._lmin:
-                    self._rebalance_leaf(pn)
-                    changed = True
-                    break
-                pn = nxt
+            after  = self._num_cells(page)
+            deleted += before - after
+            if not page[1] and after < self._lmin:
+                candidates.append(pn)
+            pn = nxt
+        # Phase 2: single forward pass over underfull candidates.
+        # freed tracks pages orphaned by a left-absorbs-right merge so we skip
+        # them if they appear later in the candidate list.
+        freed: set[int] = set()
+        for pn in candidates:
+            if pn in freed:
+                continue
+            page = self._p.get_page(pn)
+            # Skip if a preceding borrow already topped this page up.
+            if page[1] or self._num_cells(page) >= self._lmin:
+                continue
+            self._rebalance_leaf(pn, freed)
         return deleted
 
     # ── Key pack / unpack ─────────────────────────────────────────────────────
@@ -305,7 +309,8 @@ class BTree:
 
     # ── Leaf rebalancing ───────────────────────────────────────────────────────
 
-    def _rebalance_leaf(self, pn: int) -> None:
+    def _rebalance_leaf(self, pn: int,
+                        freed: "set[int] | None" = None) -> None:
         page = self._p.get_page(pn)
         if page[1] or self._num_cells(page) >= self._lmin:
             return
@@ -321,6 +326,8 @@ class BTree:
                 self._borrow_right_leaf(pn, rn, parent, k)
                 return
             self._merge_leaves(pn, rn, parent_num, parent, k)
+            if freed is not None:
+                freed.add(rn)   # rn is orphaned; skip if seen later in candidates
             return
 
         if k > 0:   # left sibling exists at children[k-1]
@@ -330,6 +337,8 @@ class BTree:
                 self._borrow_left_leaf(ln, pn, parent, k - 1)
                 return
             self._merge_leaves(ln, pn, parent_num, parent, k - 1)
+            # pn is orphaned (absorbed into ln); freed.add(pn) is unnecessary
+            # since pn is the current candidate and won't appear again
 
     def _borrow_right_leaf(self, ln: int, rn: int,
                             parent: bytearray, sep: int) -> None:

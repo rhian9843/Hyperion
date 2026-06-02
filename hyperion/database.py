@@ -1,6 +1,7 @@
 import contextlib
 import struct
 import threading
+from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -130,10 +131,16 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self.fk_enforcement  = True
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
-        self._plan_cache: dict[str, dict] = {}  # raw SQL template → parsed AST
+        self._plan_cache: OrderedDict[str, dict] = OrderedDict()  # LRU: SQL → AST
         # Schema bytes cache: skip page writes when structure hasn't changed.
-        # Ops are always written (they're small and change on every INSERT).
         self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
+        # Ops snapshot: detect which tables/indexes changed since last flush so
+        # ops_to_bytes() only re-serializes touched entries (O(dirty) not O(all)).
+        self._ops_snap_tables:  dict = {}   # {name: (root_page, next_page, next_key)}
+        self._ops_snap_indexes: dict = {}   # {name: (root_page, next_page)}
+        self._ops_snap_global:  tuple = (
+            self._catalog.next_free_page, tuple(self._catalog.free_pages)
+        )
         # Readers-writer lock: concurrent SELECTs share the read lock; writes
         # (DML, DDL, transactions) require exclusive access.  Write lock is
         # reentrant for the same thread so nested calls (e.g. executescript →
@@ -141,6 +148,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._lock = _RWLock()
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
+
+    def _exec_stmt_with_ctes(self, stmt: dict, ctes: dict) -> list[dict]:
+        from .executor import _rows_for_stmt
+        return _rows_for_stmt(stmt, self, ctes)
 
     # ── Read-only toggle ──────────────────────────────────────────────────────
 
@@ -175,6 +186,11 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if self._txn_depth > 0:
                 raise TransactionError("Transaction already active")
             self._pager.begin()
+            # If the pager found pending WAL frames and updated _cache, reload
+            # the catalog so this transaction starts with up-to-date next_key /
+            # root pages from a previous connection's lazy-checkpointed commit.
+            if getattr(self._pager, '_wal_had_pending', False):
+                self._reload_catalog()
             self._txn_depth = 1
 
     def commit(self) -> None:
@@ -492,6 +508,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
          self._catalog_ops_pn,
          self._catalog_ops_extra) = self._load_catalog()
         self._schema_flushed_bytes = self._catalog.schema_to_bytes()
+        # Reset ops snapshot so next flush rebuilds all snippets from scratch.
+        self._ops_snap_tables.clear()
+        self._ops_snap_indexes.clear()
+        self._ops_snap_global = (
+            self._catalog.next_free_page, tuple(self._catalog.free_pages)
+        )
 
     # ── Catalog flush — schema and ops written independently ──────────────────
 
@@ -585,8 +607,43 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._pager.flush(pn)
 
     def _flush_ops(self) -> None:
-        """Write operational-state JSON to the ops page chain."""
-        payload = self._catalog.ops_to_bytes()
+        """Write operational-state JSON to the ops page chain.
+
+        Before serializing, compare current ops values against the last-flush
+        snapshot to mark only changed tables/indexes as dirty.  ops_to_bytes()
+        then re-serializes only dirty entries, keeping cost O(dirty) instead
+        of O(all_tables) per commit.
+        """
+        cat = self._catalog
+        for name, m in cat.tables.items():
+            if m.temporary:
+                continue
+            curr = (m.root_page, m.next_page, m.next_key)
+            if self._ops_snap_tables.get(name) != curr:
+                cat.mark_table_ops_dirty(name)
+                self._ops_snap_tables[name] = curr
+        # Remove entries for dropped tables
+        for name in list(self._ops_snap_tables):
+            if name not in cat.tables:
+                cat._t_snippets.pop(name, None)
+                del self._ops_snap_tables[name]
+
+        for name, m in cat.indexes.items():
+            curr = (m.root_page, m.next_page)
+            if self._ops_snap_indexes.get(name) != curr:
+                cat.mark_index_ops_dirty(name)
+                self._ops_snap_indexes[name] = curr
+        for name in list(self._ops_snap_indexes):
+            if name not in cat.indexes:
+                cat._i_snippets.pop(name, None)
+                del self._ops_snap_indexes[name]
+
+        global_curr = (cat.next_free_page, tuple(cat.free_pages))
+        if self._ops_snap_global != global_curr:
+            cat.mark_global_ops_dirty()
+            self._ops_snap_global = global_curr
+
+        payload = cat.ops_to_bytes()
         for _ in range(4):
             n_needed = max(1, (len(payload) + _CAT_CHUNK - 1) // _CAT_CHUNK)
             n_have   = 1 + len(self._catalog_ops_extra)

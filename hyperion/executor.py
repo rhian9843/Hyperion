@@ -119,6 +119,22 @@ from .triggers import (fire_triggers, has_triggers, has_instead_of,
                        scan_matching_rows, apply_update_row)
 from .where import _instantiate_correlated
 
+_DEFAULT_CONST_EXPRS = frozenset({
+    "TRUE", "FALSE", "CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"
+})
+
+def _eval_default(val: Any) -> Any:
+    """Evaluate a column default value, resolving SQL constants at insert time."""
+    if not isinstance(val, str):
+        return val
+    if val.upper() in _DEFAULT_CONST_EXPRS or "(" in val or " " in val:
+        try:
+            return eval_expr(val, {})
+        except Exception:
+            pass
+    return val
+
+
 def _is_single_string_literal(val: str) -> bool:
     """True iff val is exactly one single-quoted SQL string (not a concat expression)."""
     if not (val.startswith("'") and val.endswith("'") and len(val) >= 2):
@@ -327,6 +343,11 @@ def _apply_one_window(rows: list[dict], col: str, wf: dict) -> None:
             tcol    = fn_args[0].strip() if fn_args else None
             is_star = not tcol or tcol == "*"
             frame   = wf.get("frame")
+            # SQL default: ORDER BY with no explicit frame → ROWS UNBOUNDED PRECEDING TO CURRENT ROW
+            if frame is None and ob_spec:
+                frame = {"mode": "ROWS",
+                         "lo": ("UNBOUNDED", "PRECEDING"),
+                         "hi": ("CURRENT", "ROW")}
             if frame is not None:
                 # Per-row frame: each row gets its own aggregate over its frame window
                 for pos, idx in enumerate(indices):
@@ -429,11 +450,20 @@ def _exec_recursive_cte(cte_def: dict, db: "Database", ctes: dict) -> list[dict]
     union_all = cte_def.get("union_all", True)
 
     working = [_apply_aliases(r) for r in _rows_for_stmt(cte_def["base"], db, ctes)]
+    # Derive canonical column names from base case (used when no explicit col aliases)
+    base_keys: list[str] = list(working[0].keys()) if working else []
     for row in working:
         k = _row_key(row)
         if union_all or k not in seen:
             accumulated.append(row)
             seen.append(k)
+
+    def _normalize_to_base(row: dict) -> dict:
+        """Rename recursive step output columns to match base case column names."""
+        if col_aliases or not base_keys:
+            return row
+        vals = list(row.values())
+        return {base_keys[i]: vals[i] for i in range(min(len(base_keys), len(vals)))}
 
     max_iterations = 1000
     for _ in range(max_iterations):
@@ -441,7 +471,7 @@ def _exec_recursive_cte(cte_def: dict, db: "Database", ctes: dict) -> list[dict]
             break
         step_ctes = {**ctes, cte_key: {"op": "INLINE_ROWS", "rows": working}}
         raw = _rows_for_stmt(cte_def["recursive"], db, step_ctes)
-        working = [_apply_aliases(r) for r in raw]
+        working = [_normalize_to_base(_apply_aliases(r)) for r in raw]
         new_rows: list[dict] = []
         for row in working:
             k = _row_key(row)
@@ -522,8 +552,21 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
     on_clause   = join_info.get("on_clause")
     on_left     = join_info.get("on_left")
     on_right    = join_info.get("on_right")
-    rcol        = on_right.split(".")[-1] if on_right else None
     lat_sub     = join_info.get("lateral_subquery")
+
+    # Normalise on_left/on_right so that on_left is always the column from the
+    # LEFT combined rows and on_right is always the column from the RIGHT (new)
+    # table.  The parser sets them by position in the ON "=" expression, which
+    # can place the right-table column on the left side (e.g. ON i.col = o.col
+    # where i is the new right table).
+    if on_left and on_right:
+        left_prefix  = on_left.split(".")[0]  if "." in on_left  else ""
+        right_prefix = on_right.split(".")[0] if "." in on_right else ""
+        # If the on_left prefix matches the right_alias, they need to be swapped.
+        if left_prefix == right_alias and right_prefix != right_alias:
+            on_left, on_right = on_right, on_left
+
+    rcol = on_right.split(".")[-1] if on_right else None
 
     # LATERAL: for each left row, re-execute the subquery with outer context
     if lat_sub is not None:
@@ -680,7 +723,9 @@ def _exec_in_memory_join(stmt: dict, db: "Database", ctes: dict) -> list[dict]:
 
     def _right_rows_for(lr: dict) -> list[dict]:
         if _lat_sub is not None:
-            inst = {**_lat_sub, "where": _instantiate_correlated(_lat_sub.get("where"), lr)}
+            inst = {**_lat_sub,
+                    "where": _instantiate_correlated(_lat_sub.get("where"), lr),
+                    "_outer_row": lr}
             return _rows_for_stmt(inst, db, ctes)
         if not _rtbl_is_tvf:
             return right_rows_static  # type: ignore[return-value]
@@ -746,14 +791,27 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     _tls.user_aggs  = db._user_aggs
     _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
-    op = stmt["op"]
+    _prev_active_ctes = getattr(db, '_active_ctes', None)
+    if ctes:
+        db._active_ctes = {**(_prev_active_ctes or {}), **ctes}
+    try:
+        return _rows_for_stmt_inner(stmt, db, ctes, op=stmt["op"])
+    finally:
+        if _prev_active_ctes is None:
+            db.__dict__.pop('_active_ctes', None)
+        else:
+            db._active_ctes = _prev_active_ctes
+
+
+def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> list[dict]:
     if op == "INLINE_ROWS":
         return stmt["rows"]
     if op == "RECURSIVE_CTE":
         return _exec_recursive_cte(stmt, db, ctes)
     if op == "SELECT_NOFROM":
         col_aliases = stmt.get("col_aliases") or {}
-        result = {col: eval_expr(col, {}) for col in (stmt.get("columns") or [])}
+        outer = stmt.get("_outer_row") or {}
+        result = {col: eval_expr(col, outer) for col in (stmt.get("columns") or [])}
         return [{col_aliases.get(k, k): v for k, v in result.items()}]
     if op == "SELECT":
         s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
@@ -764,7 +822,14 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
         tbl = s.get("table") or ""
         if s.get("subquery_from"):
-            rows = _exec_derived_table(s, db, ctes)
+            if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
+                raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
+                raw_rows = _exec_derived_table(raw_stmt, db, ctes)
+                rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
+                                          s.get("having"), db)
+                rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
+            else:
+                rows = _exec_derived_table(s, db, ctes)
         elif tbl == "_hyperion_master":
             rows = _exec_cte_select(s, {"op": "INLINE_ROWS",
                                         "rows": _hyperion_master_rows(db)}, db, ctes)
@@ -826,14 +891,17 @@ def _rows_for_stmt(stmt: dict, db: "Database",
         ltbl = s.get("left_table", "")
         rtbl = s.get("right_table", "")
         group_by = s.get("group_by")
+        stmt_cols_j = s.get("columns") or []
         has_agg  = (group_by or (s.get("having") is not None) or any(
-            _q_parse_agg(c) for c in (s.get("columns") or []) if c != "*"))
+            _q_parse_agg(c) for c in stmt_cols_j if c != "*"))
+        has_window_j = any(_WINDOW_RE.search(c) or _WINDOW_NAMED_RE.search(c)
+                           for c in stmt_cols_j if c != "*")
         multi_cond_on = s.get("on_clause") is not None and s.get("on_left") is None
         has_lateral = (rtbl == "__lateral__" or s.get("lateral_subquery") is not None
                        or any(ej.get("lateral_subquery") for ej in (s.get("extra_joins") or [])))
         if (ltbl in ctes or rtbl in ctes or ltbl in db.views or rtbl in db.views
                 or _JSON_EACH_RE.match(ltbl) or _JSON_EACH_RE.match(rtbl)
-                or has_agg or multi_cond_on or has_lateral):
+                or has_agg or has_window_j or multi_cond_on or has_lateral):
             raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
             raw_rows = _exec_in_memory_join(raw_stmt, db, ctes)
             for ej in (s.get("extra_joins") or []):
@@ -841,6 +909,11 @@ def _rows_for_stmt(stmt: dict, db: "Database",
             if has_agg:
                 raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
                                               group_by, s.get("having"), db)
+            elif has_window_j:
+                nw_j = stmt.get("named_windows") or {}
+                raw_rows = [_normalize_row(r) for r in raw_rows]
+                raw_rows = _apply_window_functions(raw_rows, stmt_cols_j, nw_j)
+                raw_rows = [_project_row(r, stmt_cols_j) for r in raw_rows] if stmt_cols_j else raw_rows
             elif s.get("columns"):
                 raw_rows = [_project_row(_normalize_row(r), s["columns"]) for r in raw_rows]
             rows = _apply_order_limit(raw_rows, s.get("order_by"), s.get("limit"), s.get("offset"))
@@ -875,7 +948,8 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     if op == "SET_OP":
         left  = _rows_for_stmt(stmt["left"],  db, ctes)
         right = _rows_for_stmt(stmt["right"], db, ctes)
-        return _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
+        rows  = _apply_set_op(stmt["set_op"], stmt.get("all", False), left, right)
+        return _apply_order_limit(rows, stmt.get("order_by"), stmt.get("limit"), stmt.get("offset"))
     raise InternalError(f"Expected SELECT/JOIN/SET_OP, got '{op}'")
 
 
@@ -891,6 +965,9 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
     """
     _check_timeout(db)
     merged_ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
+    if merged_ctes:
+        _prev = getattr(db, '_active_ctes', None)
+        db._active_ctes = {**(_prev or {}), **merged_ctes}
     op = stmt.get("op", "")
 
     if op == "SELECT" and not stmt.get("subquery_from"):
@@ -929,14 +1006,14 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
                 if skipped < offset:
                     skipped += 1
                     continue
+                if limit is not None and count >= limit:
+                    return
                 projected = _project_row(row, cols) if cols else row
                 if col_aliases:
                     projected = {col_aliases.get(k, k): v
                                  for k, v in projected.items()}
                 yield projected
                 count += 1
-                if limit is not None and count >= limit:
-                    return
             return
 
     yield from _rows_for_stmt(stmt, db, merged_ctes)
@@ -970,12 +1047,14 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
         if value in ("OFF", "0", "FALSE"):
             db.fk_enforcement = False
             return "foreign_keys = 0"
-        return f"foreign_keys = {1 if db.fk_enforcement else 0}"
+        val = 1 if db.fk_enforcement else 0
+        return RowResult([{"foreign_keys": val}], ["foreign_keys"])
 
     if name == "table_info":
         tname = stmt.get("arg") or ""
         if tname not in db.tables:
-            raise NoSuchTableError(f"No such table: '{tname}'")
+            cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
+            return RowResult([], cols)
         schema = db._meta(tname).schema
         pk_cols = set(schema.primary_key_columns or [])
         rows = []
@@ -1160,15 +1239,23 @@ def _exec_instead_of_insert(stmt: dict, db: Database) -> str:
             raise SchemaError(
                 f"Cannot determine columns for INSERT on view '{tname}' "
                 f"— specify column names explicitly")
+    _IIOT_CONST = frozenset({"TRUE", "FALSE", "CURRENT_TIMESTAMP",
+                              "CURRENT_DATE", "CURRENT_TIME"})
     count = 0
     for values in stmt["rows"]:
         if len(col_names) != len(values):
             raise DataError(
                 f"Column/value mismatch: {len(col_names)} columns, {len(values)} values")
-        parsed: dict[str, Any] = {
-            n: (None if v.upper() == "NULL" else v)
-            for n, v in zip(col_names, values)
-        }
+        parsed: dict[str, Any] = {}
+        for n, v in zip(col_names, values):
+            if v.upper() == "NULL":
+                parsed[n] = None
+            elif _is_single_string_literal(v):
+                parsed[n] = v[1:-1].replace("''", "'")
+            elif " " in v or v.upper() in _IIOT_CONST or "(" in v:
+                parsed[n] = eval_expr(v, {})
+            else:
+                parsed[n] = v
         fire_triggers(db, tname, "INSTEAD OF", "INSERT", parsed, None)
         count += 1
     return f"{count} row{'s' if count != 1 else ''} inserted."
@@ -1255,278 +1342,289 @@ def _exec_meta_delete(stmt: dict, db: Database) -> str:
     return f"{n} row{'s' if n != 1 else ''} deleted."
 
 
-def _execute_inner(stmt: dict, db: Database) -> str:
+def _exec_create_table_as_select(stmt: dict, db: Database) -> str:
+    from .schema import Schema, Column
+    if stmt.get("if_not_exists") and stmt["name"] in db.tables:
+        return f"Table '{stmt['name']}' already exists."
+    rows = _rows_for_stmt(stmt["select"], db)
+    if not rows:
+        sel_cols = stmt["select"].get("columns") or []
+        columns = [Column(c, TEXT, DEFAULT_TEXT_SIZE) for c in sel_cols if c != "*"]
+    else:
+        columns = []
+        for col_name, val in rows[0].items():
+            if isinstance(val, int):
+                columns.append(Column(col_name, INTEGER, 8))
+            elif isinstance(val, float):
+                columns.append(Column(col_name, REAL, 8))
+            else:
+                max_len = max(len(str(r.get(col_name) or "")) for r in rows)
+                columns.append(Column(col_name, TEXT, max(DEFAULT_TEXT_SIZE, max_len + 16)))
+    db.create_table(Schema(name=stmt["name"], columns=columns))
+    for row in rows:
+        db.insert(stmt["name"], row)
+    n = len(rows)
+    _invalidate_rc(db, stmt["name"])
+    return f"Table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
+
+
+def _exec_create_table(stmt: dict, db: Database) -> str:
     from .schema import Schema
-    op = stmt["op"]
-
-    if op == "ANALYZE":
-        return _execute_analyze(stmt, db)
-
-    if op == "CREATE_TABLE_AS_SELECT":
-        from .schema import Schema, Column
-        if stmt.get("if_not_exists") and stmt["name"] in db.tables:
-            return f"Table '{stmt['name']}' already exists."
-        rows = _rows_for_stmt(stmt["select"], db)
-        if not rows:
-            sel_cols = stmt["select"].get("columns") or []
-            columns = [Column(c, TEXT, DEFAULT_TEXT_SIZE)
-                       for c in sel_cols if c != "*"]
-        else:
-            columns = []
-            for col_name, val in rows[0].items():
-                if isinstance(val, int):
-                    columns.append(Column(col_name, INTEGER, 8))
-                elif isinstance(val, float):
-                    columns.append(Column(col_name, REAL, 8))
-                else:
-                    max_len = max(len(str(r.get(col_name) or "")) for r in rows)
-                    columns.append(Column(col_name, TEXT, max(DEFAULT_TEXT_SIZE, max_len + 16)))
-        from .schema import Schema
-        db.create_table(Schema(name=stmt["name"], columns=columns))
-        for row in rows:
-            db.insert(stmt["name"], row)
-        n = len(rows)
-        _invalidate_rc(db, stmt["name"])
-        return f"Table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
-
-    if op == "CREATE_TABLE":
-        if stmt.get("if_not_exists") and stmt["name"] in db.tables:
-            return f"Table '{stmt['name']}' already exists."
-        pk_cols = stmt.get("primary_key_columns") or []
-        if pk_cols:
-            for col in stmt["columns"]:
-                if col.name in pk_cols:
-                    col.nullable = False
-            uc = list(stmt.get("unique_constraints") or [])
-            if pk_cols not in uc:
-                uc.append(pk_cols)
-            stmt = {**stmt, "unique_constraints": uc}
-        db.create_table(Schema(name=stmt["name"], columns=stmt["columns"],
-                               foreign_keys=stmt.get("foreign_keys", []),
-                               unique_constraints=stmt.get("unique_constraints", []),
-                               primary_key_columns=pk_cols),
-                        temporary=stmt.get("temporary", False))
+    if stmt.get("if_not_exists") and stmt["name"] in db.tables:
+        return f"Table '{stmt['name']}' already exists."
+    pk_cols = stmt.get("primary_key_columns") or []
+    if pk_cols:
         for col in stmt["columns"]:
-            if col.primary_key:
-                pk_idx = f"_pk_{stmt['name']}_{col.name}"
-                if pk_idx not in db.indexes:
-                    db.create_index(pk_idx, stmt["name"], [col.name])
-        if pk_cols and len(pk_cols) > 1:
-            pk_idx = f"_pk_{stmt['name']}_{'_'.join(pk_cols)}"
+            if col.name in pk_cols:
+                col.nullable = False
+        uc = list(stmt.get("unique_constraints") or [])
+        if pk_cols not in uc:
+            uc.append(pk_cols)
+        stmt = {**stmt, "unique_constraints": uc}
+    db.create_table(Schema(name=stmt["name"], columns=stmt["columns"],
+                           foreign_keys=stmt.get("foreign_keys", []),
+                           unique_constraints=stmt.get("unique_constraints", []),
+                           primary_key_columns=pk_cols),
+                    temporary=stmt.get("temporary", False))
+    for col in stmt["columns"]:
+        if col.primary_key:
+            pk_idx = f"_pk_{stmt['name']}_{col.name}"
             if pk_idx not in db.indexes:
-                db.create_index(pk_idx, stmt["name"], pk_cols)
-        return f"Table '{stmt['name']}' created."
+                db.create_index(pk_idx, stmt["name"], [col.name])
+    if pk_cols and len(pk_cols) > 1:
+        pk_idx = f"_pk_{stmt['name']}_{'_'.join(pk_cols)}"
+        if pk_idx not in db.indexes:
+            db.create_index(pk_idx, stmt["name"], pk_cols)
+    return f"Table '{stmt['name']}' created."
 
-    if op == "DROP_TABLE":
-        if stmt.get("if_exists") and stmt["name"] not in db.tables:
-            return f"Table '{stmt['name']}' does not exist."
-        db.drop_table(stmt["name"])
-        _invalidate_rc(db, stmt["name"])
-        return f"Table '{stmt['name']}' dropped."
 
-    if op == "CREATE_VIEW":
-        db.create_view(stmt["name"], stmt["sql"],
-                       if_not_exists=stmt.get("if_not_exists", False),
-                       or_replace=stmt.get("or_replace", False))
-        return f"View '{stmt['name']}' created."
+def _exec_drop_table(stmt: dict, db: Database) -> str:
+    if stmt.get("if_exists") and stmt["name"] not in db.tables:
+        return f"Table '{stmt['name']}' does not exist."
+    db.drop_table(stmt["name"])
+    _invalidate_rc(db, stmt["name"])
+    return f"Table '{stmt['name']}' dropped."
 
-    if op == "DROP_VIEW":
-        db.drop_view(stmt["name"], if_exists=stmt.get("if_exists", False))
-        return f"View '{stmt['name']}' dropped."
 
-    if op == "ALTER_ADD_COLUMN":
-        db.alter_add_column(stmt["table"], stmt["col"])
-        return f"Column '{stmt['col'].name}' added to '{stmt['table']}'."
+def _exec_create_view(stmt: dict, db: Database) -> str:
+    db.create_view(stmt["name"], stmt["sql"],
+                   if_not_exists=stmt.get("if_not_exists", False),
+                   or_replace=stmt.get("or_replace", False))
+    return f"View '{stmt['name']}' created."
 
-    if op == "ALTER_DROP_COLUMN":
-        db.alter_drop_column(stmt["table"], stmt["col_name"])
-        return f"Column '{stmt['col_name']}' dropped from '{stmt['table']}'."
 
-    if op == "ALTER_RENAME_COLUMN":
-        db.alter_rename_column(stmt["table"], stmt["old_name"], stmt["new_name"])
-        return f"Column '{stmt['old_name']}' renamed to '{stmt['new_name']}'."
+def _exec_drop_view(stmt: dict, db: Database) -> str:
+    db.drop_view(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"View '{stmt['name']}' dropped."
 
-    if op == "ALTER_RENAME_TABLE":
-        db.alter_rename_table(stmt["table"], stmt["new_name"])
-        return f"Table '{stmt['table']}' renamed to '{stmt['new_name']}'."
 
-    if op == "ALTER_ALTER_COLUMN":
-        db.alter_column_type(stmt["table"], stmt["col_name"],
-                             stmt["new_type"], stmt["new_size"])
-        return (f"Column '{stmt['col_name']}' in '{stmt['table']}' "
-                f"type changed to {stmt['new_type']}.")
+def _exec_alter_add_column(stmt: dict, db: Database) -> str:
+    db.alter_add_column(stmt["table"], stmt["col"])
+    return f"Column '{stmt['col'].name}' added to '{stmt['table']}'."
 
-    if op == "CREATE_INDEX":
-        if stmt.get("if_not_exists") and stmt["idx_name"] in db.indexes:
-            return f"Index '{stmt['idx_name']}' already exists."
-        db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"],
-                        unique=stmt.get("unique", False))
-        cols_str = ", ".join(stmt["cols"])
-        return f"Index '{stmt['idx_name']}' created on {stmt['table']}({cols_str})."
 
-    if op == "DROP_INDEX":
-        try:
-            db.drop_index(stmt["idx_name"])
-        except (NoSuchIndexError, RuntimeError):
-            if not stmt.get("if_exists"):
-                raise
-        return f"Index '{stmt['idx_name']}' dropped."
+def _exec_alter_drop_column(stmt: dict, db: Database) -> str:
+    db.alter_drop_column(stmt["table"], stmt["col_name"])
+    return f"Column '{stmt['col_name']}' dropped from '{stmt['table']}'."
 
-    if op == "CREATE_TRIGGER":
-        from .catalog import TriggerMeta
-        if stmt.get("if_not_exists") and stmt["name"] in db._catalog.triggers:
-            return f"Trigger '{stmt['name']}' already exists."
-        trig = TriggerMeta(stmt["table"], stmt["timing"], stmt["event"],
-                           stmt.get("update_cols", []), stmt.get("when_tokens", []),
-                           stmt.get("body_tokens", []))
-        db.create_trigger(stmt["name"], trig)
-        return f"Trigger '{stmt['name']}' created."
 
-    if op == "DROP_TRIGGER":
-        if stmt.get("if_exists") and stmt["name"] not in db._catalog.triggers:
-            return f"Trigger '{stmt['name']}' does not exist."
-        db.drop_trigger(stmt["name"])
-        return f"Trigger '{stmt['name']}' dropped."
+def _exec_alter_rename_column(stmt: dict, db: Database) -> str:
+    db.alter_rename_column(stmt["table"], stmt["old_name"], stmt["new_name"])
+    return f"Column '{stmt['old_name']}' renamed to '{stmt['new_name']}'."
 
-    if op == "INSERT":
-        if stmt["table"] == "_hyperion_schema_meta":
-            return _exec_meta_insert(stmt, db)
-        if stmt["table"] not in db.tables and stmt["table"] in db.views:
-            if not has_instead_of(db, stmt["table"], "INSERT"):
-                raise SchemaError(
-                    f"Cannot insert into view '{stmt['table']}' without an INSTEAD OF trigger")
-            return _exec_instead_of_insert(stmt, db)
-        meta            = db._meta(stmt["table"])
-        col_names       = stmt["col_names"] or [c.name for c in meta.schema.columns]
-        conflict_action = stmt.get("conflict_action")
-        on_conflict_set = stmt.get("on_conflict_set") or {}
-        returning_cols  = stmt.get("returning")
-        returned_rows: list[dict] = []
-        _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
-        for values in stmt["rows"]:
-            if len(col_names) != len(values):
-                raise DataError(
-                    f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
-                )
-            parsed: dict[str, Any] = {}
-            _CONST_EXPRS = frozenset({"TRUE", "FALSE", "CURRENT_TIMESTAMP",
-                                       "CURRENT_DATE", "CURRENT_TIME"})
-            for name, val in zip(col_names, values):
-                if val.upper() == "NULL":
-                    parsed[name] = None
-                elif _is_single_string_literal(val):
-                    # Quoted string literal — unquote (handle '' escape sequences)
-                    parsed[name] = val[1:-1].replace("''", "'")
-                elif " " in val or val.upper() in _CONST_EXPRS:
-                    # Multi-token expression (joined with spaces) or SQL constant
-                    parsed[name] = eval_expr(val, {})
+
+def _exec_alter_rename_table(stmt: dict, db: Database) -> str:
+    db.alter_rename_table(stmt["table"], stmt["new_name"])
+    return f"Table '{stmt['table']}' renamed to '{stmt['new_name']}'."
+
+
+def _exec_alter_alter_column(stmt: dict, db: Database) -> str:
+    db.alter_column_type(stmt["table"], stmt["col_name"],
+                         stmt["new_type"], stmt["new_size"])
+    return (f"Column '{stmt['col_name']}' in '{stmt['table']}' "
+            f"type changed to {stmt['new_type']}.")
+
+
+def _exec_create_index(stmt: dict, db: Database) -> str:
+    if stmt.get("if_not_exists") and stmt["idx_name"] in db.indexes:
+        return f"Index '{stmt['idx_name']}' already exists."
+    db.create_index(stmt["idx_name"], stmt["table"], stmt["cols"],
+                    unique=stmt.get("unique", False))
+    cols_str = ", ".join(stmt["cols"])
+    return f"Index '{stmt['idx_name']}' created on {stmt['table']}({cols_str})."
+
+
+def _exec_drop_index(stmt: dict, db: Database) -> str:
+    try:
+        db.drop_index(stmt["idx_name"])
+    except (NoSuchIndexError, RuntimeError):
+        if not stmt.get("if_exists"):
+            raise
+    return f"Index '{stmt['idx_name']}' dropped."
+
+
+def _exec_create_trigger(stmt: dict, db: Database) -> str:
+    from .catalog import TriggerMeta
+    if stmt.get("if_not_exists") and stmt["name"] in db._catalog.triggers:
+        return f"Trigger '{stmt['name']}' already exists."
+    trig = TriggerMeta(stmt["table"], stmt["timing"], stmt["event"],
+                       stmt.get("update_cols", []), stmt.get("when_tokens", []),
+                       stmt.get("body_tokens", []))
+    db.create_trigger(stmt["name"], trig)
+    return f"Trigger '{stmt['name']}' created."
+
+
+def _exec_drop_trigger(stmt: dict, db: Database) -> str:
+    if stmt.get("if_exists") and stmt["name"] not in db._catalog.triggers:
+        return f"Trigger '{stmt['name']}' does not exist."
+    db.drop_trigger(stmt["name"])
+    return f"Trigger '{stmt['name']}' dropped."
+
+
+def _exec_insert(stmt: dict, db: Database) -> str:
+    if stmt["table"] == "_hyperion_schema_meta":
+        return _exec_meta_insert(stmt, db)
+    if stmt["table"] not in db.tables and stmt["table"] in db.views:
+        if not has_instead_of(db, stmt["table"], "INSERT"):
+            raise SchemaError(
+                f"Cannot insert into view '{stmt['table']}' without an INSTEAD OF trigger")
+        return _exec_instead_of_insert(stmt, db)
+    meta            = db._meta(stmt["table"])
+    col_names       = stmt["col_names"] or [c.name for c in meta.schema.columns]
+    for _cn in (stmt["col_names"] or []):
+        _cm = next((c for c in meta.schema.columns if c.name == _cn), None)
+        if _cm and _cm.is_generated:
+            raise ConstraintError(f"Cannot assign to generated column '{_cn}'")
+    conflict_action = stmt.get("conflict_action")
+    on_conflict_set = stmt.get("on_conflict_set") or {}
+    returning_cols  = stmt.get("returning")
+    returned_rows: list[dict] = []
+    _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
+    for values in stmt["rows"]:
+        if len(col_names) != len(values):
+            raise DataError(
+                f"Column/value mismatch: {len(col_names)} columns, {len(values)} values"
+            )
+        parsed: dict[str, Any] = {}
+        for name, val in zip(col_names, values):
+            if val.upper() == "NULL":
+                parsed[name] = None
+            elif _is_single_string_literal(val):
+                parsed[name] = val[1:-1].replace("''", "'")
+            elif " " in val or val.upper() in _DEFAULT_CONST_EXPRS or "(" in val:
+                parsed[name] = eval_expr(val, {})
+            else:
+                parsed[name] = val
+        for col in meta.schema.columns:
+            if col.name not in parsed:
+                parsed[col.name] = _eval_default(col.default)
+        if _has_ins_trig:
+            fire_triggers(db, stmt["table"], "BEFORE", "INSERT", parsed, None)
+        if conflict_action == "IGNORE":
+            try:
+                row_out = db.insert(stmt["table"], parsed)
+                if _has_ins_trig:
+                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
+                if returning_cols:
+                    returned_rows.append(row_out)
+            except (ConstraintError, RuntimeError) as _e:
+                if isinstance(_e, ConstraintError) or any(
+                        kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK",
+                                                  "FOREIGN KEY", "constraint")):
+                    pass
                 else:
-                    parsed[name] = val
-            for col in meta.schema.columns:
-                if col.name not in parsed:
-                    parsed[col.name] = col.default
+                    raise
+        elif conflict_action == "REPLACE":
+            _remove_conflicting_rows(db, meta, parsed)
+            row_out = db.insert(stmt["table"], parsed)
             if _has_ins_trig:
-                fire_triggers(db, stmt["table"], "BEFORE", "INSERT", parsed, None)
-            if conflict_action == "IGNORE":
-                try:
-                    row_out = db.insert(stmt["table"], parsed)
-                    if _has_ins_trig:
-                        fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
-                    if returning_cols:
-                        returned_rows.append(row_out)
-                except (ConstraintError, RuntimeError) as _e:
-                    if isinstance(_e, ConstraintError) or any(
-                            kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK",
-                                                      "FOREIGN KEY", "constraint")):
-                        pass
-                    else:
-                        raise
-            elif conflict_action == "REPLACE":
-                _remove_conflicting_rows(db, meta, parsed)
-                row_out = db.insert(stmt["table"], parsed)
-                if _has_ins_trig:
-                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
-                if returning_cols:
-                    returned_rows.append(row_out)
-            elif conflict_action == "UPDATE":
-                try:
-                    row_out = db.insert(stmt["table"], parsed)
-                    if _has_ins_trig:
-                        fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
-                    if returning_cols:
-                        returned_rows.append(row_out)
-                except (ConstraintError, RuntimeError) as _e:
-                    if isinstance(_e, ConstraintError) or any(
-                            kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK")):
-                        _apply_on_conflict_update(db, meta, parsed, on_conflict_set)
-                    else:
-                        raise
-            else:
-                row_out = db.insert(stmt["table"], parsed)
-                if _has_ins_trig:
-                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
-                if returning_cols:
-                    returned_rows.append(row_out)
-        n = len(stmt["rows"])
-        _invalidate_rc(db, stmt["table"])
-        if returning_cols:
-            projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
-            return RowResult(projected, returning_cols, rowcount=n)
-        return f"{n} row{'s' if n != 1 else ''} inserted."
-
-    if op == "INSERT_SELECT":
-        src_rows = _rows_for_stmt(stmt["select"], db, stmt.get("ctes"))
-        col_names = stmt.get("col_names")
-        meta = db._meta(stmt["table"])
-        target_cols = [c.name for c in meta.schema.columns]
-        _has_ins_trig2 = has_triggers(db, stmt["table"], "INSERT")
-        for src_row in src_rows:
-            if col_names:
-                row_vals = list(src_row.values())
-                data: dict[str, Any] = {n: (row_vals[i] if i < len(row_vals) else None)
-                                        for i, n in enumerate(col_names)}
-            else:
-                src_keys = list(src_row.keys())
-                # Use key matching when source keys align with target columns;
-                # fall back to positional mapping otherwise (e.g. SELECT literals)
-                if all(k in target_cols for k in src_keys):
-                    data = dict(src_row)
-                else:
-                    src_vals = list(src_row.values())
-                    data = {target_cols[i]: src_vals[i]
-                            for i in range(min(len(target_cols), len(src_vals)))}
-            for col in meta.schema.columns:
-                if col.name not in data:
-                    data[col.name] = col.default
-            if _has_ins_trig2:
-                fire_triggers(db, stmt["table"], "BEFORE", "INSERT", data, None)
-            row_out = db.insert(stmt["table"], data)
-            if _has_ins_trig2:
                 fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
-        n = len(src_rows)
-        _invalidate_rc(db, stmt["table"])
-        return f"{n} row{'s' if n != 1 else ''} inserted."
+            if returning_cols:
+                returned_rows.append(row_out)
+        elif conflict_action == "UPDATE":
+            try:
+                row_out = db.insert(stmt["table"], parsed)
+                if _has_ins_trig:
+                    fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
+                if returning_cols:
+                    returned_rows.append(row_out)
+            except (ConstraintError, RuntimeError) as _e:
+                if isinstance(_e, ConstraintError) or any(
+                        kw in str(_e) for kw in ("UNIQUE", "NOT NULL", "CHECK")):
+                    _apply_on_conflict_update(db, meta, parsed, on_conflict_set)
+                else:
+                    raise
+        else:
+            row_out = db.insert(stmt["table"], parsed)
+            if _has_ins_trig:
+                fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
+            if returning_cols:
+                returned_rows.append(row_out)
+    n = len(stmt["rows"])
+    _invalidate_rc(db, stmt["table"])
+    if returning_cols:
+        projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
+        return RowResult(projected, returning_cols, rowcount=n)
+    return f"{n} row{'s' if n != 1 else ''} inserted."
 
-    if op in ("SELECT", "SELECT_NOFROM", "JOIN", "SET_OP"):
-        rows = _rows_for_stmt(stmt, db)
-        cols = list(rows[0].keys()) if rows else []
-        return RowResult(rows, cols)
 
-    if op == "TRUNCATE":
-        rows = db.delete(stmt["table"], None)
-        n = len(rows)
-        _invalidate_rc(db, stmt["table"])
-        return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
+def _exec_insert_select(stmt: dict, db: Database) -> str:
+    src_rows = _rows_for_stmt(stmt["select"], db, stmt.get("ctes"))
+    col_names = stmt.get("col_names")
+    meta = db._meta(stmt["table"])
+    target_cols = [c.name for c in meta.schema.columns]
+    _has_ins_trig = has_triggers(db, stmt["table"], "INSERT")
+    for src_row in src_rows:
+        if col_names:
+            row_vals = list(src_row.values())
+            data: dict[str, Any] = {n: (row_vals[i] if i < len(row_vals) else None)
+                                    for i, n in enumerate(col_names)}
+        else:
+            src_keys = list(src_row.keys())
+            if all(k in target_cols for k in src_keys):
+                data = dict(src_row)
+            else:
+                src_vals = list(src_row.values())
+                data = {target_cols[i]: src_vals[i]
+                        for i in range(min(len(target_cols), len(src_vals)))}
+        for col in meta.schema.columns:
+            if col.name not in data:
+                data[col.name] = _eval_default(col.default)
+        if _has_ins_trig:
+            fire_triggers(db, stmt["table"], "BEFORE", "INSERT", data, None)
+        row_out = db.insert(stmt["table"], data)
+        if _has_ins_trig:
+            fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
+    n = len(src_rows)
+    _invalidate_rc(db, stmt["table"])
+    return f"{n} row{'s' if n != 1 else ''} inserted."
 
-    if op == "UPDATE":
-        tname = stmt["table"]
-        if tname == "_hyperion_schema_meta":
-            return _exec_meta_update(stmt, db)
-        if tname not in db.tables and tname in db.views:
-            if not has_instead_of(db, tname, "UPDATE"):
-                raise SchemaError(
-                    f"Cannot update view '{tname}' without an INSTEAD OF trigger")
-            return _exec_instead_of_update(stmt, db)
+
+def _exec_select(stmt: dict, db: Database) -> RowResult:
+    rows = _rows_for_stmt(stmt, db)
+    cols = list(rows[0].keys()) if rows else []
+    return RowResult(rows, cols)
+
+
+def _exec_truncate(stmt: dict, db: Database) -> str:
+    rows = db.delete(stmt["table"], None)
+    n = len(rows)
+    _invalidate_rc(db, stmt["table"])
+    db._meta(stmt["table"]).next_key = 1
+    return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
+
+
+def _exec_update(stmt: dict, db: Database) -> str:
+    tname = stmt["table"]
+    if tname == "_hyperion_schema_meta":
+        return _exec_meta_update(stmt, db)
+    if tname not in db.tables and tname in db.views:
+        if not has_instead_of(db, tname, "UPDATE"):
+            raise SchemaError(
+                f"Cannot update view '{tname}' without an INSTEAD OF trigger")
+        return _exec_instead_of_update(stmt, db)
+    _update_conflict = (stmt.get("conflict_action") or "").upper()
+    try:
         if has_triggers(db, tname, "UPDATE"):
             changed_cols = list(stmt["assignments"].keys())
             old_rows = scan_matching_rows(db, tname, stmt["where"])
@@ -1540,41 +1638,79 @@ def _execute_inner(stmt: dict, db: Database) -> str:
                 fire_triggers(db, tname, "AFTER", "UPDATE", new_row, old_row, changed_cols)
         else:
             rows = db.update(tname, stmt["assignments"], stmt["where"], stmt.get("limit"))
-        n = len(rows)
-        _invalidate_rc(db, tname)
-        if stmt.get("returning"):
-            ret_cols = stmt["returning"]
-            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
-                             ret_cols, rowcount=n)
-        return f"{n} row{'s' if n != 1 else ''} updated."
+    except ConstraintError:
+        if _update_conflict != "IGNORE":
+            raise
+        rows = []
+    n = len(rows)
+    _invalidate_rc(db, tname)
+    if stmt.get("returning"):
+        ret_cols = stmt["returning"]
+        return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                         ret_cols, rowcount=n)
+    return f"{n} row{'s' if n != 1 else ''} updated."
 
-    if op == "DELETE":
-        tname = stmt["table"]
-        if tname == "_hyperion_schema_meta":
-            return _exec_meta_delete(stmt, db)
-        if tname not in db.tables and tname in db.views:
-            if not has_instead_of(db, tname, "DELETE"):
-                raise SchemaError(
-                    f"Cannot delete from view '{tname}' without an INSTEAD OF trigger")
-            return _exec_instead_of_delete(stmt, db)
-        if has_triggers(db, tname, "DELETE"):
-            old_rows = scan_matching_rows(db, tname, stmt["where"])
-            for old_row in old_rows:
-                fire_triggers(db, tname, "BEFORE", "DELETE", None, old_row)
-            rows = db.delete(tname, stmt["where"], stmt.get("limit"))
-            for old_row in old_rows:
-                fire_triggers(db, tname, "AFTER", "DELETE", None, old_row)
-        else:
-            rows = db.delete(tname, stmt["where"], stmt.get("limit"))
-        n = len(rows)
-        _invalidate_rc(db, tname)
-        if stmt.get("returning"):
-            ret_cols = stmt["returning"]
-            return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
-                             ret_cols, rowcount=n)
-        return f"{n} row{'s' if n != 1 else ''} deleted."
 
-    raise InternalError(f"Unknown op: {op}")
+def _exec_delete(stmt: dict, db: Database) -> str:
+    tname = stmt["table"]
+    if tname == "_hyperion_schema_meta":
+        return _exec_meta_delete(stmt, db)
+    if tname not in db.tables and tname in db.views:
+        if not has_instead_of(db, tname, "DELETE"):
+            raise SchemaError(
+                f"Cannot delete from view '{tname}' without an INSTEAD OF trigger")
+        return _exec_instead_of_delete(stmt, db)
+    if has_triggers(db, tname, "DELETE"):
+        old_rows = scan_matching_rows(db, tname, stmt["where"])
+        for old_row in old_rows:
+            fire_triggers(db, tname, "BEFORE", "DELETE", None, old_row)
+        rows = db.delete(tname, stmt["where"], stmt.get("limit"))
+        for old_row in old_rows:
+            fire_triggers(db, tname, "AFTER", "DELETE", None, old_row)
+    else:
+        rows = db.delete(tname, stmt["where"], stmt.get("limit"))
+    n = len(rows)
+    _invalidate_rc(db, tname)
+    if stmt.get("returning"):
+        ret_cols = stmt["returning"]
+        return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
+                         ret_cols, rowcount=n)
+    return f"{n} row{'s' if n != 1 else ''} deleted."
+
+
+_DISPATCH: dict[str, Any] = {
+    "ANALYZE":                  _execute_analyze,
+    "CREATE_TABLE_AS_SELECT":   _exec_create_table_as_select,
+    "CREATE_TABLE":             _exec_create_table,
+    "DROP_TABLE":               _exec_drop_table,
+    "CREATE_VIEW":              _exec_create_view,
+    "DROP_VIEW":                _exec_drop_view,
+    "ALTER_ADD_COLUMN":         _exec_alter_add_column,
+    "ALTER_DROP_COLUMN":        _exec_alter_drop_column,
+    "ALTER_RENAME_COLUMN":      _exec_alter_rename_column,
+    "ALTER_RENAME_TABLE":       _exec_alter_rename_table,
+    "ALTER_ALTER_COLUMN":       _exec_alter_alter_column,
+    "CREATE_INDEX":             _exec_create_index,
+    "DROP_INDEX":               _exec_drop_index,
+    "CREATE_TRIGGER":           _exec_create_trigger,
+    "DROP_TRIGGER":             _exec_drop_trigger,
+    "INSERT":                   _exec_insert,
+    "INSERT_SELECT":            _exec_insert_select,
+    "SELECT":                   _exec_select,
+    "SELECT_NOFROM":            _exec_select,
+    "JOIN":                     _exec_select,
+    "SET_OP":                   _exec_select,
+    "TRUNCATE":                 _exec_truncate,
+    "UPDATE":                   _exec_update,
+    "DELETE":                   _exec_delete,
+}
+
+
+def _execute_inner(stmt: dict, db: Database) -> str:
+    handler = _DISPATCH.get(stmt["op"])
+    if handler is None:
+        raise InternalError(f"Unknown op: {stmt['op']}")
+    return handler(stmt, db)
 
 
 _SCALAR_SQ_RE = re.compile(r'^\(\s*SELECT\b', re.IGNORECASE)
@@ -1680,13 +1816,20 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
             else:
                 col_obj = next((c for c in schema.columns if c.name == col_name), None)
                 if col_obj and col_obj.type == INTEGER:
-                    try: updated[col_name] = int(val)
-                    except (ValueError, TypeError): updated[col_name] = val
+                    try:
+                        updated[col_name] = int(val)
+                    except (ValueError, TypeError):
+                        try: updated[col_name] = int(eval_expr(str(val), updated))
+                        except Exception: updated[col_name] = val
                 elif col_obj and col_obj.type == REAL:
-                    try: updated[col_name] = float(val)
-                    except (ValueError, TypeError): updated[col_name] = val
+                    try:
+                        updated[col_name] = float(val)
+                    except (ValueError, TypeError):
+                        try: updated[col_name] = float(eval_expr(str(val), updated))
+                        except Exception: updated[col_name] = val
                 else:
-                    updated[col_name] = val
+                    try: updated[col_name] = eval_expr(str(val), updated)
+                    except Exception: updated[col_name] = val
         db._table_btree(meta).update({rowid: db._pack_row_cell(serialize_row(schema, updated))})
         for im in db._indexes_for(schema.name):
             if not any(c in assignments for c in im.columns):
@@ -1786,17 +1929,31 @@ def _cell_str(v: Any) -> str:
     return "NULL" if v is None else str(v)
 
 
-def _format_rows(rows: list[dict], requested_cols: list[str] | None) -> str:
+def _format_rows(rows: list[dict], requested_cols: list[str] | None, *, fancy: bool = False) -> str:
     if not rows:
         return "(no rows)"
     cols   = requested_cols if requested_cols else list(rows[0].keys())
     widths = {c: max(len(c), max(len(_cell_str(r.get(c))) for r in rows))
               for c in cols}
+    n = len(rows)
+
+    if fancy:
+        def _pad(val: str, w: int) -> str:
+            return val.ljust(w)
+        top   = "┌" + "┬".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┐"
+        hdr   = "│" + "│".join(f" {c.ljust(widths[c])} " for c in cols) + "│"
+        mid   = "├" + "┼".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┤"
+        rows_ = [
+            "│" + "│".join(f" {_pad(_cell_str(r.get(c)), widths[c])} " for c in cols) + "│"
+            for r in rows
+        ]
+        bot   = "└" + "┴".join("─" * (w + 2) for w in (widths[c] for c in cols)) + "┘"
+        return "\n".join([top, hdr, mid, *rows_, bot, f"({n} row{'s' if n != 1 else ''})"])
+
     header = " | ".join(c.ljust(widths[c]) for c in cols)
     sep    = "-+-".join("-" * widths[c] for c in cols)
     body   = "\n".join(
         " | ".join(_cell_str(r.get(c)).ljust(widths[c]) for c in cols)
         for r in rows
     )
-    n = len(rows)
     return f"{header}\n{sep}\n{body}\n({n} row{'s' if n != 1 else ''})"

@@ -32,6 +32,16 @@ def _sql_literal(val: Any) -> str:
     if val is None:
         return "NULL"
     if isinstance(val, str):
+        # Numeric strings should substitute as bare numbers so arithmetic works
+        s = val.strip()
+        try:
+            int(s); return s
+        except ValueError:
+            pass
+        try:
+            float(s); return s
+        except ValueError:
+            pass
         return "'" + val.replace("'", "''") + "'"
     return str(val)
 

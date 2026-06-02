@@ -98,6 +98,27 @@ class TestPageReuse:
         finally:
             os.unlink(path)
 
+    def test_bulk_delete_rebalance_single_pass(self):
+        """Bulk delete that leaves many underfull leaves must complete in O(k)
+        time, not O(k * chain_length).  We verify correctness: all deleted
+        rows are gone and all retained rows are intact and queryable."""
+        import time
+        db = Database(":memory:")
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        n = 500
+        for i in range(n):
+            db.execute(f"INSERT INTO t VALUES ({i}, 'v{i}')")
+        # Delete every other row — maximises underfull leaves
+        for i in range(0, n, 2):
+            db.execute(f"DELETE FROM t WHERE id = {i}")
+        rows = db.execute("SELECT id FROM t ORDER BY id").fetchall()
+        expected = list(range(1, n, 2))
+        assert [r["id"] for r in rows] == expected, \
+            "retained rows must be exactly the odd-id rows"
+        # Sanity: deleted rows must not be visible
+        gone = db.execute("SELECT COUNT(*) AS c FROM t WHERE id = 0").fetchone()
+        assert gone["c"] == 0
+
     def test_high_water_mark_bounded_by_free_list(self):
         """HWM after refill must not exceed peak HWM when free list covers demand."""
         db = Database(":memory:")

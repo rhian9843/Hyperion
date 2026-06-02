@@ -1,4 +1,5 @@
 """Tests for MVCC / snapshot isolation (copy-on-write pager)."""
+import threading
 import pytest
 from hyperion import Database
 from hyperion.errors import TransactionError
@@ -311,6 +312,83 @@ def test_memorypager_no_double_begin():
     with pytest.raises(TransactionError, match="Transaction already active"):
         mp.begin()
     mp.rollback()
+
+
+# ── Savepoint concurrent-read isolation ─────────────────────────────────────
+
+def test_savepoint_concurrent_read_isolation():
+    """Thread A creates a savepoint, modifies data, and sleeps.
+    Thread B reads concurrently via the same connection and must never see
+    Thread A's post-savepoint uncommitted modifications.
+
+    The RWLock means Thread B's read blocks until Thread A releases the write
+    lock (via commit or rollback), so Thread B always reads committed state.
+    """
+    db = _db()
+    db.execute("CREATE TABLE t (id INTEGER, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 100)")
+
+    results: dict = {}
+    error_holder: list = []
+    barrier = threading.Barrier(2)
+
+    def writer():
+        try:
+            db.savepoint("sp")
+            db.execute("UPDATE t SET val = 999 WHERE id = 1")
+            barrier.wait()     # signal reader to proceed
+            # Hold the savepoint (and thus the write lock) for a moment
+            import time; time.sleep(0.05)
+            db.rollback_to_savepoint("sp")
+            db.release_savepoint("sp")
+            db.commit()
+        except Exception as exc:
+            error_holder.append(exc)
+            barrier.abort()
+
+    def reader():
+        barrier.wait()     # wait until writer has made the modification
+        try:
+            # This SELECT must block until the writer releases the write lock,
+            # then it reads the committed value (100), NOT the savepoint value (999).
+            row = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+            results["val"] = row["val"]
+        except Exception as exc:
+            error_holder.append(exc)
+
+    t_write = threading.Thread(target=writer)
+    t_read  = threading.Thread(target=reader)
+    t_write.start(); t_read.start()
+    t_write.join(timeout=5); t_read.join(timeout=5)
+
+    assert not error_holder, f"Thread error: {error_holder}"
+    assert not t_write.is_alive(), "writer thread did not finish in time"
+    assert not t_read.is_alive(),  "reader thread did not finish in time"
+
+    # After rollback_to_savepoint + commit, original value must be intact.
+    assert results.get("val") == 100, (
+        f"Reader saw {results.get('val')!r} — expected committed value 100, "
+        f"not the savepoint-modified value 999"
+    )
+
+
+def test_savepoint_reader_sees_committed_after_rollback():
+    """After a rollback-to-savepoint + commit the pre-savepoint value is
+    the committed value; a subsequent fresh read must see it."""
+    db = _db()
+    db.execute("CREATE TABLE t (id INTEGER, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 42)")
+
+    db.savepoint("sp")
+    db.execute("UPDATE t SET val = 0 WHERE id = 1")
+    # Reader sees 0 inside the same connection (own-write visibility)
+    assert db.execute("SELECT val FROM t WHERE id = 1").fetchone()["val"] == 0
+    db.rollback_to_savepoint("sp")
+    db.release_savepoint("sp")
+    db.commit()
+
+    # After rollback the committed value must be restored
+    assert db.execute("SELECT val FROM t WHERE id = 1").fetchone()["val"] == 42
 
 
 def test_memorypager_read_page_returns_committed_version_during_txn():
