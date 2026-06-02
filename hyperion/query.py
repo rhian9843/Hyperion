@@ -17,7 +17,12 @@ from .optimizer import find_eq_index, probe_index as _probe_index
 
 _AGG_RE = re.compile(
     r"^(COUNT|MIN|MAX|SUM|AVG|GROUP_CONCAT|STRING_AGG)"
-    r"\(\s*(DISTINCT\s+)?(.+?)\s*\)$",
+    r"\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$",
+    re.IGNORECASE,
+)
+
+_NESTED_AGG_RE = re.compile(
+    r'\b(COUNT|MIN|MAX|SUM|AVG)\s*\(\s*(DISTINCT\s+)?([^()]+?)\s*\)',
     re.IGNORECASE,
 )
 
@@ -28,6 +33,9 @@ _USER_AGG_CALL_RE = re.compile(
 
 def _parse_agg(col: str) -> tuple[str, str, bool] | None:
     """If col is an aggregate call, return (FUNC_UPPER, arg, distinct). Else None."""
+    # Window functions look like AGG(...) OVER (...) — not a GROUP BY aggregate
+    if re.search(r'\bOVER\s*\(', col, re.IGNORECASE):
+        return None
     m = _AGG_RE.match(col)
     if m:
         return (m.group(1).upper(), m.group(3).strip(), bool(m.group(2)))
@@ -50,23 +58,24 @@ def _project_row(row: dict, columns: list[str]) -> dict:
             if bare in row:
                 result[col] = row[bare]
             else:
-                # scan for any key whose bare name matches
                 matches = [v for k, v in row.items() if k.split(".")[-1] == bare]
                 if matches:
                     result[col] = matches[0]
-                elif is_expr(col):
-                    result[col] = eval_expr(col, row)
                 else:
-                    raise NoSuchColumnError(f"Unknown column: '{col}'")
+                    try:
+                        result[col] = eval_expr(col, row)
+                    except Exception:
+                        raise NoSuchColumnError(f"Unknown column: '{col}'")
         else:
-            # bare col → try table-qualified scan before treating as expr
+            # bare col → try table-qualified scan, then evaluate as expression/literal
             matches = [v for k, v in row.items() if k.split(".")[-1] == col]
             if matches:
                 result[col] = matches[0]
-            elif is_expr(col):
-                result[col] = eval_expr(col, row)
             else:
-                raise NoSuchColumnError(f"Unknown column: '{col}'")
+                try:
+                    result[col] = eval_expr(col, row)
+                except Exception:
+                    raise NoSuchColumnError(f"Unknown column: '{col}'")
     return result
 
 
@@ -158,18 +167,25 @@ class QueryMixin:
         schema  = meta.schema
         results = []
         seen: set[tuple] = set()
+        # Collect full rows first so ORDER BY can reference columns not in SELECT list.
+        # Projection and DISTINCT dedup happen after sorting/limiting.
+        _need_full = bool(order_by and columns)
         for _, raw in self._table_btree(meta).scan():
             row = deserialize_row(schema, self._unpack_row_cell(raw))
             if where and not where.evaluate(row, self):
                 continue
+            results.append(row)
+        results = _apply_order_limit(results, order_by, limit, offset)
+        out = []
+        for row in results:
             projected = _project_row(row, columns) if columns else row
             if distinct:
                 key = tuple(projected.get(k) for k in (columns or list(row.keys())))
                 if key in seen:
                     continue
                 seen.add(key)
-            results.append(projected)
-        return _apply_order_limit(results, order_by, limit, offset)
+            out.append(projected)
+        return out
 
     def _compute_aggregates(self, bucket_rows: list[dict],
                             columns: list[str]) -> dict[str, Any]:
@@ -180,7 +196,17 @@ class QueryMixin:
                 continue
             agg = _parse_agg(col)
             if agg is None:
-                result[col] = bucket_rows[0].get(col) if bucket_rows else None
+                # Defer columns containing nested aggregates to the second pass
+                if _NESTED_AGG_RE.search(col):
+                    continue
+                _first = bucket_rows[0] if bucket_rows else {}
+                _v = _first.get(col)
+                if _v is None and col not in _first:
+                    try:
+                        _v = eval_expr(col, _first)
+                    except Exception:
+                        pass
+                result[col] = _v
                 continue
             func, arg, distinct = agg
             if func == "COUNT":
@@ -192,7 +218,18 @@ class QueryMixin:
                         vals = list(dict.fromkeys(vals))
                     result[col] = len(vals)
             elif func in ("GROUP_CONCAT", "STRING_AGG"):
-                parts = [p.strip() for p in arg.split(",", 1)]
+                # Extract optional ORDER BY clause before parsing col/sep
+                _gc_order_col: str | None = None
+                _gc_order_desc = False
+                _gc_arg = arg
+                _m_gc_ob = re.search(
+                    r'\bORDER\s+BY\s+(.+?)(?:\s+(ASC|DESC))?\s*$',
+                    arg, re.IGNORECASE)
+                if _m_gc_ob:
+                    _gc_order_col = _m_gc_ob.group(1).strip()
+                    _gc_order_desc = (_m_gc_ob.group(2) or "ASC").upper() == "DESC"
+                    _gc_arg = arg[:_m_gc_ob.start()].rstrip().rstrip(",").rstrip()
+                parts = [p.strip() for p in _gc_arg.split(",", 1)]
                 col_name = parts[0]
                 if len(parts) > 1:
                     sep_raw = parts[1].strip()
@@ -200,8 +237,26 @@ class QueryMixin:
                                             and sep_raw.endswith("'")) else sep_raw
                 else:
                     sep = ","
-                str_vals = [str(r[col_name]) for r in bucket_rows
-                            if col_name in r and r.get(col_name) is not None]
+                _gc_rows = bucket_rows
+                if _gc_order_col:
+                    def _gc_key(r: dict):
+                        v = r.get(_gc_order_col)  # type: ignore[arg-type]
+                        if v is None:
+                            try:
+                                v = eval_expr(_gc_order_col, r)  # type: ignore[arg-type]
+                            except Exception:
+                                pass
+                        return (v is None, v)
+                    _gc_rows = sorted(bucket_rows, key=_gc_key, reverse=_gc_order_desc)
+                def _gc_val(r: dict) -> str | None:
+                    v = r.get(col_name)
+                    if v is None and col_name not in r:
+                        try:
+                            v = eval_expr(col_name, r)
+                        except Exception:
+                            return None
+                    return str(v) if v is not None else None
+                str_vals = [s for r in _gc_rows if (s := _gc_val(r)) is not None]
                 if distinct:
                     str_vals = list(dict.fromkeys(str_vals))
                 result[col] = sep.join(str_vals) if str_vals else None
@@ -213,8 +268,15 @@ class QueryMixin:
                     agg_obj.step(v)
                 result[col] = agg_obj.finalize()
             else:
-                vals = [r[arg] for r in bucket_rows
-                        if r.get(arg) is not None and arg in r]
+                def _agg_val(r: dict, a: str):
+                    if a in r:
+                        return r[a]
+                    try:
+                        return eval_expr(a, r)
+                    except Exception:
+                        return None
+                vals = [v for r in bucket_rows
+                        if (v := _agg_val(r, arg)) is not None]
                 if distinct:
                     vals = list(dict.fromkeys(vals))
                 if not vals:
@@ -223,6 +285,51 @@ class QueryMixin:
                 elif func == "MAX":  result[col] = max(vals)
                 elif func == "SUM":  result[col] = sum(vals)
                 elif func == "AVG":  result[col] = sum(vals) / len(vals)
+
+        # Second pass: evaluate wrapper expressions containing nested aggregates
+        # e.g. COALESCE(SUM(col), 0), ROUND(AVG(col), 2)
+        for col in columns:
+            if col in result:
+                continue
+            if not _NESTED_AGG_RE.search(col):
+                continue
+            def _agg_val2(r: dict, a: str):
+                if a in r:
+                    return r[a]
+                if "." in a:
+                    bare = a.split(".")[-1]
+                    if bare in r:
+                        return r[bare]
+                    matches = [v for k, v in r.items() if k.split(".")[-1] == bare]
+                    if matches:
+                        return matches[0]
+                try:
+                    v = eval_expr(a, r)
+                    return None if (isinstance(v, str) and v == a) else v
+                except Exception:
+                    return None
+            def _replace_agg(m: re.Match) -> str:
+                func2 = m.group(1).upper()
+                arg2  = m.group(3).strip()
+                raw2 = [v for r in bucket_rows
+                        if (v := _agg_val2(r, arg2)) is not None]
+                try:
+                    vals2 = [float(v) for v in raw2]
+                except (TypeError, ValueError):
+                    vals2 = raw2
+                if func2 == "COUNT": v2 = len(bucket_rows) if arg2 == "*" else len(vals2)
+                elif func2 == "SUM": v2 = sum(vals2) if vals2 else None
+                elif func2 == "MIN": v2 = min(vals2) if vals2 else None
+                elif func2 == "MAX": v2 = max(vals2) if vals2 else None
+                elif func2 == "AVG": v2 = sum(vals2) / len(vals2) if vals2 else None
+                else: v2 = None
+                return "NULL" if v2 is None else repr(v2)
+            expanded = _NESTED_AGG_RE.sub(_replace_agg, col)
+            try:
+                result[col] = eval_expr(expanded, {})
+            except Exception:
+                result[col] = None
+
         return result
 
     def _aggregate_select(self, meta, columns: list[str],
@@ -249,9 +356,17 @@ class QueryMixin:
             if where and not where.evaluate(row, self):
                 continue
             all_rows.append(row)
+        def _gb_val(c: str, r: dict) -> Any:
+            if c in r:
+                return r[c]
+            try:
+                return eval_expr(c, r)
+            except Exception:
+                return None
+
         buckets: dict[tuple, list[dict]] = {}
         for row in all_rows:
-            key = tuple(row.get(c) for c in group_by)
+            key = tuple(_gb_val(c, row) for c in group_by)
             if key not in buckets:
                 buckets[key] = []
             buckets[key].append(row)
@@ -297,7 +412,7 @@ class QueryMixin:
             return m
 
         def _project(merged: dict) -> dict:
-            return {c: merged[c] for c in columns if c in merged} if columns else merged
+            return _project_row(merged, columns) if columns else merged
 
         def _emit(merged: dict) -> dict | None:
             if where and not where.evaluate(merged, self):
@@ -334,8 +449,16 @@ class QueryMixin:
             use_inlj = False
             lcol = rcol = None
         else:
-            lcol = on_left.split(".")[-1]   # type: ignore[union-attr]
-            rcol = on_right.split(".")[-1]  # type: ignore[union-attr]
+            raw_left  = on_left.split(".")[-1]   # type: ignore[union-attr]
+            raw_right = on_right.split(".")[-1]  # type: ignore[union-attr]
+            # Resolve which bare column belongs to which side by checking alias prefix.
+            # ON may be written as "right_alias.col = left_alias.col" — detect the swap.
+            left_prefix  = on_left.split(".")[0]  if "." in on_left  else ""  # type: ignore
+            on_left_is_right = left_prefix in (ra, right_table)
+            if on_left_is_right:
+                lcol, rcol = raw_right, raw_left   # swapped: on_left refers to right table
+            else:
+                lcol, rcol = raw_left, raw_right
             use_inlj = (join_type in ("INNER", "LEFT", "LEFT OUTER")
                         and find_eq_index(self, right_table, rcol) is not None)
 

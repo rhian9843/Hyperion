@@ -299,6 +299,8 @@ class ConstraintsMixin:
                     )
                 elif action == "CASCADE":
                     if is_delete:
+                        for _, child_row in matching:
+                            self._check_fk_parent(tname, child_row, is_delete=True)
                         victim_ids = {r for r, _ in matching}
                         self._table_btree(tmeta).delete(victim_ids)
                         for im in self._indexes_for(tname):

@@ -280,8 +280,9 @@ class Cursor:
         if sql not in cache:
             cache[sql] = parse(sql)
             if len(cache) > 512:
-                oldest = next(iter(cache))
-                del cache[oldest]
+                cache.popitem(last=False)  # LRU: evict least-recently-used entry
+        else:
+            cache.move_to_end(sql)         # LRU: promote to most-recently-used
         stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
         op   = stmt.get("op", "")
 
@@ -301,8 +302,9 @@ class Cursor:
         if sql not in cache:
             cache[sql] = parse(sql)
             if len(cache) > 512:
-                oldest = next(iter(cache))
-                del cache[oldest]
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(sql)
         stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
         return self._execute_stmt(stmt, stmt.get("op", ""), timeout_ms, max_rows)
 
@@ -368,8 +370,9 @@ class Cursor:
         if sql not in cache:
             cache[sql] = parse(sql)
             if len(cache) > 512:
-                oldest = next(iter(cache))
-                del cache[oldest]
+                cache.popitem(last=False)
+        else:
+            cache.move_to_end(sql)
         stmt_template = cache[sql]
         op = stmt_template.get("op", "")
 

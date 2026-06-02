@@ -1,5 +1,6 @@
 """Thread safety tests: concurrent access to a shared Database instance."""
 import threading
+import time
 from hyperion import Database
 from hyperion.database import _RWLock
 
@@ -355,6 +356,72 @@ def test_lastrowid_file_backed_concurrent(tmp_path):
         f"Duplicate lastrowids in file-backed DB: {results}"
 
 
+def test_no_dirty_reads_across_threads():
+    """A thread doing SELECT must never see uncommitted data written by another thread.
+
+    Thread A opens an explicit transaction, UPDATEs a row, then sleeps while still
+    inside the transaction.  Thread B issues repeated SELECTs on the same connection
+    during that window.  Thread B must always see the pre-UPDATE committed value (100),
+    never the uncommitted value (999).  After A rolls back, all readers see 100.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 100)")
+
+    dirty_reads: list = []
+    barrier = threading.Barrier(2)
+
+    def writer():
+        barrier.wait()
+        db.begin()
+        db.execute("UPDATE t SET val = 999 WHERE id = 1")
+        time.sleep(0.05)   # hold the transaction open
+        db.rollback()      # never commits — dirty reads must not leak
+
+    def reader():
+        barrier.wait()
+        time.sleep(0.01)   # let writer start its transaction
+        for _ in range(20):
+            row = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+            if row and row["val"] == 999:
+                dirty_reads.append(row["val"])
+            time.sleep(0.005)
+
+    t1 = threading.Thread(target=writer)
+    t2 = threading.Thread(target=reader)
+    t1.start(); t2.start()
+    t1.join();  t2.join()
+
+    assert dirty_reads == [], (
+        f"Dirty read detected: reader saw uncommitted value 999 "
+        f"({len(dirty_reads)} time(s)) during writer's uncommitted transaction"
+    )
+    final = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert final["val"] == 100, "Value should be 100 after rollback"
+
+
+def test_writer_reads_own_uncommitted_writes():
+    """The writing thread must see its own uncommitted writes (write-own-reads).
+
+    This ensures the dirty-read fix does not accidentally break the writer's ability
+    to read back its own in-progress changes within the same transaction.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+    db.execute("INSERT INTO t VALUES (1, 100)")
+
+    db.begin()
+    db.execute("UPDATE t SET val = 999 WHERE id = 1")
+    row = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert row["val"] == 999, (
+        "Writer should see its own uncommitted write (999), got " + str(row["val"])
+    )
+    db.rollback()
+
+    row_after = db.execute("SELECT val FROM t WHERE id = 1").fetchone()
+    assert row_after["val"] == 100, "Rollback should restore 100"
+
+
 def test_explicit_transaction_serialised():
     """Two threads racing on an explicit transaction must not double-commit or corrupt."""
     db = Database(":memory:")
@@ -383,3 +450,47 @@ def test_explicit_transaction_serialised():
     # All non-conflicting transactions must have committed
     row = db.execute("SELECT COUNT(*) AS n FROM t").fetchone()
     assert row["n"] >= 1  # at least one thread succeeded
+
+
+def test_sequential_explicit_transactions_all_commit(tmp_path):
+    """When threads take turns with explicit transactions, every transaction
+    must commit exactly once and all rows must be present afterwards.
+
+    This catches cases where concurrent BEGIN/COMMIT racing causes silent
+    data loss or corrupts the transaction-depth counter.
+    """
+    db_path = tmp_path / "seq_txn.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, tid INTEGER)")
+
+    n_threads  = 6
+    rows_each  = 5
+    errors: list = []
+    # Serialise via a lock so each thread holds the full txn before the next starts
+    mutex = threading.Lock()
+
+    def worker(thread_id: int) -> None:
+        try:
+            with mutex:
+                db.begin()
+                for j in range(rows_each):
+                    db.execute(
+                        "INSERT INTO t VALUES (?, ?)",
+                        (thread_id * 100 + j, thread_id),
+                    )
+                db.commit()
+        except Exception as e:
+            errors.append((thread_id, e))
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n_threads)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    assert not errors, f"Thread errors: {errors}"
+    total = db.execute("SELECT COUNT(*) AS n FROM t").fetchone()["n"]
+    assert total == n_threads * rows_each, (
+        f"Expected {n_threads * rows_each} rows, got {total}"
+    )
+    db.close()

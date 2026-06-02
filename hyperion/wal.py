@@ -118,42 +118,63 @@ class WAL:
 
     @classmethod
     def replay_if_exists(cls, wal_path: Path, db_file) -> None:
-        """Replay any committed transactions from a WAL left by a previous run."""
+        """Replay any committed transactions from a WAL left by a previous run.
+
+        Durability ordering
+        -------------------
+        1. Read and apply all committed frames to db_file.
+        2. flush() + fsync(db_file) — pages are on disk before WAL is touched.
+        3. Unlink the WAL — safe because every committed byte is now durable.
+
+        If any step raises, the WAL is intentionally left intact so the next
+        open can retry recovery rather than losing committed data.
+        """
         if not wal_path.exists():
             return
-        try:
-            with open(wal_path, "rb") as wf:
-                hdr = wf.read(cls.HDR_SIZE)
-                if len(hdr) < cls.HDR_SIZE or hdr[:4] != cls.MAGIC:
-                    return
-                version = struct.unpack_from("<I", hdr, 4)[0]
-                if version == 1:
-                    # Legacy: single committed transaction — apply all frames.
-                    while True:
-                        frame = wf.read(cls.FRAME_SZ)
-                        if len(frame) < cls.FRAME_SZ:
-                            break
-                        pn = struct.unpack_from("<I", frame)[0]
-                        db_file.seek(pn * PAGE_SIZE)
-                        db_file.write(frame[4:])
-                    db_file.flush()
-                elif version == 2:
-                    # Multi-txn: apply only transactions terminated by COMMIT_PN.
-                    pending: list[tuple[int, bytes]] = []
-                    while True:
-                        frame = wf.read(cls.FRAME_SZ)
-                        if len(frame) < cls.FRAME_SZ:
-                            break
-                        pn = struct.unpack_from("<I", frame)[0]
-                        if pn == cls.COMMIT_PN:
-                            for ppn, data in pending:
-                                verify_page(data, ppn)
-                                db_file.seek(ppn * PAGE_SIZE)
-                                db_file.write(data)
-                            pending.clear()
-                        else:
-                            pending.append((pn, frame[4:]))
-                    db_file.flush()
-                # Any other version: discard (treat as corrupt).
-        finally:
-            wal_path.unlink(missing_ok=True)
+        replayed = False
+        with open(wal_path, "rb") as wf:
+            hdr = wf.read(cls.HDR_SIZE)
+            if len(hdr) < cls.HDR_SIZE or hdr[:4] != cls.MAGIC:
+                wal_path.unlink(missing_ok=True)
+                return
+            version = struct.unpack_from("<I", hdr, 4)[0]
+            if version == 1:
+                # Legacy: single committed transaction — apply all frames.
+                while True:
+                    frame = wf.read(cls.FRAME_SZ)
+                    if len(frame) < cls.FRAME_SZ:
+                        break
+                    pn = struct.unpack_from("<I", frame)[0]
+                    db_file.seek(pn * PAGE_SIZE)
+                    db_file.write(frame[4:])
+                replayed = True
+            elif version == 2:
+                # Multi-txn: apply only transactions terminated by COMMIT_PN.
+                pending: list[tuple[int, bytes]] = []
+                while True:
+                    frame = wf.read(cls.FRAME_SZ)
+                    if len(frame) < cls.FRAME_SZ:
+                        break
+                    pn = struct.unpack_from("<I", frame)[0]
+                    if pn == cls.COMMIT_PN:
+                        for ppn, data in pending:
+                            verify_page(data, ppn)
+                            db_file.seek(ppn * PAGE_SIZE)
+                            db_file.write(data)
+                        pending.clear()
+                        replayed = True
+                    else:
+                        pending.append((pn, frame[4:]))
+            # Any other version: discard (treat as corrupt) — fall through to unlink.
+
+        if replayed:
+            # Flush kernel buffers then fsync to guarantee all replayed pages reach
+            # disk before we remove the WAL.  If this crashes, the WAL survives and
+            # recovery can be retried on the next open.
+            db_file.flush()
+            try:
+                os.fsync(db_file.fileno())
+            except OSError:
+                pass  # some filesystems / platforms don't support fsync
+
+        wal_path.unlink(missing_ok=True)

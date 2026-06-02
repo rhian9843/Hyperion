@@ -33,6 +33,7 @@ class WhereClause:
     subquery_ast: "dict | None"        = None
     group_clause: "WhereClause | None" = None  # set when op == "GROUP"
     row_cols:     "list[str] | None"   = None  # multi-column (a,b) IN / = / !=
+    collate:      "str | None"         = None  # COLLATE NOCASE etc.
     _subq_cache:  dict = field(default_factory=dict, init=False,
                                repr=False, compare=False)
 
@@ -149,8 +150,14 @@ class WhereClause:
             except (ValueError, TypeError):
                 return False
         match self.op:
-            case "=":    return cell == val
-            case "!=":   return cell != val
+            case "=":
+                if self.collate == "NOCASE" and isinstance(cell, str) and isinstance(val, str):
+                    return cell.casefold() == val.casefold()
+                return cell == val
+            case "!=":
+                if self.collate == "NOCASE" and isinstance(cell, str) and isinstance(val, str):
+                    return cell.casefold() != val.casefold()
+                return cell != val
             case "<":    return cell < val
             case ">":    return cell > val
             case "<=":   return cell <= val
@@ -222,24 +229,30 @@ class WhereClause:
         rvals_raw = self.val.split("\x1f")
 
         def _coerce(cell: Any, raw: str) -> Any:
-            if cell is None:
+            if raw.upper() == "NULL":
                 return None
-            if isinstance(cell, int):
+            if isinstance(cell, (int, float)) or cell is None:
                 try:
                     return int(raw)
                 except ValueError:
-                    return raw
-            if isinstance(cell, float):
+                    pass
                 try:
                     return float(raw)
                 except ValueError:
-                    return raw
+                    pass
             return raw
 
         rvals = tuple(_coerce(lvals[i], rvals_raw[i]) for i in range(len(lvals)))
         match op:
-            case "=":  return lvals == rvals
-            case "!=": return lvals != rvals
+            case "=":
+                # NULL in either operand → UNKNOWN → False
+                if any(v is None for v in lvals) or any(v is None for v in rvals):
+                    return False
+                return lvals == rvals
+            case "!=":
+                if any(v is None for v in lvals) or any(v is None for v in rvals):
+                    return False
+                return lvals != rvals
             case "<":  return lvals < rvals  # type: ignore[operator]
             case ">":  return lvals > rvals  # type: ignore[operator]
             case "<=": return lvals <= rvals  # type: ignore[operator]
@@ -293,6 +306,7 @@ def _instantiate_correlated(where: "WhereClause | None",
         col=new_col, op=new_op, val=new_val,
         subquery_ast=where.subquery_ast,
         row_cols=where.row_cols,
+        collate=where.collate,
         group_clause=_instantiate_correlated(where.group_clause, outer_row),
         and_clause=_instantiate_correlated(where.and_clause, outer_row),
         or_clause=_instantiate_correlated(where.or_clause, outer_row),
@@ -313,6 +327,9 @@ def _exec_subquery(stmt: "dict | None", db: Any) -> list[dict]:
     """Execute an already-instantiated subquery AST (no correlated substitution)."""
     if stmt is None or db is None:
         return []
+    ctes = getattr(db, '_active_ctes', None) or {}
+    if ctes:
+        return db._exec_stmt_with_ctes(stmt, ctes)
     op = stmt["op"]
     where = stmt.get("where")
     if op == "SELECT":
@@ -343,8 +360,12 @@ def _exec_correlated_subquery(stmt: "dict | None", db: Any,
     """
     if stmt is None or db is None:
         return []
-    op = stmt["op"]
+    ctes = getattr(db, '_active_ctes', None) or {}
     inst_where = _instantiate_correlated(stmt.get("where"), outer_row)
+    inst_stmt = {**stmt, "where": inst_where}
+    if ctes:
+        return db._exec_stmt_with_ctes(inst_stmt, ctes)
+    op = stmt["op"]
     if op == "SELECT":
         return db.select(stmt["table"], stmt["columns"], inst_where,
                          stmt.get("order_by"), stmt.get("limit"),

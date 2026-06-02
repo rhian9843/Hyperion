@@ -2,6 +2,8 @@
 
 ## Bugs (silent wrong behaviour)
 
+- [x] Fix `CREATE INDEX ON t(expr)` with multi-token expressions — `CREATE INDEX ON users (age / 10)` raised `NoSuchColumnError: Column '10' not found`; the fallback index column parser appended each token individually, splitting `age / 10` into `['age', '/', '10']`; fixed by collecting tokens until `,` or `)` and joining them as a single expression string
+
 - [x] Fix silent column-miss in WHERE — `WHERE nonexistent = 1` returns zero rows instead of an error
 - [x] Fix multi-row INSERT silently dropping extra rows — `VALUES (1,'a'), (2,'b')` only inserts the first tuple with no warning
 - [x] Fix `struct.error` leaking on integer overflow — wrap as user-facing `RuntimeError`
@@ -229,6 +231,253 @@
 - [x] Single-process only — WAL-based file locking protects against corruption but there is no network protocol or server mode; multiple processes cannot share a database over a socket; an agent workload that needs to expose the database to remote services or run the engine in a dedicated process must either embed it in-process or add a thin TCP/Unix-socket server layer
 - [x] No `ALTER TABLE … ALTER COLUMN type` — column type changes are not supported; a column's declared type is fixed at creation time; workaround is `CREATE TABLE new AS SELECT CAST(col AS new_type) …` then `DROP TABLE old` and rename, but this loses indexes, triggers, and constraints on the affected table
 - [x] `PRAGMA` / `RETURNING` / `EXPLAIN` results not fetchable — `execute()` returned a formatted string; `cursor.fetchall()` on PRAGMA/RETURNING/EXPLAIN returned `[]`; fixed by introducing `RowResult` so all data-producing ops are fetchable via the cursor
+
+## Phase 1.5 — CLI & Developer Experience
+
+- [x] Run `.sql` files from the CLI
+- [x] REST API / HTTP server mode — `python -m hyperion http mydb.hdb --port 8080`; full feature parity with the embedded API
+
+### Bugs Fixed in Phase 1.5
+
+- [x] Fix `INSERT INTO t SELECT ..., literal, ... FROM ...` — literal constants in SELECT list treated as column names instead of values; fixed by routing through `eval_expr` in `_project_row`
+- [x] Fix JOIN ON column side resolution — `ON right_alias.col = left_alias.col` resolved incorrectly when right table's column appeared on the left side of `=`; fixed by checking alias prefix to determine which side each column belongs to
+- [x] Fix `SUM/MIN/MAX/AVG` of cross-table expressions in GROUP BY — `SUM(p.price * o.quantity)` returned NULL because aggregation used dict key lookup instead of `eval_expr` for expression arguments
+- [x] Fix `UPDATE SET col = 'string-with-hyphen'` — string literal `'555-0001'` evaluated as arithmetic `555-1=554`; parser now preserves quotes on string literals in SET assignments so `eval_expr` correctly identifies them as strings
+- [x] Fix `ALTER TABLE ADD COLUMN ... DEFAULT value` — default value not applied to existing rows; parser never parsed the DEFAULT clause in ADD COLUMN; fixed by parsing DEFAULT token and passing value through `_rewrite_table`
+- [x] Fix chained CTEs — second CTE referencing first CTE in a WHERE IN subquery raised `No such table`; root cause: `_exec_subquery` in `where.py` called `db.select()` directly without any CTE context; fixed by threading `_active_ctes` onto the db object in `_rows_for_stmt` so subquery executors in `where.py` can resolve CTE names
+- [x] Fix `WITH RECURSIVE` without explicit column aliases — `WITH RECURSIVE nums AS (SELECT 1 AS n UNION ALL SELECT n+1 FROM nums WHERE n<5)` raised `Unknown column: 'n'`; recursive step output kept key `"n + 1"` instead of `"n"` because `_apply_aliases` only fires when column aliases are declared in the CTE name (e.g. `cnt(n)`); fixed by normalising recursive step output columns to match base case column names
+- [x] Fix trigger body split on `;` — `_split_statements` cut trigger bodies at every `;` inside `BEGIN...END`, leaving `END` as a bare unrecognised statement; fixed by tracking `BEGIN`/`END` depth in the splitter (while excluding `BEGIN TRANSACTION`)
+- [x] Fix `COALESCE(SUM(...), 0)` returning NULL in GROUP BY — `_compute_aggregates` only recognised top-level aggregates; a function wrapped around an aggregate (e.g. `COALESCE(SUM(col), 0)`) was never computed; fixed with a second pass that substitutes inner aggregate results and re-evaluates the outer expression via `eval_expr`
+- [x] Fix trigger `NEW.col` arithmetic — values in `new_row` at trigger fire time are Python strings (e.g. `"3"` not int `3`); `_sql_literal` wrapped them as quoted SQL strings (`'3'`), breaking expressions like `stock - NEW.quantity` with `int - str`; fixed by detecting numeric strings in `_sql_literal` and returning bare number tokens
+- [x] Fix `ON CONFLICT DO UPDATE SET col = col + n` — parser only captured one token for upsert assignments, losing multi-token expressions like `qty + 3`; fixed by reading full token sequence until comma/semicolon
+- [x] Fix `ON CONFLICT DO UPDATE` expression not evaluated — `_apply_on_conflict_update` tried `int(val)` which fails for expressions; fixed by falling back to `eval_expr(val, existing_row)`
+- [x] Fix `_parse_agg` matching window functions as GROUP BY aggregates — `_AGG_RE` matched `SUM(x) OVER (...)` because lazy `.+?` stretched to last `)`; caused JOIN + window function queries to collapse all rows into one; fixed by rejecting columns containing `OVER (`
+- [x] Fix window functions in JOIN queries silently dropped — `has_window` check only existed in SELECT path; JOIN path had no equivalent so LAG/LEAD/SUM OVER etc. were ignored; fixed by adding `has_window_j` detection and `_apply_window_functions` call in the JOIN code path
+- [x] Fix `SUM(...) OVER (ORDER BY ...)` returning full-partition total — SQL default frame when ORDER BY present is `ROWS UNBOUNDED PRECEDING TO CURRENT ROW`; code treated missing frame as full-partition; fixed by applying the default cumulative frame when `ob_spec` is non-empty
+- [x] Fix nested `CASE WHEN` returning wrong branch — branch token collector stopped at inner `WHEN`/`ELSE` keywords regardless of nesting depth; `THEN CASE WHEN ...` only collected `['CASE']`; fixed by tracking CASE/END depth in `_collect_case_branch_tokens`
+- [x] Fix `=` operator dropped in `_tokenize_expr` — `_TOK_RE` matched `<=`, `>=`, `!=` but not bare `=`; CASE WHEN conditions like `dept = 'Eng'` tokenized without the operator, making every condition True; fixed by adding bare `=` as a token alternative in the regex
+- [x] Fix `UNION ... ORDER BY` ignored — parser passed `t[right_start:]` (including `ORDER BY`) to the right SELECT parser which consumed it; outer UNION got `order_by: None`; fixed by stripping top-level ORDER BY/LIMIT/OFFSET from the right side and attaching them to the SET_OP node
+- [x] Fix multi-source UNION column name mismatch — `SELECT name ... UNION SELECT customer ...` produced rows with mixed keys (`name` and `customer`); SQL standard requires all rows to use the leftmost SELECT's column names; fixed by remapping right-side rows to left-side keys in `_apply_set_op`
+- [x] Fix function call on WHERE LHS — `WHERE UPPER(name) LIKE '%x%'` raised `Unknown operator: '('`; parser read `UPPER` as the column name and `(` as the operator; fixed by detecting `identifier(` pattern in `_parse_one_condition` and collecting the full function call expression before finding the comparison operator
+- [x] Fix `STRFTIME` / `DATE` / `DATETIME` / `TIME` returning NULL — date functions not implemented in `_eval_func`, falling through to `return None`; added full implementation using Python's `datetime` module with modifier support (`+30 days`, `-1 month`, etc.)
+- [x] Fix table-level `UNIQUE(col1, col2)` in CREATE TABLE parsed as a column — `_TOKEN_RE` matched `UNIQUE(student_id, course_id)` as a single token; the parser's UNIQUE constraint check compared exact string `"UNIQUE"` and missed the combined token; fixed by adding a `re.fullmatch` path that extracts column names from the single-token form
+- [x] Fix inline `CHECK(expr)` in CREATE TABLE parsed as a garbage column — `_TOKEN_RE` matched `CHECK(amount > 0)` as a single token; the column constraint while-loop only matched bare `"CHECK"` keyword, so the combined token fell through; parser tried to use `CHECK(amount > 0)` as a column name, then `")"` as a type, raising `Unknown column type: ')'`; fixed by detecting `CHECK\s*\(` token in the loop and extracting the expression via `re.fullmatch`
+- [x] Add `UPDATE OR IGNORE` support — `UPDATE OR IGNORE t SET col = val` raised `Expected: UPDATE <table> SET col=val`; parser expected `t[2] == "SET"` but `OR` and `IGNORE` occupied positions 1 and 2; fixed by detecting and skipping `OR <action>` tokens in `_parse_update` and passing `conflict_action` through to the executor; executor wraps the update in a try/except and silently skips rows that violate a constraint when `conflict_action == "IGNORE"`
+- [x] Fix 3-table (and N-table) JOIN returning 0 rows — `_exec_extra_join` normalised `on_left`/`on_right` by literal position in the `ON a = b` expression, not by which alias belongs to the new right table; for `ON i.order_id = o.id` with right_alias `i`, `rcol` was resolved from `o.id` (wrong side), INLJ index lookup found the PK on `o.id` by accident, then `lr.get("i.order_id")` returned None on every left row, skipping all results; fixed by swapping `on_left`/`on_right` when `on_left`'s alias prefix matches `right_alias`
+- [x] Fix string literal SELECT columns dropped in 2-table JOIN — `_project` inside `QueryMixin.join` used `{c: merged[c] for c in columns if c in merged}`, silently omitting columns not present as dict keys (e.g. `'Q3 label'` string literals, arithmetic, expressions); fixed by replacing the dict comprehension with a call to `_project_row` which falls back to `eval_expr` for missing columns
+- [x] Fix string literal SELECT columns showing NULL in GROUP BY queries — `_compute_aggregates` resolved non-aggregate columns with `bucket_rows[0].get(col)` which returns None for literal strings not stored as row keys; fixed by adding an `eval_expr` fallback when the column is absent from the row
+- [x] Fix `GROUP_CONCAT(col ORDER BY sort_col)` returning NULL — `ORDER BY sort_col` was left inside the arg string, making `col_name = "i.product ORDER BY i.price ASC"`, a key that doesn't exist in any row; fixed by stripping the `ORDER BY` clause from the arg before parsing column name and separator, then sorting `bucket_rows` by the extracted sort column before concatenating
+- [x] Fix `LIMIT 0` returning 1 row — fast-path iterator checked `count >= limit` AFTER yielding, so LIMIT 0 emitted one row before stopping; fixed by moving the limit check before yield
+- [x] Fix `OFFSET n` without `LIMIT` being ignored — ORDER BY column-parsing loop stopped only at `LIMIT` not `OFFSET`, causing `ORDER BY id OFFSET 3` to parse `OFFSET` and `3` as additional sort columns; `OFFSET` was also absent from `_ALIAS_BLOCKLIST` so `FROM t OFFSET 3` treated `OFFSET` as a table alias; both fixed by adding `"OFFSET"` to the ORDER BY stop tokens and to `_ALIAS_BLOCKLIST`
+- [x] Fix `ORDER BY non_select_col LIMIT n` returning wrong rows — full-table-scan path projected rows to selected columns before sorting, so ORDER BY columns absent from SELECT list were silently NULL during sort; fixed by collecting full rows, sorting and limiting, then projecting at the end
+- [x] Fix `SELECT COUNT(*) FROM (subquery) t` returning per-row NULLs — the `subquery_from` branch in `_rows_for_stmt_inner` called `_exec_derived_table` without detecting aggregates; the projection loop in `_exec_derived_table` called `_project_row` for each row with `COUNT(*)` which isn't a row key, returning NULL per row; fixed by adding an aggregate-detection branch that routes to `_apply_groupby_agg` (same as the CTE/view paths)
+- [x] Fix string literal SELECT columns returning NULL when aggregate source has 0 rows — `_compute_aggregates` used `bucket_rows[0].get(col)` falling back to `None` when bucket is empty, even for constant literals like `'label'` that don't need row context; fixed by trying `eval_expr(col, {})` as fallback even for empty buckets
+- [x] Fix function calls in `INSERT VALUES` not evaluated — single-token function calls like `UPPER('xyz')` and `ABS(-4.99)` have no space so the VALUES handler fell through to `else: parsed[name] = val`, storing the raw string; `ABS(-4.99)` then crashed `serialize_row` with `ValueError: could not convert string to float`; fixed by adding `"(" in val` to the `eval_expr` routing condition in `_execute_inner`
+- [x] Fix `TRUNCATE TABLE` not resetting `AUTOINCREMENT` counter — `TRUNCATE` called `db.delete()` then returned without touching `meta.next_key`; subsequent inserts continued from the previous high-water mark instead of restarting from 1; fixed by resetting `db._meta(table).next_key = 1` after the delete in `executor.py`
+- [x] Fix multi-level `ON DELETE CASCADE` not propagating past first child — `_check_fk_parent` deleted child B-tree rows directly without recursing into grandchildren first; deleting a customer cascade-deleted its orders but left order_items intact; fixed by calling `_check_fk_parent` recursively for each matched child row before deleting it from the B-tree in `constraints.py`
+- [x] Fix `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME` column defaults stored as literal strings — default values assigned via `col.default` bypassed eval entirely; `DEFAULT CURRENT_TIMESTAMP` stored the string `"CURRENT_TIMESTAMP"` in the row; fixed by adding `_eval_default()` helper that routes SQL constant defaults through `eval_expr({})` at insert time; applied to both INSERT VALUES and INSERT SELECT default-fill paths in `executor.py`
+- [x] Fix `LIMIT` in `UPDATE ... ORDER BY col LIMIT n` ignored — `_parse_update` checked for `LIMIT` immediately after WHERE but `ORDER BY col` tokens sat between them; `limit_u` stayed `None` and all matching rows were updated; fixed by skipping the optional `ORDER BY ...` clause before parsing `LIMIT` in `_parse_update`
+- [x] Fix `LIMIT` in `DELETE ... ORDER BY col LIMIT n` ignored — same root cause as UPDATE: `_parse_delete` checked for `LIMIT` immediately after WHERE; `ORDER BY col` tokens prevented the LIMIT token from being reached; fixed by skipping the optional `ORDER BY ...` clause before parsing `LIMIT` in `_parse_delete`
+- [x] Fix `TIME` column type not recognised — `_parse_col_type` handled `DATE`, `DATETIME`, `TIMESTAMP` but not `TIME`; raised `Unknown column type: 'TIME'`; fixed by adding `TIME` → `TEXT, 8` mapping in `parser.py`
+- [x] Fix `SUM(CAST(col AS type))` / any aggregate with nested function-call arg returning NULL — when the arg to an aggregate contains `(`, the tokenizer produces `SUM ( CAST(col AS type) )` with spaces; `_AGG_RE` had no `\s*` between function name and `\(`; `_parse_agg` returned None; the column was never recognised as an aggregate; fixed by adding `\s*` before `\(` in `_AGG_RE`
+- [x] Fix `GROUP BY expression` (e.g. `STRFTIME('%Y-%m', col)`) putting all rows in one bucket — `_group_by_select` used `row.get(c)` to build the bucket key; expression GROUP BY keys are never dict keys so all rows got key `(None,)` and collapsed into one bucket; fixed by falling back to `eval_expr(c, row)` when the key is not a direct column name
+- [x] Fix `LENGTH(blob_col)` returning length of Python repr string instead of byte count — `_eval_func("LENGTH", ...)` called `str(args[0])` unconditionally, converting `b'hello world'` to the 14-char string `"b'hello world'"`; fixed by returning `len(args[0])` directly when the value is `bytes` or `bytearray`
+- [x] Fix `COLLATE NOCASE` in WHERE equality (`WHERE name = 'bob' COLLATE NOCASE`) returning 0 rows — `_parse_one_condition` consumed `col op val` but left `COLLATE NOCASE` tokens dangling; `WhereClause` had no `collate` field so case-insensitive comparison was never applied; fixed by adding `collate` field to `WhereClause`, consuming `COLLATE <name>` in `_parse_one_condition`, and applying `casefold()` comparison in `_eval_atom` when `self.collate == "NOCASE"`
+- [x] Fix INSERT into generated column silently succeeding — executor never validated that user-supplied `col_names` doesn't include generated columns; fixed by checking each user-supplied column name against `col.is_generated` in the INSERT handler and raising `ConstraintError` if found
+- [x] Fix composite PK table JOIN returning 0 rows — `probe_index` in `optimizer.py` built lo/hi search keys using `_encode_composite_key([val], [type])` which produces a 128-bit (single-column) integer, but the composite PK index has `key_sz=24` and stores 192-bit keys (`col1 + col2 + rowid`); the 128-bit lo/hi were smaller than all actual keys so `scan_range` returned no rows; fixed by detecting `len(idx_meta.columns) > 1` and padding lo/hi with `_MIN_VAL_KEY`/`_MAX_VAL_KEY` for trailing columns
+- [x] Fix `INSTEAD OF INSERT` trigger storing raw SQL literals — `_exec_instead_of_insert` built `parsed` dict with raw token values like `"'Grace'"` (with quotes) instead of unquoted strings; regular INSERT handler applied `_is_single_string_literal` unquoting but INSTEAD OF path didn't; fixed by applying the same token-parsing logic (NULL check, string unquote, eval_expr for expressions) in `_exec_instead_of_insert`
+- [x] Fix `json_array(json_object(...))` double-encoding nested JSON — `json_array` passed args directly to `json.dumps`, which encoded already-serialized JSON strings as quoted strings; added `_maybe_json` helper that pre-parses string args starting with `{` or `[`; applied to both `json_array` and `json_object` value args to match SQLite JSONB subtype nesting behaviour
+- [x] Fix `json_each` returning Python `True`/`False` for JSON booleans — `json_each_rows` stored raw Python bools in `value`/`atom`; SQLite returns `1`/`0`; fixed by converting bools to integers in `_cell` helper inside `json_each_rows`
+- [x] Fix `json_each(fn(...))` in comma-join FROM not recognised — parser called `_collect_func_call` for the primary table but not for subsequent comma-joined tables; `json_each` was parsed as a bare table name; fixed by adding the same `_TABLE_VALUED_FUNCS` check in the comma-join loop
+- [x] Fix `PRAGMA foreign_keys` (read, no value) returning a plain string instead of a fetchable RowResult — executor returned `f"foreign_keys = {val}"` string; fixed by returning `RowResult([{"foreign_keys": val}], ["foreign_keys"])` to match SQLite behaviour
+- [x] Fix `PRAGMA table_info(missing_table)` raising `NoSuchTableError` — SQLite returns 0 rows for unknown tables; fixed by returning an empty `RowResult` with the correct column list instead of raising
+- [x] Fix `col NOT LIKE pattern` raising `ParseError` — `_parse_one_condition` only handled `NOT IN` and `NOT BETWEEN`; added `NOT LIKE` and `NOT GLOB` (with ESCAPE support) by wrapping a LIKE/GLOB clause in a NOT group node
+- [x] Fix LATERAL subquery column expressions not resolving outer row references — `SELECT_NOFROM` evaluated columns with `eval_expr(col, {})` (empty dict); LATERAL subquery passed outer row to `_instantiate_correlated` for WHERE but not for SELECT columns; fixed by storing `_outer_row` on the instantiated subquery AST and using it in `SELECT_NOFROM` evaluation
+- [x] Fix `(a, b) = (v1, v2)` row comparison with NULLs returning wrong results — `_coerce` copied `None` from the cell to the target value, so `(NULL, 10) == (1, 10)` became `(None, 10) == (None, 10)` → True; fixed by coercing the raw value independently of cell type; added explicit NULL-in-either-operand → False guard for `=` and `!=` operators
+
+### Audit Findings — Principal Engineer Review (2026-06-02)
+
+#### Priority 1 — Data Correctness (must fix before Phase 2)
+
+- [x] Fix `INT64_MIN` (-9223372036854775808) as primary key crashes with `OverflowError` — `btree.py:_pack_key` calls `key.to_bytes(self._key_sz, "big")` for non-8-byte keys; `_make_index_key(-2^63, -2^63)` returns a negative Python int because the `_KEY_SIGN` bias cancels out and the rowid component is negative; `int.to_bytes` without `signed=True` raises `OverflowError`; fix by masking the rowid to unsigned in `_make_index_key`: `(rowid & 0xFFFF_FFFF_FFFF_FFFF)` — verified to crash in production with extremal integer values
+- [x] Fix dirty reads across explicit multi-statement transactions on shared connections — `Pager.read_page()` returns pages from `_working` (the uncommitted write buffer) whenever `self._in_txn is True`; `_in_txn` is a per-Pager attribute shared by all threads; the `_RWLock` is released between individual SQL statements in an explicit transaction so a concurrent SELECT acquires the read lock while `_in_txn is True` and reads uncommitted data; fix by gating `_working` access on whether the calling thread is the write-lock owner (store `_write_tid = threading.get_ident()` in `Pager.begin()` and check it in `read_page()`); verified: 7 consecutive dirty reads of an uncommitted value observed in controlled test before rollback
+- [x] Fix WAL crash-recovery `replay_if_exists` missing `fsync` before WAL deletion — after applying committed pages, `wal.py:replay_if_exists` calls `db_file.flush()` but **not** `os.fsync(db_file.fileno())`; the WAL is then deleted in the `finally` block; if the OS crashes between `flush()` and the kernel writing pages to disk, the WAL is gone but the data is not durable — committed data is permanently lost; fix by adding `os.fsync(db_file.fileno())` (with `except OSError: pass`) immediately after `db_file.flush()` and before `wal_path.unlink()`
+- [x] Add test: `INSERT INTO t VALUES (-9223372036854775808, 'x')` with INTEGER PRIMARY KEY must not raise — covers the INT64_MIN key overflow found above
+- [x] Add test: dirty-read isolation — Thread A calls `db.begin()`, UPDATE, then sleeps; Thread B does SELECT on same connection; result must not contain Thread A's uncommitted value; rollback must restore original
+- [x] Add test: WAL crash recovery fsync ordering — monkeypatch `os.fsync` to raise mid-replay; verify WAL is not deleted before main-file pages are durably written
+
+#### Priority 2 — Durability & Reliability
+
+- [x] Remove dead `CHECKPOINT_PAGES = 64` constant and `WAL.needs_checkpoint()` method, or implement lazy checkpointing — `needs_checkpoint()` is defined in `wal.py:81` but is **never called anywhere in the codebase**; `pager.commit()` unconditionally calls `self._wal.checkpoint()` on every commit making the threshold mechanism a no-op; either delete both (the WAL always-checkpoint behaviour is intentional) or implement lazy checkpointing: only call `checkpoint()` when `needs_checkpoint()` returns True and force a full checkpoint at `close()`, which would significantly improve bulk-insert throughput
+- [x] Add test: concurrent explicit transactions — two threads each doing `BEGIN` / `INSERT` / `COMMIT` serially must not produce `TransactionError` inside a single thread; current `test_explicit_transaction_serialised` accepts `"already active"` silently, masking cross-thread state leakage
+- [x] Add test: `CHECKPOINT_PAGES` threshold — verify `needs_checkpoint()` returns False below the threshold and True at/above it; verify checkpoint is triggered at the right boundary (currently untestable because the threshold is never checked)
+- [x] Add test: multi-connection WAL replay — process A writes 100 rows and closes; a left-behind WAL is manually constructed; process B opens the same file and must replay the WAL and see all 100 rows; currently no test covers the two-process open scenario
+
+#### Priority 3 — Performance
+
+- [x] Optimize catalog ops flush — `ops_to_bytes()` serializes metadata for **all** tables on every commit regardless of which tables were touched; with 100 tables a single INSERT takes 3.8× longer than with 1 table; fix by tracking a dirty flag per `TableMeta`/`IndexMeta` and only serializing changed entries; or limit `ops_to_bytes()` to the single table touched by the current transaction
+- [x] Fix plan cache eviction from FIFO to LRU — when the 512-entry cache is full, `cursor.py` evicts `oldest = next(iter(cache))` (insertion-order, not access-order); a workload with 513+ distinct query templates (common in AI/LLM applications) thrashes the cache and effectively disables it; fix by using `collections.OrderedDict` and calling `move_to_end(sql)` on cache hit before returning the cached plan
+- [x] Add test: plan cache with 513 distinct query templates — verify that the 512nd+1 template evicts the least-recently-used entry, not the first-inserted one; verify the most-recently-used template is never evicted while less-used ones exist
+
+#### Priority 4 — Code Quality & Latent Bugs
+
+- [x] Replace `_TOKEN_RE` regex tokenizer with a proper depth-tracking lexer — `r'\w+\([^()]*\)'` only captures function calls with flat (non-nested) arguments; any SQL with nested functions (`ROUND(SUM(x), 2)`, `json_each(json_extract(col, '$.key'))`, `CAST(col AS INT)`) is not captured as a single token, causing downstream parsing failures; this root cause has already produced at least 6 separate bugs fixed in Phase 1.5 (SUM+CAST, json_each+json_extract, COALESCE+SUM, etc.) and more will surface; a 30-line depth-tracking lexer eliminates this entire class permanently
+- [x] Decompose `_execute_inner` (330 lines, largest function in the codebase) into per-statement handlers — `executor.py:_execute_inner` handles every DML statement (INSERT, UPDATE, DELETE, TRUNCATE, CREATE, DROP, etc.) in a single monolithic function; each new SQL feature adds more branches; split into `_exec_insert`, `_exec_update`, `_exec_delete`, `_exec_truncate`, `_exec_ddl` etc. with a dispatch table; each handler becomes independently testable
+- [x] Fix B-tree delete Phase-2 rebalance restart — after bulk delete the engine loops `while changed: pn = self._leftmost_leaf()` restarting the full leaf scan from leftmost after each merge; for k underfull leaves this is O(k × leaf_chain_length); replace with a single bottom-up merge pass that tracks candidate underfull leaves during the Phase-1 compact step instead of rediscovering them by re-scanning
+- [x] Add test: tokenizer with deeply nested function calls — `SELECT ROUND(SUM(CAST(col AS REAL)), 2)` and `WHERE json_each(json_extract(json_extract(col, '$.a'), '$.b'))` must parse and execute without error; covers the recurring `_TOKEN_RE` nesting limitation
+- [x] Add test: overflow page chain crash simulation — insert 10 large rows (each requiring 3 overflow pages), simulate a crash after page 5 of the last row's overflow chain by truncating the WAL mid-frame; reopen and verify: (a) the partially-written row is not visible (uncommitted), (b) the 9 complete rows are intact, (c) no dangling overflow page references exist after recovery
+- [x] Add test: fuzz tokenizer with random SQL — generate 1000 random SQL strings mixing keywords, identifiers, numbers, and nested parens; verify that `parse()` either returns a valid AST or raises `ParseError`, never raises an unhandled internal exception such as `IndexError`, `KeyError`, or `AttributeError`
+- [x] Add test: savepoint under concurrent reads — Thread A creates a savepoint, modifies data, and sleeps; Thread B reads concurrently; verify Thread B never sees Thread A's post-savepoint uncommitted modifications; complements the dirty-read test above but specifically targets the savepoint snapshot mechanism
+
+### Transactions
+
+- [ ] `SELECT FOR UPDATE` — row-level locking within a transaction; `SELECT * FROM t WHERE id = 1 FOR UPDATE` acquires an exclusive lock on matched rows, blocking concurrent writers until `COMMIT` or `ROLLBACK`; required for safe read-modify-write patterns
+- [ ] Transaction isolation levels — `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ|SERIALIZABLE`; current engine uses a readers-writer lock but exposes no user-visible isolation level; `SHOW TRANSACTIONS` lists active transactions with their isolation level and start time
+
+### Network
+
+- [ ] MySQL wire protocol server — `python -m hyperion mysql mydb.hdb --port 4406`; implements the MySQL client/server protocol so any MySQL-compatible client connects without a Hyperion-specific driver:
+  - Server greeting / capability handshake — send server version string and capability flags; accept unauthenticated or password-bypass connections (`--skip-ssl`, empty password)
+  - `COM_QUERY` — receive SQL string, execute against the database, return column-definition packets + row data packets + EOF/OK packet
+  - `COM_PING` — respond with OK packet (keepalive)
+  - `COM_QUIT` — close connection cleanly
+  - Result set encoding — column count packet, one `ColumnDefinition41` packet per column (name, type, flags), one text-protocol row packet per result row, `EOF` to terminate
+  - Error packet — `ERR_Packet` with SQL state and typed message on any exception
+  - `COM_INIT_DB` — handle `USE database` command sent by MySQL clients on connection or schema switch
+  - Compatible clients: `mysql` CLI (`mysql -h 127.0.0.1 -P 4406 -u root --skip-ssl`), `mysql-connector-python`, `PyMySQL`, SQLAlchemy MySQL dialect
+- [ ] Web Dashboard — browser UI served at `GET /` by the HTTP server; shows database stats, table list, schema browser, and an interactive SQL query editor; no external JS dependencies (single self-contained HTML page)
+- [ ] DSN connection strings — `hyperion://host:port/dbname` format parsed by a `connect(dsn=...)` helper; standard format for ORMs and connection pool libraries
+- [ ] Server-side connection pooling — configurable pool size and max queue depth on the TCP server; reuses cursors across requests rather than spawning a new thread per connection; `SHOW PROCESSLIST` lists active connections with current query, user, and elapsed time
+
+### Analytics — Column Store
+
+- [ ] `CREATE COLUMN TABLE` — alternative storage layout where each column is stored as a contiguous array rather than row-by-row; enables vectorised `SUM/AVG/COUNT/MIN/MAX` scans that skip irrelevant columns entirely
+- [ ] Columnar aggregate scans — when the query touches only a subset of columns and the table is a column table, scan only those column arrays; `GROUP BY` fallback to row-store path when needed
+- [ ] `SHOW STORAGE FORMAT` — introspection command returning `ROW` or `COLUMN` for each table
+
+### Replication
+
+- [ ] Logical replication — `CREATE PUBLICATION pub FOR TABLE t1, t2` on the primary; `CREATE SUBSCRIPTION sub CONNECTION '...' PUBLICATION pub` on the replica; changes are streamed as an append-only change log and applied on the subscriber
+- [ ] Physical replication — binary-level WAL streaming from primary to replica with auto-sync every 500ms; auto-reconnect on connection loss; replica runs in read-only mode (any write raises `ReadOnlyError`); `SHOW MASTER STATUS`, `SHOW SLAVE STATUS`, `SHOW BINLOG`, `START SLAVE`, `STOP SLAVE`; replica can be promoted to primary on failure
+
+### Row-Level Security
+
+- [ ] `ENABLE ROW LEVEL SECURITY` / `DISABLE ROW LEVEL SECURITY` per table — when enabled, all queries against the table are filtered by active policies; superuser-level connections bypass RLS
+- [ ] `CREATE POLICY name ON table USING (expr)` — defines a filter expression applied transparently to every `SELECT`, `UPDATE`, and `DELETE` on the table; multiple policies are OR-combined
+- [ ] `CURRENT_USER_ID()` scalar function — returns the active user identity set via `db.set_user(id)`; used inside policy expressions for per-tenant row filtering
+
+### Event Scheduler
+
+- [ ] `CREATE EVENT name ON SCHEDULE EVERY n SECOND|MINUTE|HOUR|DAY DO sql` — registers a background job that fires on the given interval; event definitions persist in the catalog
+- [ ] `CREATE EVENT name ON SCHEDULE AT timestamp DO sql` — one-shot event fires once at the given datetime then auto-drops
+- [ ] `SHOW EVENTS` / `DROP EVENT` — list and remove scheduled events
+- [ ] `ALTER EVENT name ENABLE|DISABLE` — pause or resume a scheduled event without dropping it
+- [ ] Background event loop — a daemon thread in `Database` checks due events and executes them; honors the readers-writer lock so events never corrupt concurrent queries
+
+### Functions — Missing
+
+- [ ] Regex functions — `REGEXP_REPLACE(str, pattern, replacement)`, `REGEXP_EXTRACT(str, pattern)`, `REGEXP` / `RLIKE` infix operators for pattern matching in `WHERE` clauses; backed by Python `re` module; no external dependency
+- [ ] Date manipulation functions — `NOW()` (alias for `CURRENT_TIMESTAMP`), `DATEDIFF(date1, date2)` returns days between two dates, `DATE_ADD(date, INTERVAL n UNIT)` / `DATE_SUB(date, INTERVAL n UNIT)` for date arithmetic, `DATE_FORMAT(date, format)` for strftime-style formatting; MySQL-compatible signatures
+- [ ] `TIME` standalone data type — `HH:MM:SS` storage separate from `DATE` and `DATETIME`; already have `CURRENT_TIME` scalar but no `TIME` column type
+
+### Introspection — Missing
+
+- [ ] `EXPLAIN ANALYZE` — runs the query and annotates the execution plan with actual row counts, loop iterations, and elapsed time per node; complements `EXPLAIN` (estimated plan) and `EXPLAIN QUERY PLAN` (textual plan) with real execution statistics
+- [ ] `SHOW RECOVERY STATUS` — reports the current WAL state: last committed LSN, whether a recovery replay occurred on startup, WAL file size, and checkpoint timestamp; useful for diagnosing crash recovery
+- [ ] `SHOW MATERIALIZED VIEWS` — lists all materialized views with their name, defining query, last refresh timestamp, and row count; complements `SHOW TABLES` and `INFORMATION_SCHEMA`
+- [ ] `SHOW LOGICAL LOG` — display the last N entries from the logical replication change log; shows table name, operation (INSERT/UPDATE/DELETE), and column values; useful for debugging replication lag
+
+### Adaptive Query Optimizer
+
+- [ ] Automatic query rewriting — simplify trivially true/false conditions before planning (`WHERE 1=1` → strip, `WHERE 1=0` → empty scan); normalize redundant `AND`/`OR` combinations; rewrite `WHERE col IN (SELECT ...)` to an equivalent JOIN when the subquery is non-correlated and the planner estimates the join path is cheaper
+- [ ] `EXPLAIN REWRITTEN` — show the query as it looks after the rewriter has transformed it, before the planner runs; lets developers see exactly what optimizations were applied and verify the rewriter is not changing query semantics
+- [ ] Access statistics tracking — record per-table and per-index scan counts, hit rates, and last-used timestamps in the catalog; updated on every query execution
+- [ ] `SHOW INDEX SUGGESTIONS` — analyse access statistics and current schema to recommend missing indexes; output lists candidate columns, estimated selectivity, and projected query speedup
+- [ ] `SHOW QUERY STATS` — per-table query frequency and column filter counts
+- [ ] `SHOW PROFILES` / `PROFILE ON|OFF` — per-query execution timing; `SHOW PROFILE FOR QUERY n` shows breakdown for a specific query
+- [ ] Hash JOIN and Merge JOIN strategies — planner selects `NESTED_LOOP` for small tables, `HASH_JOIN` for large unsorted inputs, `MERGE_JOIN` when both sides are index-ordered; current engine only does nested loop
+- [ ] Query result cache — LRU cache of recent `SELECT` results with a configurable TTL; cache key is the normalised SQL + params; invalidated on any write to a referenced table; `SHOW CACHE STATUS`, `SET CACHE ON|OFF`
+- [ ] Parallel query execution — split table scans and aggregations across multiple CPU threads on the same machine; `SET MAX_PARALLEL_WORKERS n` controls thread count; `SET PARALLEL_THRESHOLD n` sets minimum row count before parallelism kicks in; `/*+ PARALLEL(N) */` query hint forces a specific degree; `SHOW PARALLEL STATUS`; planner chooses parallel path automatically for large scans
+
+### DDL — Advanced Schema
+
+- [ ] Schemas / namespaces — `CREATE SCHEMA s`, `DROP SCHEMA s`, `USE s`; tables qualified as `schema.table`; default schema is `public`; required for multi-tenant isolation at the schema level
+- [ ] Materialized views — `CREATE MATERIALIZED VIEW name AS SELECT ...`; result is physically stored and queryable like a table; `REFRESH MATERIALIZED VIEW name` re-executes the query and replaces stored rows; `DROP MATERIALIZED VIEW`
+- [ ] Stored procedures — `CREATE PROCEDURE name(params) BEGIN ... END`; `CALL name(args)`; `DROP PROCEDURE`; body supports local variables, `IF/ELSE`, `LOOP/LEAVE`, and `CURSOR` declarations for row-by-row processing; `SHOW PROCEDURES`
+- [ ] Named prepared statements — SQL-level `PREPARE stmt FROM 'SELECT ... WHERE id = ?'`; `EXECUTE stmt USING val`; `DEALLOCATE PREPARE stmt`; complements the existing Python-level `?` binding with a session-scoped statement handle
+- [ ] Table partitioning — `CREATE TABLE t (...) PARTITION BY RANGE|LIST|HASH (col)`; rows routed to the correct partition on insert; queries with matching predicates scan only relevant partitions; `SHOW PARTITIONS`; `DROP PARTITION`
+- [ ] Table inheritance — `CREATE TABLE child INHERITS (parent)`; child inherits all parent columns; `SELECT * FROM parent` includes child rows; `SELECT * FROM ONLY parent` excludes them; `SHOW INHERITANCE`
+
+### Security — User Management
+
+- [ ] `CREATE USER 'name' IDENTIFIED BY 'password'` / `DROP USER` / `SHOW USERS` — per-user identity stored in the catalog; passwords hashed (SHA-256)
+- [ ] `GRANT SELECT|INSERT|UPDATE|DELETE|ALL ON table TO user` / `REVOKE` / `SHOW GRANTS FOR user` — table-level privilege enforcement; any operation by a user without the required privilege raises `AuthorizationError`
+
+### Concurrency
+
+- [ ] `LOCK TABLE t READ|WRITE` / `UNLOCK TABLES` / `SHOW LOCKS` — explicit advisory table locks; `READ` allows concurrent reads, blocks writes; `WRITE` blocks all other access; complements the existing RWLock with user-visible locking
+- [ ] Buffer pool manager — configurable LRU page cache with dirty-page tracking and write-behind flushing; `SET BUFFER_POOL_SIZE n` (in MB); `SHOW BUFFER POOL STATUS` returns hit rate, dirty page count, eviction count; `FLUSH BUFFER POOL` forces all dirty pages to disk; reduces I/O under read-heavy workloads by keeping hot pages in memory
+
+### Operational
+
+- [ ] `BACKUP DATABASE TO 'file.sql'` / `BACKUP TABLE t TO 'file.sql'` — SQL-dump backup with schema + data; header includes timestamp and version metadata; complements `iterdump()` with a CLI-accessible SQL command
+- [ ] `RESTORE DATABASE FROM 'file.sql'` — replay a backup file against the current database; drops existing tables that conflict before recreating
+- [ ] `LOAD DATA INFILE 'path' INTO TABLE t SEPARATOR ',' SKIP HEADER` — bulk CSV import with auto-separator detection (comma, semicolon, tab) and quoted-field handling
+- [ ] `SELECT * FROM t INTO OUTFILE 'path' SEPARATOR ','` — export query results to CSV
+- [ ] `LISTEN channel` / `NOTIFY channel, 'payload'` / `UNLISTEN channel` — lightweight pub/sub messaging between connections; notifications delivered to all listeners on the named channel; `SHOW LISTEN` lists active subscriptions; useful for cache invalidation and real-time agent coordination
+- [ ] `BENCHMARK 'SELECT ...' [n]` — run a statement n times and report total and per-iteration timing; useful for regression testing query performance
+- [ ] `SHOW VARIABLES` — list all configurable runtime settings and their current values
+- [ ] `INFORMATION_SCHEMA.TABLES` and `INFORMATION_SCHEMA.COLUMNS` virtual tables — standard SQL information schema views; `INFORMATION_SCHEMA.TABLES` returns `(TABLE_NAME, TABLE_ROWS, TABLE_TYPE)`; `INFORMATION_SCHEMA.COLUMNS` returns `(TABLE_NAME, COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY)`
+- [ ] `DESCRIBE table` / `SHOW CREATE TABLE table` — MySQL-compatible aliases for schema introspection; `DESCRIBE` returns column name, type, nullable, key, default; `SHOW CREATE TABLE` returns the full `CREATE TABLE` statement that would recreate the table
+- [ ] `SHOW TABLES` / `SHOW DATABASES` / `SHOW SCHEMAS` — MySQL-compatible aliases for listing objects; currently requires `SELECT name FROM _hyperion_master` or the Python API
+
+### GPU / MPS Acceleration
+
+- [ ] Hardware detection at startup — probe for CUDA (NVIDIA), MPS (Apple Silicon), and ROCm (AMD) availability using optional libraries (`cupy`, `torch`, `mlx`); if none present, silently fall back to CPU; expose detected backend via `SHOW VARIABLES` (`gpu_backend = cuda|mps|rocm|none`)
+- [ ] GPU-accelerated column store scans — when a query targets a `COLUMN TABLE`, transfer column arrays to GPU memory and execute `SUM`, `AVG`, `COUNT`, `MIN`, `MAX` as massively parallel reductions; fall back to CPU path for row-store tables or when GPU unavailable
+- [ ] GPU-accelerated aggregations — `GROUP BY` aggregations on large row-store tables offloaded to GPU when table exceeds `gpu_threshold` rows (configurable via `SET GPU_THRESHOLD n`); GPU builds hash-grouped partial aggregates, CPU merges
+- [ ] GPU-accelerated hash joins — when both sides of a join exceed `gpu_threshold`, build the hash table on GPU memory and probe in parallel; orders of magnitude faster than CPU nested-loop for large equijoins
+- [ ] GPU-accelerated sorting — `ORDER BY` on large result sets offloaded to GPU parallel sort (bitonic sort / radix sort); CPU sort retained for small results where GPU transfer overhead exceeds compute savings
+- [ ] MPS backend (Apple Silicon) — uses `mlx` or `torch` MPS device; zero-copy transfers via unified memory on M-series chips where CPU and GPU share the same physical RAM; automatic selection when running on macOS with Apple Silicon
+- [ ] `SHOW GPU STATUS` — report backend name, device name, total VRAM, used VRAM, current `gpu_threshold`, and whether GPU is actively being used
+- [ ] Phase 2 bridge — GPU backend reused for vector similarity operators (`<->`, `<=>`, `<#>`) and HNSW index construction/search in Phase 2; scoped here so the acceleration layer is in place before vector workloads arrive
+
+### Spatial
+
+- [ ] `POINT(lat, lng)` column type — stores a 2D geographic coordinate as two REAL values
+- [ ] `ST_DISTANCE(p1, p2)` — Haversine distance in km between two POINT values
+- [ ] `ST_WITHIN(point, center, radius_km)` — returns true if point is within radius of center; enables geo-radius queries without full table scans
+- [ ] `ST_X(point)` / `ST_Y(point)` — extract latitude / longitude from a POINT value
+- [ ] `ST_ASTEXT(point)` — return WKT string representation `POINT(lat lng)`
+- [ ] `CREATE SPATIAL INDEX idx ON t(col)` — index on a POINT column to accelerate `ST_WITHIN` queries
+
+## Phase 1.75 — C Extension Hot Path
+
+> **Goal** — keep 95% of the codebase in Python; rewrite only the innermost loop functions that appear at the top of a profiler trace as a thin C extension (`_hyperion_core.so`). Users still `pip install hyperion` — the extension compiles on install via `setup.py`. No new runtime dependencies.
+
+### Profiling & Baseline
+
+- [ ] Establish benchmark suite — scripts that measure row encode/decode throughput, B-tree lookup latency, bulk insert speed, and full table scan speed at 100k / 1M / 10M rows; results recorded as baseline before any C work begins
+- [ ] Profile-guided targeting — run the benchmark suite under `cProfile` / `py-spy` to confirm which functions dominate; only rewrite functions that account for >10% of total query time
+
+### C Extension — Core Functions
+
+- [ ] `encode_row(row_dict, schema) → bytes` — pack a Python dict into the fixed-width binary row format; replaces the pure-Python implementation in `encoding.py`; called on every INSERT and UPDATE
+- [ ] `decode_row(buf, schema) → dict` — unpack raw page bytes back into a Python dict; replaces the pure-Python deserialisation path; called on every row read during scans and lookups
+- [ ] `btree_compare_keys(a: bytes, b: bytes) → int` — low-level byte-level key comparison used in every B-tree traversal; eliminates per-comparison Python overhead in the innermost search loop
+- [ ] `btree_search_page(page_bytes, key: bytes) → int` — binary search within a single 4KB B-tree page; returns the cell offset of the matching or nearest key; replaces the Python loop in `btree.py`
+- [ ] `page_checksum(page_bytes) → int` — CRC-32 computation for page integrity; currently calls Python `struct` and `zlib`; a C version eliminates interpreter overhead on every page read and write
+
+### Build & Integration
+
+- [ ] `setup.py` / `pyproject.toml` C extension target — defines the `_hyperion_core` extension module with optional build; if a C compiler is unavailable, falls back to pure-Python implementations transparently with a warning
+- [ ] Pure-Python fallback shim — each C function has a Python equivalent behind a `try: from _hyperion_core import X` / `except ImportError: X = _python_X` guard; the rest of the codebase calls the name, never the module directly
+- [ ] CI build matrix — compile and test the extension on Linux (gcc), macOS (clang / Apple Silicon), and Windows (MSVC) via GitHub Actions; pure-Python fallback tested in the same matrix
+
+### Validation
+
+- [ ] Correctness test suite — run the full existing test suite against the C extension build; any divergence from pure-Python results is a bug in the C code, not an acceptable trade-off
+- [ ] Benchmark regression gate — re-run the baseline benchmark suite after each C function is introduced; document speedup per function; flag any function where the C version is slower than Python (likely a marshalling overhead issue)
 
 ## Phase 2
 

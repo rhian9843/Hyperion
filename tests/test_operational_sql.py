@@ -19,7 +19,7 @@ def db_run(commands, db_path):
     )
     lines = []
     for line in result.stdout.splitlines():
-        stripped = line.removeprefix("H > ").strip()
+        stripped = line.removeprefix("hyperion> ").strip()
         if stripped and stripped != "...":
             lines.append(stripped)
     return result.returncode, lines
@@ -75,9 +75,9 @@ class TestPragmaTableInfo(unittest.TestCase):
         self.assertIsNotNone(id_row, "No data row found for 'id' column")
         self.assertIn("1", id_row)  # pk=1 for id
 
-    def test_unknown_table_raises(self):
+    def test_unknown_table_returns_no_rows(self):
         _, lines = db_run(["PRAGMA table_info(nonexistent)", ".exit"], self.db)
-        self.assertIn("Error", " ".join(lines))
+        self.assertIn("no rows", " ".join(lines))
 
 
 # ── PRAGMA index_list ──────────────────────────────────────────────────────────

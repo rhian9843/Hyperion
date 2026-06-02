@@ -55,7 +55,14 @@ Thumbs.db
 
 # Hyperion database files
 *.db
+*.hdb
 *.wal
+database/
+
+# SQL scratch files and test coverage
+*.sql
+sql/
+.claude/SQL_TEST_COVERAGE.md
 
 # Logs
 *.log

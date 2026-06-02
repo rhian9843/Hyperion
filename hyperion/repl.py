@@ -78,35 +78,93 @@ def _needs_continuation(sql: str) -> bool:
 
 
 def _split_statements(text: str) -> list[str]:
-    """Split SQL text on ';' outside string literals."""
+    """Split SQL text on ';' outside string literals and BEGIN...END blocks."""
     stmts: list[str] = []
     buf: list[str] = []
     in_str = False
+    begin_depth = 0
     i = 0
-    while i < len(text):
+    n = len(text)
+    while i < n:
         ch = text[i]
         if ch == "'" and not in_str:
             in_str = True; buf.append(ch)
         elif ch == "'" and in_str:
             buf.append(ch)
-            if i + 1 < len(text) and text[i + 1] == "'":
+            if i + 1 < n and text[i + 1] == "'":
                 buf.append(text[i + 1]); i += 2; continue
             in_str = False
         elif ch == ";" and not in_str:
-            stmts.append("".join(buf)); buf = []
+            if begin_depth == 0:
+                stmts.append("".join(buf)); buf = []
+            else:
+                buf.append(ch)
         else:
             buf.append(ch)
+            if not in_str:
+                # Check for BEGIN / END keyword boundaries
+                joined = "".join(buf)
+                upper = joined.upper()
+                # A keyword ends at the current position and is preceded by
+                # a non-word character (or start of text).
+                def _is_keyword_end(word: str) -> bool:
+                    wl = len(word)
+                    if not upper.endswith(word):
+                        return False
+                    pos = len(upper) - wl - 1
+                    if pos >= 0 and (upper[pos].isalnum() or upper[pos] == '_'):
+                        return False
+                    nxt = i + 1
+                    if nxt < n and (text[nxt].isalnum() or text[nxt] == '_'):
+                        return False
+                    return True
+                if _is_keyword_end("BEGIN"):
+                    # BEGIN TRANSACTION or BEGIN; → SQL transaction, not a block
+                    rest = text[i + 1:].lstrip()
+                    if (not rest.upper().startswith("TRANSACTION")
+                            and not rest.startswith(";")):
+                        begin_depth += 1
+                elif _is_keyword_end("END") and begin_depth > 0:
+                    begin_depth -= 1
         i += 1
     if buf:
         stmts.append("".join(buf))
     return stmts
 
 
+_BANNER = """\
+╔══════════════════════════════════════════════╗
+║            Hyperion Database                 ║
+║   Type '.help' for commands, '.exit' to quit ║
+╚══════════════════════════════════════════════╝"""
+
+_HELP = """\
+Commands:
+  .tables           List all tables
+  .indexes          List all indexes
+  .schema <table>   Show table definition
+  .exit / .quit     Exit the REPL
+
+Separate multiple statements with ;"""
+
+
+def _print_result(result, /, *, fancy: bool = False) -> None:
+    """Print the result of a single statement."""
+    if isinstance(result, RowResult):
+        print(_format_rows(result.rows, result.columns, fancy=fancy))
+    elif result is not None:
+        print(result)
+
+
 def repl(db: Database) -> None:
+    _tty = sys.stdout.isatty()
+    if _tty:
+        print(_BANNER)
+        print()
     buf: list[str] = []
     while True:
         try:
-            text = input("H > " if not buf else "... ").strip()
+            text = input("hyperion> " if not buf else "       -> ").strip()
         except KeyboardInterrupt:
             print()
             buf = []
@@ -116,17 +174,22 @@ def repl(db: Database) -> None:
             break
         if not text:
             if buf:
-                buf = []   # empty line abandons incomplete buffer
+                buf = []
             continue
         if text.startswith("."):
             if buf:
                 buf = []
+            if text.lower() in (".help", ".h"):
+                print(_HELP)
+                continue
             if handle_meta(text, db) is None:
+                if _tty:
+                    print("Bye.")
                 break
             continue
         buf.append(text)
         if _needs_continuation(text):
-            continue     # show "... " prompt for next line
+            continue
         combined = " ".join(buf)
         buf = []
         for part in _split_statements(combined):
@@ -135,19 +198,53 @@ def repl(db: Database) -> None:
                 continue
             try:
                 result = execute(parse(part), db)
-                print(_format_rows(result.rows, result.columns)
-                      if isinstance(result, RowResult) else result)
+                _print_result(result, fancy=_tty)
             except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
                 print(f"Error: {e}")
 
 
+def _strip_comments(sql: str) -> str:
+    """Remove -- line comments from SQL text."""
+    lines = []
+    for line in sql.splitlines():
+        idx = line.find("--")
+        lines.append(line[:idx] if idx != -1 else line)
+    return "\n".join(lines)
+
+
+def run_sql_file(db: Database, path: str) -> None:
+    """Execute every statement in a .sql file and print SELECT results."""
+    try:
+        sql = Path(path).read_text(encoding="utf-8")
+    except OSError as e:
+        print(f"Error reading '{path}': {e}", file=sys.stderr)
+        sys.exit(1)
+    sql = _strip_comments(sql)
+    for part in _split_statements(sql):
+        part = part.strip()
+        if not part:
+            continue
+        try:
+            result = execute(parse(part), db)
+            if isinstance(result, RowResult) and result.rows:
+                print(_format_rows(result.rows, result.columns))
+        except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+
 def main() -> None:
     if len(sys.argv) < 2:
-        print("Usage: python -m hyperion <database_file>")
+        print("Usage: python -m hyperion <database_file> [script.sql]")
         sys.exit(1)
     db = Database(sys.argv[1])
     try:
-        repl(db)
+        if len(sys.argv) >= 3:
+            run_sql_file(db, sys.argv[2])
+            if db.in_transaction:
+                db.commit()
+        else:
+            repl(db)
     finally:
         db.close()
 

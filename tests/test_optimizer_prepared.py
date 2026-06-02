@@ -209,3 +209,74 @@ def test_plan_cache_multiple_where_params():
                    [(i, i*2, i*3) for i in range(10)])
     rows = db.execute("SELECT z FROM t WHERE x = ? AND y = ?", (4, 8)).fetchall()
     assert rows[0]["z"] == 12
+
+
+# ── LRU eviction correctness ──────────────────────────────────────────────────
+
+def test_plan_cache_lru_evicts_least_recently_used():
+    """When the 512-entry cache is full, the LRU entry is evicted, not the
+    oldest-inserted one.  A hot entry used just before the cache fills must
+    survive eviction while cold entries are discarded.
+    """
+    from collections import OrderedDict
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+
+    # Fill the cache with 511 distinct queries so the next insert makes it full
+    for i in range(511):
+        db.execute(f"SELECT {i}")   # SELECT without FROM, each is unique
+
+    # Access the very first query again to make it the most-recently-used entry
+    hot_sql = "SELECT 0"
+    assert hot_sql in db._plan_cache
+    db.execute(hot_sql)   # promotes to MRU
+
+    # Insert one more unique query to trigger eviction (cache size now 513 → trim to 512)
+    evicting_sql = "SELECT 9999"
+    db.execute(evicting_sql)
+
+    # The hot entry must still be in the cache (it was MRU)
+    assert hot_sql in db._plan_cache, (
+        "LRU eviction removed the most-recently-used entry instead of the LRU one"
+    )
+    # The evicting query must be in the cache
+    assert evicting_sql in db._plan_cache
+
+    # Total size must not exceed 512
+    assert len(db._plan_cache) <= 512
+
+
+def test_plan_cache_lru_evicts_cold_not_hot_across_513_templates():
+    """With 513+ distinct templates, repeatedly-used queries stay cached while
+    single-use queries are evicted.  This mirrors the AI/LLM workload where
+    a small set of structural queries are issued many times alongside many
+    unique ad-hoc queries.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+    for i in range(20):
+        db.execute("INSERT INTO t VALUES (?, ?)", (i, f"v{i}"))
+
+    hot_queries = [
+        "SELECT COUNT(*) AS n FROM t",
+        "SELECT id FROM t ORDER BY id LIMIT 1",
+        "SELECT val FROM t WHERE id = ?",
+    ]
+
+    # Issue all hot queries once to seed the cache
+    for q in hot_queries:
+        db.execute(q, (0,) if "?" in q else ())
+
+    # Fill the rest of the cache with cold unique queries, re-issuing hot queries
+    # periodically to keep them near the MRU end
+    for i in range(600):
+        db.execute(f"SELECT {i} AS n")   # unique cold query
+        if i % 50 == 0:
+            for q in hot_queries:
+                db.execute(q, (i % 20,) if "?" in q else ())
+
+    assert len(db._plan_cache) <= 512, "Cache must not exceed 512 entries"
+    for q in hot_queries:
+        assert q in db._plan_cache, (
+            f"Hot query evicted from cache: {q!r}"
+        )

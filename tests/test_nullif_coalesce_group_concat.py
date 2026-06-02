@@ -19,7 +19,7 @@ def db_run(commands, db_path):
     )
     lines = []
     for line in result.stdout.splitlines():
-        stripped = line.removeprefix("H > ").strip()
+        stripped = line.removeprefix("hyperion> ").strip()
         if stripped and stripped != "...":
             lines.append(stripped)
     return result.returncode, lines

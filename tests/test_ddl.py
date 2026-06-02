@@ -21,7 +21,7 @@ def db_run(commands, db_path):
     # strip the "H > " prompts and blank lines, return meaningful output lines
     lines = []
     for line in result.stdout.splitlines():
-        stripped = line.removeprefix("H > ").strip()
+        stripped = line.removeprefix("hyperion> ").strip()
         if stripped:
             lines.append(stripped)
     return result.returncode, lines
