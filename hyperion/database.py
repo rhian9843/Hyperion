@@ -132,6 +132,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
         self._plan_cache: OrderedDict[str, dict] = OrderedDict()  # LRU: SQL → AST
+        self._plan_cache_lock = threading.Lock()  # guards all _plan_cache mutations
         # Schema bytes cache: skip page writes when structure hasn't changed.
         self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
         # Ops snapshot: detect which tables/indexes changed since last flush so

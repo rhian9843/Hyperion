@@ -493,4 +493,97 @@ def test_sequential_explicit_transactions_all_commit(tmp_path):
     assert total == n_threads * rows_each, (
         f"Expected {n_threads * rows_each} rows, got {total}"
     )
+
+
+# ── Plan cache concurrent mutation ────────────────────────────────────────────
+
+def test_plan_cache_concurrent_reads_no_corruption():
+    """20 threads rotating over 30 distinct SELECT templates for 2 seconds.
+
+    Detects the OrderedDict.move_to_end() race: without _plan_cache_lock,
+    concurrent check-then-act sequences corrupt the LRU doubly-linked list,
+    causing KeyError, RuntimeError, or silently wrong query results.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+    for i in range(100):
+        db.execute("INSERT INTO t VALUES (?, ?)", (i, i * 10))
+
+    # 30 distinct query templates — enough to keep LRU eviction active if
+    # the cache size were small; with 512 slots eviction won't fire here, but
+    # move_to_end() races are exercised on every cache hit.
+    templates = [f"SELECT val FROM t WHERE id = {i}" for i in range(30)]
+
+    errors: list = []
+    stop_event = threading.Event()
+
+    def worker():
+        idx = 0
+        while not stop_event.is_set():
+            sql = templates[idx % len(templates)]
+            idx += 1
+            try:
+                row = db.execute(sql).fetchone()
+                expected_id = int(sql.split("= ")[1])
+                if row is None or row["val"] != expected_id * 10:
+                    errors.append(
+                        f"Wrong result for '{sql}': got {row!r}, "
+                        f"expected val={expected_id * 10}"
+                    )
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker) for _ in range(20)]
+    for t in threads:
+        t.start()
+
+    time.sleep(2.0)
+    stop_event.set()
+
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not errors, f"Plan cache race detected ({len(errors)} errors):\n" + "\n".join(errors[:10])
+
+
+def test_plan_cache_eviction_under_concurrency():
+    """Cache eviction (popitem) races with concurrent inserts and move_to_end.
+
+    Uses > 512 distinct queries to force evictions while other threads are
+    hitting cached entries.  Without the lock, popitem + move_to_end on the
+    same OrderedDict from different threads corrupts the linked list.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)")
+    for i in range(600):
+        db.execute("INSERT INTO t VALUES (?)", (i,))
+
+    # 600 templates: more than the 512-slot cache, so eviction fires
+    templates = [f"SELECT id FROM t WHERE id = {i}" for i in range(600)]
+    errors: list = []
+    stop_event = threading.Event()
+
+    def worker():
+        import random
+        rng = random.Random()
+        while not stop_event.is_set():
+            sql = rng.choice(templates)
+            try:
+                db.execute(sql).fetchone()
+            except Exception as exc:
+                errors.append(f"{type(exc).__name__}: {exc}")
+
+    threads = [threading.Thread(target=worker) for _ in range(10)]
+    for t in threads:
+        t.start()
+
+    time.sleep(1.5)
+    stop_event.set()
+
+    for t in threads:
+        t.join(timeout=5)
+
+    assert not errors, (
+        f"Plan cache eviction race ({len(errors)} errors):\n" + "\n".join(errors[:10])
+    )
     db.close()

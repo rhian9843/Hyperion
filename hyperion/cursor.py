@@ -271,19 +271,23 @@ class Cursor:
 
     def execute(self, sql: str, params=None, timeout_ms: int | None = None,
                max_rows: int | None = None) -> "Cursor":
-        # Parse and bind BEFORE acquiring any lock.  _plan_cache access is
-        # safe under the GIL: worst case two threads both parse the same SQL,
-        # and the final dict value is the same either way (benign race).
+        # Parse and bind BEFORE acquiring any lock so concurrent SELECTs can
+        # overlap in the execution phase.  _plan_cache_lock serialises all cache
+        # mutations (insert, move_to_end, popitem, and the final dict read) so
+        # the check-then-act sequence is atomic and LRU ordering is maintained
+        # correctly under concurrent access.
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)  # LRU: evict least-recently-used entry
-        else:
-            cache.move_to_end(sql)         # LRU: promote to most-recently-used
-        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)  # evict least-recently-used
+            else:
+                cache.move_to_end(sql)         # promote to most-recently-used
+            stmt_ast = cache[sql]
+        stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         op   = stmt.get("op", "")
 
         lock = (self._db._lock.read()
@@ -299,13 +303,15 @@ class Cursor:
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)
-        else:
-            cache.move_to_end(sql)
-        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)
+            else:
+                cache.move_to_end(sql)
+            stmt_ast = cache[sql]
+        stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         return self._execute_stmt(stmt, stmt.get("op", ""), timeout_ms, max_rows)
 
     def _execute_stmt(self, stmt: dict, op: str,
@@ -367,13 +373,14 @@ class Cursor:
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)
-        else:
-            cache.move_to_end(sql)
-        stmt_template = cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)
+            else:
+                cache.move_to_end(sql)
+            stmt_template = cache[sql]
         op = stmt_template.get("op", "")
 
         with self._db._lock.write():
