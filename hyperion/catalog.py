@@ -67,6 +67,10 @@ class Catalog:
                                         compare=False)
     _ops_global_snippet: str    = field(default="",           repr=False,
                                         compare=False)
+    # Stats are written to the ops blob (not the schema blob) so ANALYZE does
+    # not trigger a schema page rewrite on every subsequent commit.
+    _stats_dirty:   bool = field(default=True, repr=False, compare=False)
+    _stats_snippet: str  = field(default="{}",  repr=False, compare=False)
 
     CATALOG_PAGE = 0
 
@@ -79,14 +83,18 @@ class Catalog:
     def mark_global_ops_dirty(self) -> None:
         self._ops_global_dirty = True
 
+    def mark_stats_dirty(self) -> None:
+        self._stats_dirty = True
+
     # ── Serialisation ─────────────────────────────────────────────────────────
 
     def schema_to_bytes(self) -> bytes:
-        """Structural-only JSON: table/index definitions, views, triggers, stats.
+        """Structural-only JSON: table/index definitions, views, triggers, meta.
 
-        This blob changes only on DDL (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER,
-        ANALYZE) and is therefore written to disk only when those operations
-        occur — typically a tiny fraction of all commits.
+        This blob changes only on DDL (CREATE/DROP TABLE/INDEX/VIEW/TRIGGER)
+        and is therefore written to disk only when those operations occur —
+        typically a tiny fraction of all commits.  ANALYZE stats are stored in
+        the ops blob instead so they do not cause schema page rewrites.
         """
         return json.dumps({
             "tables": {
@@ -99,7 +107,6 @@ class Catalog:
                 for n, m in self.indexes.items()
             },
             "views":    self.views,
-            "stats":    self.stats,
             "triggers": {
                 n: {"table": m.table, "timing": m.timing, "event": m.event,
                     "update_cols": m.update_cols, "when_tokens": m.when_tokens,
@@ -149,10 +156,16 @@ class Catalog:
             )
             self._ops_global_dirty = False
 
+        # Re-encode stats only when ANALYZE has run since the last flush
+        if self._stats_dirty:
+            self._stats_snippet = json.dumps(self.stats)
+            self._stats_dirty = False
+
         table_part = ",".join(self._t_snippets.values())
         index_part = ",".join(self._i_snippets.values())
         return (
             f'{{{self._ops_global_snippet},'
+            f'"stats":{self._stats_snippet},'
             f'"table_ops":{{{table_part}}},'
             f'"index_ops":{{{index_part}}}}}'
         ).encode()
@@ -229,16 +242,24 @@ class Catalog:
             for n, t in d_s.get("triggers", {}).items()
         }
 
-        return cls(
+        # Stats live in the ops blob (new format).  Fall back to the schema blob
+        # for databases written by older versions that stored stats in the schema.
+        stats = d_o.get("stats") or d_s.get("stats", {})
+        cat = cls(
             tables=tables,
             indexes=indexes,
             views=d_s.get("views", {}),
             next_free_page=d_o.get("next_free_page", 1),
             free_pages=d_o.get("free_pages", []),
-            stats=d_s.get("stats", {}),
+            stats=stats,
             triggers=triggers,
             meta=d_s.get("meta", {}),
         )
+        # Initialise snippet cache and mark stats clean so the first ops flush
+        # doesn't re-serialise unchanged stats.
+        cat._stats_snippet = json.dumps(stats)
+        cat._stats_dirty = False
+        return cat
 
     @classmethod
     def from_bytes(cls, data: bytes) -> "Catalog":

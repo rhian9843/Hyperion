@@ -1125,6 +1125,7 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
             "row_count": row_count,
             "columns": {c: {"ndv": len(distinct[c])} for c in col_names},
         }
+        db._catalog.mark_stats_dirty()
 
         # Refresh session row-count cache
         if hasattr(db, "_opt_row_counts"):

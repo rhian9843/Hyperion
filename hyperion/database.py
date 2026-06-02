@@ -896,6 +896,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for trig_name, trig_meta in list(self._catalog.triggers.items()):
             new_db.create_trigger(trig_name, trig_meta)
         new_db._catalog.stats = copy.deepcopy(self._catalog.stats)
+        new_db._catalog.mark_stats_dirty()
         new_db._catalog.meta  = copy.deepcopy(self._catalog.meta)
         new_db.commit()
         new_db._pager.close()
