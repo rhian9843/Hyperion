@@ -6,6 +6,10 @@ from .schema import Column, ForeignKey, Schema
 from .where import WhereClause
 
 
+# Characters that end a non-quoted, non-special token in _tokenize (steps 5 & 9).
+# Mirrors the complement of _TOKEN_RE's [^\s(),;*=<>!]+ catchall rule.
+_TOK_STOP = frozenset(" \t\n\r(),;*=<>!'\"` ")
+
 _TOKEN_RE = re.compile(
     r"'(?:[^']|'')*'"          # single-quoted strings
     r'|"[^"]*"'                # double-quoted identifiers
@@ -77,14 +81,143 @@ def _parse_agg(col: str) -> tuple[str, str] | None:
 
 
 def _tokenize(sql: str) -> list[str]:
-    tokens = []
-    for t in _TOKEN_RE.findall(sql):
-        if t.startswith('"') and t.endswith('"'):
-            tokens.append(t[1:-1])   # double-quoted identifiers: strip quotes
-        elif t.startswith('`') and t.endswith('`'):
-            tokens.append(t[1:-1])   # backtick-quoted identifiers: strip quotes
-        else:
-            tokens.append(t)         # keep single-quoted strings as-is for expression building
+    """Hand-written lexer that produces the same token stream as _TOKEN_RE for
+    flat function calls, and additionally collapses nested function calls like
+    ROUND(SUM(col), 2) or json_each(json_extract(t.col, '$.k')) into a single
+    token.  This eliminates the entire class of bugs caused by _TOKEN_RE's
+    [^()]* pattern stopping at the first nested parenthesis.
+
+    Rules (processed left-to-right, first match wins):
+      1. Whitespace            — skip
+      2. 'single-quoted str'   — emit as-is (handles '' escapes)
+      3. "double-quoted ident" — emit without quotes
+      4. `backtick ident`      — emit without quotes
+      5. word_chars(...)       — depth-track and emit as a single function token
+      6. ( ) , ; *             — emit as single-char tokens
+      7. !=  <>  <=  >=        — emit as two-char operator tokens
+      8. =  <  >  !            — emit as single-char operator tokens
+      9. everything else       — collect non-whitespace/non-special run
+    """
+    tokens: list[str] = []
+    i = 0
+    n = len(sql)
+
+    while i < n:
+        c = sql[i]
+
+        # 1. Whitespace
+        if c in ' \t\n\r':
+            i += 1
+            continue
+
+        # 2. Single-quoted string (handles '' escape sequences)
+        if c == "'":
+            j = i + 1
+            while j < n:
+                if sql[j] == "'":
+                    if j + 1 < n and sql[j + 1] == "'":
+                        j += 2          # escaped quote — keep going
+                    else:
+                        j += 1          # closing quote
+                        break
+                else:
+                    j += 1
+            tokens.append(sql[i:j])
+            i = j
+            continue
+
+        # 3. Double-quoted identifier — strip outer quotes
+        if c == '"':
+            j = i + 1
+            while j < n and sql[j] != '"':
+                j += 1
+            tokens.append(sql[i + 1:j])
+            i = j + 1
+            continue
+
+        # 4. Backtick-quoted identifier — strip outer quotes
+        if c == '`':
+            j = i + 1
+            while j < n and sql[j] != '`':
+                j += 1
+            tokens.append(sql[i + 1:j])
+            i = j + 1
+            continue
+
+        # 5. Non-special run starting with an alnum/_  character.
+        #    Collects the same characters as _TOKEN_RE's [^\s(),;*=<>!]+ rule,
+        #    which includes %, $, -, +, etc. that can appear in SQL tokens.
+        #    After collecting the run we check if it's immediately followed by
+        #    '(' with no whitespace — if so, treat as a function call and
+        #    depth-track everything up to the matching ')'.
+        if c.isalnum() or c == '_':
+            j = i + 1
+            while j < n and sql[j] not in _TOK_STOP:
+                j += 1
+            word = sql[i:j]
+            i = j
+            # If the VERY next character (no whitespace) is '(', this is a
+            # function call — collect everything up to and including the
+            # matching ')' using depth tracking.
+            if i < n and sql[i] == '(':
+                buf = [word, '(']
+                i += 1
+                depth = 1
+                while i < n and depth > 0:
+                    ch = sql[i]
+                    if ch == "'":           # string literal inside call
+                        start = i
+                        i += 1
+                        while i < n:
+                            if sql[i] == "'":
+                                if i + 1 < n and sql[i + 1] == "'":
+                                    i += 2
+                                else:
+                                    i += 1
+                                    break
+                            else:
+                                i += 1
+                        buf.append(sql[start:i])
+                    elif ch == '(':
+                        depth += 1
+                        buf.append(ch); i += 1
+                    elif ch == ')':
+                        depth -= 1
+                        buf.append(ch); i += 1
+                    else:
+                        buf.append(ch); i += 1
+                tokens.append(''.join(buf))
+            else:
+                tokens.append(word)
+            continue
+
+        # 6. Single-char punctuation
+        if c in '(),;*':
+            tokens.append(c)
+            i += 1
+            continue
+
+        # 7. Two-char operators (check longest match first)
+        if c in '!=<>' and i + 1 < n:
+            two = sql[i:i + 2]
+            if two in ('!=', '<>', '<=', '>='):
+                tokens.append(two)
+                i += 2
+                continue
+
+        # 8. Single-char operators
+        if c in '=<>!':
+            tokens.append(c)
+            i += 1
+            continue
+
+        # 9. Everything else: collect a run of non-whitespace/non-special chars
+        j = i + 1
+        while j < n and sql[j] not in _TOK_STOP:
+            j += 1
+        tokens.append(sql[i:j])
+        i = j
+
     return tokens
 
 
@@ -897,10 +1030,23 @@ def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
     i += 1
     if i >= len(t):
         raise ParseError("Expected table name after ON in CREATE INDEX")
-    m = re.fullmatch(r"(\w+)\(([^)]+)\)", t[i])
+    m = re.fullmatch(r"(\w+)\((.+)\)", t[i], re.DOTALL)
     if m:
         table = m.group(1)
-        cols  = [c.strip() for c in m.group(2).split(",")]
+        # Split on commas that are NOT inside parentheses (handles expression cols)
+        raw = m.group(2)
+        cols = []
+        depth2 = 0
+        start2 = 0
+        for ci, ch in enumerate(raw):
+            if ch == '(':
+                depth2 += 1
+            elif ch == ')':
+                depth2 -= 1
+            elif ch == ',' and depth2 == 0:
+                cols.append(raw[start2:ci].strip())
+                start2 = ci + 1
+        cols.append(raw[start2:].strip())
     else:
         table = t[i]; i += 1
         if i >= len(t) or t[i] != "(":
