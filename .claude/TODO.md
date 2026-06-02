@@ -327,7 +327,7 @@
 - [x] Add test: tokenizer with deeply nested function calls — `SELECT ROUND(SUM(CAST(col AS REAL)), 2)` and `WHERE json_each(json_extract(json_extract(col, '$.a'), '$.b'))` must parse and execute without error; covers the recurring `_TOKEN_RE` nesting limitation
 - [x] Add test: overflow page chain crash simulation — insert 10 large rows (each requiring 3 overflow pages), simulate a crash after page 5 of the last row's overflow chain by truncating the WAL mid-frame; reopen and verify: (a) the partially-written row is not visible (uncommitted), (b) the 9 complete rows are intact, (c) no dangling overflow page references exist after recovery
 - [x] Add test: fuzz tokenizer with random SQL — generate 1000 random SQL strings mixing keywords, identifiers, numbers, and nested parens; verify that `parse()` either returns a valid AST or raises `ParseError`, never raises an unhandled internal exception such as `IndexError`, `KeyError`, or `AttributeError`
-- [ ] Add test: savepoint under concurrent reads — Thread A creates a savepoint, modifies data, and sleeps; Thread B reads concurrently; verify Thread B never sees Thread A's post-savepoint uncommitted modifications; complements the dirty-read test above but specifically targets the savepoint snapshot mechanism
+- [x] Add test: savepoint under concurrent reads — Thread A creates a savepoint, modifies data, and sleeps; Thread B reads concurrently; verify Thread B never sees Thread A's post-savepoint uncommitted modifications; complements the dirty-read test above but specifically targets the savepoint snapshot mechanism
 
 ### Transactions
 
