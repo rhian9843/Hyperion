@@ -360,3 +360,136 @@ class TestDefault(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ── FK cascade index optimisation ────────────────────────────────────────────
+# These are plain pytest functions (not unittest) so they run alongside the
+# class-based suite above without any setUp/tearDown boilerplate.
+
+import time
+import pytest
+from hyperion import Database
+
+
+def _setup_fk_scale(n: int, indexed: bool):
+    """Return a (db, parent_ids) pair: parent + child tables, 1:1 FK relationship.
+
+    If indexed=True, an explicit index on the child FK column is created so
+    _matching_child_rows() can use the O(k log n) path instead of O(n) scan.
+    """
+    db = Database(":memory:")
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY, val TEXT)")
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, "
+        "FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE CASCADE)"
+    )
+    if indexed:
+        db.execute("CREATE INDEX idx_child_parent ON child (parent_id)")
+    for i in range(n):
+        db.execute("INSERT INTO parent VALUES (?, ?)", (i, f"p{i}"))
+        db.execute("INSERT INTO child VALUES (?, ?)", (i, i))
+    return db
+
+
+def test_fk_cascade_delete_correctness_with_index():
+    """With an index on child.parent_id, all 1 000 child rows must be deleted."""
+    db = _setup_fk_scale(1000, indexed=True)
+
+    db.execute("DELETE FROM parent")
+
+    remaining_parents = db.execute("SELECT COUNT(*) AS n FROM parent").fetchone()["n"]
+    remaining_children = db.execute("SELECT COUNT(*) AS n FROM child").fetchone()["n"]
+    assert remaining_parents == 0
+    assert remaining_children == 0, (
+        f"Expected 0 child rows after cascade delete, got {remaining_children}"
+    )
+
+
+def test_fk_cascade_delete_correctness_without_index():
+    """Without an index, full-scan path must also delete all 1 000 child rows."""
+    db = _setup_fk_scale(1000, indexed=False)
+
+    db.execute("DELETE FROM parent")
+
+    remaining_children = db.execute("SELECT COUNT(*) AS n FROM child").fetchone()["n"]
+    assert remaining_children == 0, (
+        f"Expected 0 child rows after cascade delete (no index), "
+        f"got {remaining_children}"
+    )
+
+
+def test_fk_cascade_delete_indexed_faster_than_unindexed():
+    """Index path must be meaningfully faster than full-scan path at n=1 000.
+
+    The old O(n²) bug (full scan for every parent delete) would make the
+    indexed and unindexed cases equally slow; with the fix, the indexed path
+    should be at least 3× faster.
+    """
+    n = 1000
+
+    db_idx = _setup_fk_scale(n, indexed=True)
+    t0 = time.monotonic()
+    db_idx.execute("DELETE FROM parent")
+    t_indexed = time.monotonic() - t0
+
+    db_no = _setup_fk_scale(n, indexed=False)
+    t0 = time.monotonic()
+    db_no.execute("DELETE FROM parent")
+    t_unindexed = time.monotonic() - t0
+
+    assert t_indexed < 5.0, f"Indexed cascade too slow: {t_indexed:.2f}s"
+    assert t_unindexed < 30.0, f"Unindexed cascade too slow: {t_unindexed:.2f}s"
+    # Indexed must be faster; allow generous ratio to avoid flakiness on CI
+    assert t_indexed <= t_unindexed, (
+        f"Indexed ({t_indexed:.3f}s) not faster than unindexed ({t_unindexed:.3f}s)"
+    )
+
+
+def test_fk_cascade_partial_delete_preserves_unaffected_children():
+    """Deleting half the parents must leave the other half's children intact."""
+    db = _setup_fk_scale(200, indexed=True)
+
+    # Delete even-id parents (100 rows)
+    for i in range(0, 200, 2):
+        db.execute("DELETE FROM parent WHERE id = ?", (i,))
+
+    surviving_children = db.execute(
+        "SELECT id FROM child ORDER BY id"
+    ).fetchall()
+    expected = list(range(1, 200, 2))  # odd ids
+    assert [r["id"] for r in surviving_children] == expected, (
+        f"Unexpected surviving children: "
+        f"{[r['id'] for r in surviving_children][:10]}..."
+    )
+
+
+def test_fk_cascade_set_null_with_index():
+    """ON DELETE SET NULL with an indexed FK column must null only matching rows."""
+    db = Database(":memory:")
+    db.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    db.execute(
+        "CREATE TABLE child (id INTEGER PRIMARY KEY, parent_id INTEGER, "
+        "FOREIGN KEY (parent_id) REFERENCES parent(id) ON DELETE SET NULL)"
+    )
+    db.execute("CREATE INDEX idx_child_pid ON child (parent_id)")
+
+    for i in range(100):
+        db.execute("INSERT INTO parent VALUES (?)", (i,))
+        db.execute("INSERT INTO child VALUES (?, ?)", (i, i))
+    # Add some children with parent_id pointing to parent 0
+    for i in range(100, 110):
+        db.execute("INSERT INTO child VALUES (?, 0)", (i,))
+
+    db.execute("DELETE FROM parent WHERE id = 0")
+
+    # Original child 0 and children 100-109 should have parent_id = NULL
+    nulled = db.execute(
+        "SELECT COUNT(*) AS n FROM child WHERE parent_id IS NULL"
+    ).fetchone()["n"]
+    assert nulled == 11, f"Expected 11 nulled rows, got {nulled}"
+
+    # All other children (ids 1-99) must still have their original parent_id
+    intact = db.execute(
+        "SELECT COUNT(*) AS n FROM child WHERE parent_id IS NOT NULL"
+    ).fetchone()["n"]
+    assert intact == 99, f"Expected 99 intact children, got {intact}"

@@ -265,6 +265,57 @@ class ConstraintsMixin:
                     f"→ {fk.ref_table}({', '.join(fk.ref_columns)})"
                 )
 
+    def _matching_child_rows(self, tmeta, fk,
+                             ref_vals: list) -> list[tuple[int, dict]]:
+        """Return (rowid, row) pairs from the child table whose FK columns equal ref_vals.
+
+        Uses a btree index on fk.columns when one exists (O(k log n) where k
+        is the number of matches), falling back to a full table scan only when
+        no suitable index is present.
+        """
+        child_schema = tmeta.schema
+        tname = child_schema.name
+
+        # Find an index whose column list exactly matches fk.columns
+        idx_meta = None
+        for m in self._catalog.indexes.values():
+            if m.table_name == tname and m.columns == list(fk.columns):
+                idx_meta = m
+                break
+
+        if idx_meta is not None:
+            col_types = []
+            for col_name in fk.columns:
+                col_obj = next((c for c in child_schema.columns
+                                if c.name == col_name), None)
+                col_types.append(col_obj.type if col_obj else "TEXT")
+            try:
+                val_key = _encode_composite_key(ref_vals, col_types)
+            except (ValueError, TypeError):
+                pass  # fall through to full scan
+            else:
+                lo = _make_index_key(val_key, 0)
+                hi = _make_index_key(val_key, 0xFFFFFFFFFFFFFFFF)
+                matching: list[tuple[int, dict]] = []
+                child_btree = self._table_btree(tmeta)
+                for _, rowid_raw in self._index_btree(idx_meta).scan_range(lo, hi):
+                    rowid = struct.unpack("q", rowid_raw)[0]
+                    raw = child_btree.lookup(rowid)
+                    if raw is not None:
+                        child_row = deserialize_row(
+                            child_schema, self._unpack_row_cell(raw))
+                        matching.append((rowid, child_row))
+                return matching
+
+        # Full scan fallback (no index on FK columns)
+        matching = []
+        for rowid, raw in self._table_btree(tmeta).scan():
+            child_row = deserialize_row(child_schema, self._unpack_row_cell(raw))
+            if all(child_row.get(cc) == rv
+                   for cc, rv in zip(fk.columns, ref_vals)):
+                matching.append((rowid, child_row))
+        return matching
+
     def _check_fk_parent(self, table: str, old_row: dict[str, Any],
                           is_delete: bool = False,
                           new_row: dict[str, Any] | None = None) -> None:
@@ -283,12 +334,7 @@ class ConstraintsMixin:
                 if any(v is None for v in ref_vals):
                     continue
                 child_schema = tmeta.schema
-                matching: list[tuple[int, dict]] = []
-                for rowid, raw in self._table_btree(tmeta).scan():
-                    child_row = deserialize_row(child_schema, self._unpack_row_cell(raw))
-                    if all(child_row.get(cc) == rv
-                           for cc, rv in zip(fk.columns, ref_vals)):
-                        matching.append((rowid, child_row))
+                matching = self._matching_child_rows(tmeta, fk, ref_vals)
                 if not matching:
                     continue
                 action = fk.on_delete if is_delete else fk.on_update
