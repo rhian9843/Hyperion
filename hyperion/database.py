@@ -221,12 +221,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             pages_snap = {n: bytes(self._pager._working[n])
                           for n in self._pager._dirty if n in self._pager._working}
             dirty_snap  = set(self._pager._dirty)
-            cat_bytes   = self._catalog.to_bytes()
+            cat_snap    = self._catalog.snap()
             cat_extra   = list(self._catalog_extra)
             ops_pn      = self._catalog_ops_pn
             ops_extra   = list(self._catalog_ops_extra)
             self._savepoints.append(
-                (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
+                (name, pages_snap, dirty_snap, cat_snap, cat_extra, ops_pn, ops_extra))
 
     def release_savepoint(self, name: str) -> None:
         with self._lock.write():
@@ -236,7 +236,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def rollback_to_savepoint(self, name: str) -> None:
         with self._lock.write():
             idx = self._find_savepoint(name)
-            _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
+            _, pages_snap, dirty_snap, cat_snap, cat_extra, ops_pn, ops_extra = \
                 self._savepoints[idx]
             del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
             # Evict pages added after the savepoint
@@ -247,7 +247,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 self._pager._working[pn] = bytearray(content)
             self._pager._dirty = set(dirty_snap)
             # Restore catalog and page-chain metadata
-            self._catalog           = Catalog.from_bytes(cat_bytes)
+            self._catalog.restore_snap(cat_snap)
             self._catalog_extra     = list(cat_extra)
             self._catalog_ops_pn    = ops_pn
             self._catalog_ops_extra = list(ops_extra)

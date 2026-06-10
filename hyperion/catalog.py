@@ -1,3 +1,4 @@
+import base64
 import json
 import struct
 from dataclasses import dataclass, field
@@ -150,9 +151,12 @@ class Catalog:
 
         # Re-encode global state only when next_free_page / free_pages changed
         if self._ops_global_dirty:
+            fp_bin = (struct.pack(f'>{len(self.free_pages)}I', *self.free_pages)
+                      if self.free_pages else b'')
+            fp_b64 = base64.b64encode(fp_bin).decode()
             self._ops_global_snippet = (
                 f'"next_free_page":{self.next_free_page},'
-                f'"free_pages":{json.dumps(self.free_pages)}'
+                f'"free_pages_b64":"{fp_b64}"'
             )
             self._ops_global_dirty = False
 
@@ -170,10 +174,52 @@ class Catalog:
             f'"index_ops":{{{index_part}}}}}'
         ).encode()
 
-    # ── Combined format (used by savepoints and backward-compat load) ─────────
+    # ── Savepoint snapshots (lightweight, no JSON) ────────────────────────────
+
+    def snap(self) -> dict:
+        """Cheap in-memory snapshot for savepoints — avoids JSON serialization.
+
+        Shallow-copies each TableMeta/IndexMeta so mutable operational fields
+        (root_page, next_page, next_key) are captured at this instant.  Schema
+        objects inside TableMeta are shared by reference; they are effectively
+        immutable (DDL always creates new Schema/TableMeta rather than mutating
+        the existing one), so sharing is safe.
+        """
+        return {
+            "nfp":  self.next_free_page,
+            "fp":   list(self.free_pages),
+            "tbls": {n: TableMeta(m.schema, m.root_page, m.next_page,
+                                  m.next_key, m.temporary)
+                     for n, m in self.tables.items()},
+            "idxs": {n: IndexMeta(m.table_name, list(m.columns),
+                                  m.root_page, m.next_page, m.unique)
+                     for n, m in self.indexes.items()},
+            "vws":  dict(self.views),
+            "trgs": dict(self.triggers),
+            "meta": {k: dict(v) for k, v in self.meta.items()},
+        }
+
+    def restore_snap(self, snap: dict) -> None:
+        """Restore this catalog in-place to a previously taken snap()."""
+        self.next_free_page = snap["nfp"]
+        self.free_pages     = snap["fp"]
+        self.tables.clear();   self.tables.update(snap["tbls"])
+        self.indexes.clear();  self.indexes.update(snap["idxs"])
+        self.views.clear();    self.views.update(snap["vws"])
+        self.triggers.clear(); self.triggers.update(snap["trgs"])
+        self.meta.clear();     self.meta.update(snap["meta"])
+        # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
+        self._t_snippets.clear()
+        self._i_snippets.clear()
+        self._ops_dirty_tables.clear()
+        self._ops_dirty_indexes.clear()
+        self._ops_global_dirty = True
+        self._stats_dirty      = True
+
+    # ── Combined format (backward-compat load only) ────────────────────────────
 
     def to_bytes(self) -> bytes:
-        """Combined JSON — used only for in-memory savepoint snapshots."""
+        """Combined JSON — retained for backward-compat load path only."""
         return json.dumps({
             "next_free_page": self.next_free_page,
             "free_pages":     self.free_pages,
@@ -245,12 +291,22 @@ class Catalog:
         # Stats live in the ops blob (new format).  Fall back to the schema blob
         # for databases written by older versions that stored stats in the schema.
         stats = d_o.get("stats") or d_s.get("stats", {})
+
+        # Decode free-page list: new format uses compact binary (base64-encoded
+        # packed uint32s); fall back to JSON array for older databases.
+        if "free_pages_b64" in d_o:
+            fp_bin = base64.b64decode(d_o["free_pages_b64"])
+            n_fp   = len(fp_bin) // 4
+            free_pages = list(struct.unpack(f'>{n_fp}I', fp_bin)) if n_fp else []
+        else:
+            free_pages = d_o.get("free_pages", [])
+
         cat = cls(
             tables=tables,
             indexes=indexes,
             views=d_s.get("views", {}),
             next_free_page=d_o.get("next_free_page", 1),
-            free_pages=d_o.get("free_pages", []),
+            free_pages=free_pages,
             stats=stats,
             triggers=triggers,
             meta=d_s.get("meta", {}),
