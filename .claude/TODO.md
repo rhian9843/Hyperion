@@ -366,7 +366,7 @@
 
 #### Correctness — Query Results
 
-- [ ] Fix `ORDER BY` on `json_each` object keys not sorting alphabetically — `SELECT … FROM json_each('{"name":"Alice","age":30,"active":true}') AS j ORDER BY j.key` returns rows in JSON insertion order (`name, age, active`) instead of alphabetical string order (`active, age, name`); integer array keys (0, 1, 2) sort correctly; only string object keys are affected; root cause is likely that `json_each` stores the row-source index as an integer internally and `ORDER BY j.key` sorts on that integer rather than the string key value; fix by ensuring `json_each` exposes string keys as TEXT so the sort comparison uses lexicographic ordering
+- [x] Fix `ORDER BY` on `json_each` object keys not sorting alphabetically — `SELECT … FROM json_each('{"name":"Alice","age":30,"active":true}') AS j ORDER BY j.key` returns rows in JSON insertion order (`name, age, active`) instead of alphabetical string order (`active, age, name`); integer array keys (0, 1, 2) sort correctly; only string object keys are affected; root cause is likely that `json_each` stores the row-source index as an integer internally and `ORDER BY j.key` sorts on that integer rather than the string key value; fix by ensuring `json_each` exposes string keys as TEXT so the sort comparison uses lexicographic ordering
 
 #### Cosmetic / SQLite Compatibility
 

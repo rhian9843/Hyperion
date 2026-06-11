@@ -133,10 +133,17 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
         from .expr import eval_expr, is_expr
 
         def _key_val(row: dict, col: str):
-            v = row.get(col)
-            if v is None and col not in row and is_expr(col):
-                v = eval_expr(col, row)
-            return v
+            if col in row:
+                return row[col]
+            # alias.col pattern: try the bare column name (json_each rows use
+            # bare keys; the alias prefix is added later by _project_row)
+            if "." in col:
+                bare = col.split(".", 1)[1]
+                if bare in row:
+                    return row[bare]
+            if is_expr(col):
+                return eval_expr(col, row)
+            return None
 
         def _collate_key(v, collation: str | None):
             if v is None:
