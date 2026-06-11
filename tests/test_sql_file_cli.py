@@ -87,17 +87,21 @@ def test_comments_only_file(sql_file):
 
 # ── Error handling ────────────────────────────────────────────────────────────
 
-def test_syntax_error_exits_nonzero(sql_file):
-    path = sql_file("SELECT FROM;")
+def test_syntax_error_prints_to_stderr_and_continues(sql_file):
+    """Per-statement errors print to stderr but do not abort the script."""
+    path = sql_file("SELECT FROM; SELECT 1 AS v;")
     r = _run(":memory:", path)
-    assert r.returncode == 1
+    assert r.returncode == 0
+    assert r.stderr.strip() != ""   # error message printed
+    assert "1" in r.stdout           # subsequent statement still ran
+
+
+def test_missing_table_prints_error_continues(sql_file):
+    """SELECT from a missing table prints an error; script continues."""
+    path = sql_file("SELECT * FROM nonexistent_table; SELECT 42 AS v;")
+    r = _run(":memory:", path)
+    assert r.returncode == 0
     assert r.stderr.strip() != ""
-
-
-def test_missing_table_exits_nonzero(sql_file):
-    path = sql_file("SELECT * FROM nonexistent_table;")
-    r = _run(":memory:", path)
-    assert r.returncode == 1
 
 
 def test_file_not_found_exits_nonzero():
@@ -106,14 +110,16 @@ def test_file_not_found_exits_nonzero():
     assert "Error" in r.stderr
 
 
-def test_error_stops_execution(sql_file):
+def test_error_continues_execution(sql_file):
+    """SQLite compat: errors print and script continues; all statements run."""
     path = sql_file("""
         CREATE TABLE t (id INTEGER);
         SELECT * FROM nonexistent;
         INSERT INTO t VALUES (1);
     """)
     r = _run(":memory:", path)
-    assert r.returncode == 1
+    assert r.returncode == 0
+    assert r.stderr.strip() != ""   # the SELECT error was reported
 
 
 # ── Persistence (file-backed db) ─────────────────────────────────────────────

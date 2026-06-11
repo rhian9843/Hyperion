@@ -3,10 +3,11 @@ import math
 import random
 import re
 import threading
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .errors import DataError
+from .errors import DataError, ParseError
 from .json_funcs import eval_json_func as _eval_json_func
 
 # ── Application-defined function registries ────────────────────────────────────
@@ -35,6 +36,165 @@ def get_last_insert_rowid() -> int | None:
 
 _ARITH_OPS = frozenset({"+", "-", "*", "/", "%", "||"})
 _COMP_OPS  = frozenset({"=", "!=", "<", ">", "<=", ">="})
+
+# ── Expr AST node hierarchy ────────────────────────────────────────────────────
+# Each node is built once per unique expression string and reused across all
+# rows in a scan loop, eliminating per-row tokenisation and regex overhead.
+
+
+@dataclass
+class ColumnRef:
+    """Bare or table-qualified column reference: ``col`` or ``t.col``."""
+    name: str
+
+    def evaluate(self, row: dict) -> Any:
+        if self.name in row:
+            return row[self.name]
+        if "." in self.name:
+            bare = self.name.split(".", 1)[1]
+            if bare in row:
+                return row[bare]
+        return self.name  # Hyperion: unresolved name falls back to bare string
+
+
+@dataclass
+class Literal:
+    """Constant value: int, float, str, or None (NULL)."""
+    value: Any
+
+    def evaluate(self, row: dict) -> Any:
+        return self.value
+
+
+@dataclass
+class CurrentDT:
+    """CURRENT_TIMESTAMP / CURRENT_DATE / CURRENT_TIME evaluated at call time."""
+    kind: str  # "TIMESTAMP" | "DATE" | "TIME"
+
+    def evaluate(self, row: dict) -> Any:
+        now = datetime.now()
+        if self.kind == "DATE":
+            return now.strftime("%Y-%m-%d")
+        if self.kind == "TIME":
+            return now.strftime("%H:%M:%S")
+        return now.strftime("%Y-%m-%d %H:%M:%S")
+
+
+@dataclass
+class UnaryOp:
+    """Unary + or - applied to a sub-expression."""
+    op: str
+    operand: Any  # AnyExpr
+
+    def evaluate(self, row: dict) -> Any:
+        v = self.operand.evaluate(row)
+        if v is None:
+            return None
+        return -v if self.op == "-" else v
+
+
+@dataclass
+class BinaryOp:
+    """Arithmetic, concatenation, or comparison of two sub-expressions."""
+    op: str
+    left: Any   # AnyExpr
+    right: Any  # AnyExpr
+
+    def evaluate(self, row: dict) -> Any:
+        lv = self.left.evaluate(row)
+        rv = self.right.evaluate(row)
+        op = self.op
+
+        # Comparison operators — return True/False/None (SQL NULL semantics)
+        if op in _COMP_OPS:
+            if lv is None or rv is None:
+                return None
+            if isinstance(lv, (int, float)) and not isinstance(rv, (int, float)):
+                try:
+                    rv = type(lv)(str(rv))
+                except (ValueError, TypeError):
+                    pass
+            if op == "=":  return lv == rv
+            if op == "!=": return lv != rv
+            if op == "<":  return lv < rv
+            if op == ">":  return lv > rv
+            if op == "<=": return lv <= rv
+            if op == ">=": return lv >= rv
+
+        # Arithmetic — NULL propagates
+        if lv is None or rv is None:
+            return None
+        try:
+            if op == "+":  return lv + rv
+            if op == "-":  return lv - rv
+            if op == "*":  return lv * rv
+            if op == "/":
+                if rv == 0:
+                    return None
+                return (lv / rv) if isinstance(lv, float) or isinstance(rv, float) \
+                    else (lv // rv)
+            if op == "%":  return lv % rv if rv != 0 else None
+            if op == "||": return str(lv) + str(rv)
+        except (TypeError, ValueError, OverflowError):
+            return None
+        return None
+
+
+@dataclass
+class CastExpr:
+    """CAST(expr AS type)."""
+    operand: Any  # AnyExpr
+    type_name: str
+
+    def evaluate(self, row: dict) -> Any:
+        val = self.operand.evaluate(row)
+        if val is None:
+            return None
+        typ = self.type_name.upper()
+        if typ in ("INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"):
+            try:
+                return int(float(str(val)))
+            except (ValueError, TypeError):
+                return None
+        if typ in ("REAL", "FLOAT", "DOUBLE"):
+            try:
+                return float(str(val))
+            except (ValueError, TypeError):
+                return None
+        return str(val)
+
+
+@dataclass
+class FuncCall:
+    """Scalar function call with args pre-parsed into Expr nodes at parse time.
+
+    Evaluation skips _split_args / _tokenize_expr entirely — each arg node is
+    evaluated in O(tree_depth) with no string allocation."""
+    name: str
+    args: list  # list[AnyExpr]
+
+    def evaluate(self, row: dict) -> Any:
+        if self.name == "LAST_INSERT_ROWID":
+            return getattr(_tls, "last_insert_rowid", None)
+        evaluated = [a.evaluate(row) for a in self.args]
+        return _eval_func_evaled(self.name, evaluated)
+
+
+@dataclass
+class CaseExpr:
+    """CASE WHEN cond THEN val ... [ELSE val] END."""
+    branches: list   # list of (cond_node: AnyExpr, val_node: AnyExpr)
+    else_expr: Any   # AnyExpr | None
+
+    def evaluate(self, row: dict) -> Any:
+        for cond, val in self.branches:
+            cv = cond.evaluate(row)
+            if cv is not None and bool(cv):
+                return val.evaluate(row)
+        if self.else_expr is not None:
+            return self.else_expr.evaluate(row)
+        return None
+
 
 # Detect expressions that need evaluation (not a bare column name / simple literal)
 _IS_EXPR_RE = re.compile(
@@ -195,6 +355,24 @@ def _parse_primary(toks: list[str], pos: int, row: dict) -> tuple[Any, int]:
 
 # ── Function evaluator ─────────────────────────────────────────────────────────
 
+def _split_arg_tokens(toks: list[str]) -> list[list[str]]:
+    """Split a token list on top-level commas into per-argument sub-lists."""
+    groups: list[list[str]] = [[]]
+    depth = 0
+    for t in toks:
+        if t == "(":
+            depth += 1
+            groups[-1].append(t)
+        elif t == ")":
+            depth -= 1
+            groups[-1].append(t)
+        elif t == "," and depth == 0:
+            groups.append([])
+        else:
+            groups[-1].append(t)
+    return [g for g in groups if g]
+
+
 def _split_args(args_str: str) -> list[str]:
     """Split comma-separated function arguments respecting nested parentheses and string literals."""
     result: list[str] = []
@@ -226,32 +404,12 @@ def _split_args(args_str: str) -> list[str]:
     return [a for a in result if a]
 
 
-def _eval_func(fname: str, args_str: str, row: dict) -> Any:
-    if fname == "LAST_INSERT_ROWID":
-        return getattr(_tls, "last_insert_rowid", None)
+def _eval_func_evaled(fname: str, args: list) -> Any:
+    """Dispatch a function call with pre-evaluated argument values.
 
-    if fname == "CAST":
-        m = re.match(r'(.+?)\s+AS\s+(\w+)\s*$', args_str, re.IGNORECASE)
-        if not m:
-            return eval_expr(args_str, row)
-        val = eval_expr(m.group(1).strip(), row)
-        typ = m.group(2).upper()
-        if val is None:
-            return None
-        if typ in ("INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"):
-            try:
-                return int(float(str(val)))
-            except (ValueError, TypeError):
-                return None
-        if typ in ("REAL", "FLOAT", "DOUBLE"):
-            try:
-                return float(str(val))
-            except (ValueError, TypeError):
-                return None
-        return str(val)  # TEXT / VARCHAR / anything else
-
-    args = [eval_expr(a, row) for a in _split_args(args_str)]
-
+    This is the hot path called by FuncCall.evaluate() — no string parsing,
+    no tokenisation, no eval_expr overhead per row.
+    """
     if fname == "COALESCE":
         return next((v for v in args if v is not None), None)
 
@@ -283,10 +441,10 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
 
     if fname == "SUBSTR":
         # SUBSTR(str, start[, length]) — SQL uses 1-based indexing
-        if len(args) < 2 or args[0] is None:
+        if len(args) < 2 or args[0] is None or args[1] is None:
             return None
         s     = str(args[0])
-        start = int(args[1]) if args[1] is not None else 1
+        start = int(args[1])
         # SQL SUBSTR: negative start counts from end; 0 is treated as 1
         if start == 0:
             start = 1
@@ -298,17 +456,14 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
         return s[py_start:]
 
     if fname == "REPLACE":
-        if len(args) < 3 or args[0] is None:
+        if len(args) < 3 or args[0] is None or args[1] is None or args[2] is None:
             return None
-        return str(args[0]).replace(
-            str(args[1]) if args[1] is not None else "",
-            str(args[2]) if args[2] is not None else "",
-        )
+        return str(args[0]).replace(str(args[1]), str(args[2]))
 
     if fname == "INSTR":
         # INSTR(str, sub) — returns 1-based position of first occurrence, 0 if not found
         if len(args) < 2 or args[0] is None or args[1] is None:
-            return 0
+            return None
         idx = str(args[0]).find(str(args[1]))
         return idx + 1 if idx >= 0 else 0
 
@@ -490,6 +645,37 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
     return None  # unknown function → NULL
 
 
+def _eval_func(fname: str, args_str: str, row: dict) -> Any:
+    """String-based function evaluator (used by old _parse_primary path).
+
+    Evaluates args via eval_expr (which uses the expression cache), then
+    delegates to _eval_func_evaled.
+    """
+    if fname == "LAST_INSERT_ROWID":
+        return getattr(_tls, "last_insert_rowid", None)
+    if fname == "CAST":
+        m = re.match(r'(.+?)\s+AS\s+(\w+)\s*$', args_str, re.IGNORECASE)
+        if not m:
+            return eval_expr(args_str, row)
+        val = eval_expr(m.group(1).strip(), row)
+        typ = m.group(2).upper()
+        if val is None:
+            return None
+        if typ in ("INTEGER", "INT", "BIGINT", "SMALLINT", "TINYINT"):
+            try:
+                return int(float(str(val)))
+            except (ValueError, TypeError):
+                return None
+        if typ in ("REAL", "FLOAT", "DOUBLE"):
+            try:
+                return float(str(val))
+            except (ValueError, TypeError):
+                return None
+        return str(val)
+    args = [eval_expr(a, row) for a in _split_args(args_str)]
+    return _eval_func_evaled(fname, args)
+
+
 def _printf(fmt: str, args: list) -> str:
     """Format a string using SQLite-compatible C-style format specifiers."""
     result: list[str] = []
@@ -626,15 +812,210 @@ def _eval_condition_tokens(cond_toks: list[str], row: dict) -> bool:
     return bool(val) if val is not None else False
 
 
+# ── Parse-to-AST (parse_expr) ──────────────────────────────────────────────────
+# Mirror of the recursive-descent eval parser but builds Expr nodes instead of
+# evaluating immediately.  Called once per unique expression string; result is
+# cached so subsequent rows skip tokenisation entirely.
+
+
+def _parse_expr_comp(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Parse comparison: add_expr [comp_op add_expr]."""
+    left, pos = _parse_expr_add(toks, pos)
+    if pos < len(toks) and toks[pos] in _COMP_OPS:
+        op = toks[pos]; pos += 1
+        right, pos = _parse_expr_add(toks, pos)
+        return BinaryOp(op, left, right), pos
+    return left, pos
+
+
+def _parse_expr_add(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Parse additive/concat: mul (('+' | '-' | '||') mul)*."""
+    val, pos = _parse_expr_mul(toks, pos)
+    while pos < len(toks) and toks[pos] in ("+", "-", "||"):
+        op = toks[pos]; pos += 1
+        right, pos = _parse_expr_mul(toks, pos)
+        val = BinaryOp(op, val, right)
+    return val, pos
+
+
+def _parse_expr_mul(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Parse multiplicative: unary (('*' | '/' | '%') unary)*."""
+    val, pos = _parse_expr_unary(toks, pos)
+    while pos < len(toks) and toks[pos] in ("*", "/", "%"):
+        op = toks[pos]; pos += 1
+        right, pos = _parse_expr_unary(toks, pos)
+        val = BinaryOp(op, val, right)
+    return val, pos
+
+
+def _parse_expr_unary(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Parse unary: ('-' | '+') primary | primary."""
+    if pos < len(toks) and toks[pos] == "-":
+        operand, pos = _parse_expr_primary(toks, pos + 1)
+        return UnaryOp("-", operand), pos
+    if pos < len(toks) and toks[pos] == "+":
+        return _parse_expr_primary(toks, pos + 1)
+    return _parse_expr_primary(toks, pos)
+
+
+def _parse_expr_primary(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Parse primary: literal, column ref, func call, CASE, or paren group."""
+    if pos >= len(toks):
+        return Literal(None), pos
+
+    tok = toks[pos]
+    upper = tok.upper()
+
+    # Parenthesised expression
+    if tok == "(":
+        val, pos = _parse_expr_comp(toks, pos + 1)
+        if pos < len(toks) and toks[pos] == ")":
+            pos += 1
+        else:
+            raise ParseError("Unmatched '(' in expression")
+        return val, pos
+
+    # CASE WHEN ... END
+    if upper == "CASE":
+        return _parse_case_to_ast(toks, pos)
+
+    # Function call: identifier immediately followed by (
+    if pos + 1 < len(toks) and toks[pos + 1] == "(":
+        fname = upper
+        depth = 0
+        j = pos + 1
+        args_start = pos + 2
+        while j < len(toks):
+            if toks[j] == "(":
+                depth += 1
+            elif toks[j] == ")":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        args_toks = toks[args_start:j]
+
+        if fname == "CAST":
+            for k, t in enumerate(args_toks):
+                if t.upper() == "AS" and k + 1 < len(args_toks):
+                    operand_toks = args_toks[:k]
+                    type_name = args_toks[k + 1]
+                    operand_node, _ = _parse_expr_comp(operand_toks, 0)
+                    return CastExpr(operand_node, type_name), j + 1
+            # Fallback: treat as regular function if AS not found
+
+        # Parse each comma-separated arg into an Expr node
+        parsed_args = [_parse_expr_comp(g, 0)[0] for g in _split_arg_tokens(args_toks)]
+        return FuncCall(fname, parsed_args), j + 1
+
+    # Keyword constants
+    if upper == "NULL":               return Literal(None),              pos + 1
+    if upper == "TRUE":               return Literal(1),                 pos + 1
+    if upper == "FALSE":              return Literal(0),                 pos + 1
+    if upper == "CURRENT_TIMESTAMP":  return CurrentDT("TIMESTAMP"),     pos + 1
+    if upper == "CURRENT_DATE":       return CurrentDT("DATE"),          pos + 1
+    if upper == "CURRENT_TIME":       return CurrentDT("TIME"),          pos + 1
+
+    # String literal
+    if tok.startswith("'") and tok.endswith("'"):
+        return Literal(tok[1:-1].replace("''", "'")), pos + 1
+
+    # Numeric literals
+    try:
+        return Literal(int(tok)), pos + 1
+    except ValueError:
+        pass
+    try:
+        return Literal(float(tok)), pos + 1
+    except ValueError:
+        pass
+
+    # Column reference (or bare-string fallback for unquoted identifiers)
+    return ColumnRef(tok), pos + 1
+
+
+def _parse_case_to_ast(toks: list[str], pos: int) -> tuple[Any, int]:
+    """Build a CaseExpr node from CASE WHEN … END token stream."""
+    pos += 1  # skip CASE
+    branches: list = []
+    else_expr = None
+
+    while pos < len(toks):
+        kw = toks[pos].upper()
+        if kw == "WHEN":
+            pos += 1
+            cond_toks: list[str] = []
+            depth = 0
+            while pos < len(toks):
+                t = toks[pos]
+                tu = t.upper()
+                if tu == "CASE":
+                    depth += 1
+                    cond_toks.append(t); pos += 1
+                elif tu == "END" and depth > 0:
+                    depth -= 1
+                    cond_toks.append(t); pos += 1
+                elif tu == "THEN" and depth == 0:
+                    pos += 1  # skip THEN
+                    break
+                else:
+                    cond_toks.append(t); pos += 1
+            cond_node, _ = _parse_expr_comp(cond_toks, 0)
+            val_toks, pos = _collect_case_branch_tokens(toks, pos)
+            val_node, _ = _parse_expr_comp(val_toks, 0)
+            branches.append((cond_node, val_node))
+        elif kw == "ELSE":
+            pos += 1
+            else_toks, pos = _collect_case_branch_tokens(toks, pos)
+            else_expr, _ = _parse_expr_comp(else_toks, 0)
+        elif kw == "END":
+            pos += 1
+            break
+        else:
+            pos += 1
+
+    return CaseExpr(branches, else_expr), pos
+
+
+def parse_expr(s: str) -> Any:
+    """Parse a SQL expression string into an Expr AST node.
+
+    The returned node can be reused across many ``evaluate(row)`` calls
+    without re-tokenising.  Call sites that hold a node reference pay only
+    the cost of the recursive ``evaluate`` dispatch, not regex matching.
+    """
+    toks = _tokenize_expr(s.strip())
+    if not toks:
+        return Literal(None)
+    node, _ = _parse_expr_comp(toks, 0)
+    return node
+
+
+# ── Expression cache ───────────────────────────────────────────────────────────
+# Keyed on the stripped expression string.  Bounded at _MAX_EXPR_CACHE entries
+# via a simple FIFO eviction (insert-order dict).
+
+_expr_cache: dict[str, Any] = {}
+_MAX_EXPR_CACHE = 4096
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def eval_expr(expr: str, row: dict) -> Any:
-    """Evaluate a SQL expression string against a row dict."""
+    """Evaluate a SQL expression string against a row dict.
+
+    On the first call for a given expression string the string is tokenised
+    and parsed into an Expr AST node which is stored in ``_expr_cache``.
+    All subsequent calls skip tokenisation and go straight to node evaluation,
+    reducing per-row cost from O(regex) to O(tree_depth).
+    """
     expr = expr.strip()
     if not expr:
         return None
-    toks = _tokenize_expr(expr)
-    if not toks:
-        return None
-    val, _ = _parse_add(toks, 0, row)
-    return val
+    node = _expr_cache.get(expr)
+    if node is None:
+        node = parse_expr(expr)
+        if len(_expr_cache) >= _MAX_EXPR_CACHE:
+            _expr_cache.pop(next(iter(_expr_cache)))
+        _expr_cache[expr] = node
+    return node.evaluate(row)

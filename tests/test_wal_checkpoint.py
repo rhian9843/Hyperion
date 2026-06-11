@@ -2,11 +2,13 @@
 import struct
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 from hyperion import Database
 from hyperion.constants import PAGE_SIZE
 from hyperion.wal import WAL
+import hyperion.pager as _pager_mod
 
 
 # ── WAL format helpers ────────────────────────────────────────────────────────
@@ -654,3 +656,81 @@ def test_wal_replay_idempotent_across_multiple_reopens(tmp_path):
     for i in range(3):
         assert content2[(i + 1) * PAGE_SIZE] == 0x10 + i, \
             f"Page {i+1} has wrong marker after idempotent replay"
+
+
+# ── Multi-transaction inter-connection WAL staleness ─────────────────────────
+
+def test_multi_txn_wal_catchup_sees_all_commits(tmp_path):
+    """Connection A must see Connection B's SECOND commit, not just the first.
+
+    This is the exact failure mode of the old _needs_wal_catchup one-shot guard:
+    A applied WAL on its first begin(), cleared the flag, and thereafter never
+    applied again — so B's second (and all subsequent) commits were invisible.
+
+    The test patches _flock to a no-op and _flock_try_ex to always return False
+    so both connections behave as if opened from different processes (i.e. the
+    second opener cannot acquire LOCK_EX and must rely entirely on WAL catch-up
+    at begin() time to see committed data).
+    """
+    db_path = tmp_path / "staleness.hdb"
+
+    # Bootstrap: create schema with a clean connection so WAL is fully
+    # checkpointed and removed before the two-connection phase starts.
+    setup = Database(db_path)
+    setup.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+    setup.close()
+
+    _noop_flock     = lambda fd, how: None
+    _always_fail_ex = lambda fd: False
+
+    with patch.object(_pager_mod, "_flock",      _noop_flock), \
+         patch.object(_pager_mod, "_flock_try_ex", _always_fail_ex):
+
+        db_a = Database(db_path)  # reader connection
+        db_b = Database(db_path)  # writer connection
+
+        try:
+            # ── B: Transaction 1 ─────────────────────────────────────────────
+            db_b.begin()
+            db_b.execute("INSERT INTO t VALUES (1, 'one')")
+            db_b.commit()
+
+            # ── A: first read — must catch up to B's T1 ──────────────────────
+            db_a.begin()
+            rows = db_a.execute("SELECT id FROM t ORDER BY id").fetchall()
+            ids_after_t1 = [r["id"] for r in rows]
+            db_a.rollback()
+
+            # ── B: Transaction 2 — the commit the old code would miss ─────────
+            db_b.begin()
+            db_b.execute("INSERT INTO t VALUES (2, 'two')")
+            db_b.commit()
+
+            # ── A: second read — must catch up to B's T2 ─────────────────────
+            db_a.begin()
+            rows = db_a.execute("SELECT id FROM t ORDER BY id").fetchall()
+            ids_after_t2 = [r["id"] for r in rows]
+            db_a.rollback()
+
+            # ── B: Transaction 3 — verify three commits all propagate ─────────
+            db_b.begin()
+            db_b.execute("INSERT INTO t VALUES (3, 'three')")
+            db_b.commit()
+
+            db_a.begin()
+            rows = db_a.execute("SELECT id FROM t ORDER BY id").fetchall()
+            ids_after_t3 = [r["id"] for r in rows]
+            db_a.rollback()
+
+        finally:
+            db_a.close()
+            db_b.close()
+
+    assert ids_after_t1 == [1], \
+        f"A missed B's Transaction 1: got {ids_after_t1!r}"
+    assert ids_after_t2 == [1, 2], (
+        f"A missed B's Transaction 2: got {ids_after_t2!r} — "
+        "multi-txn WAL staleness bug (one-shot _needs_wal_catchup guard)"
+    )
+    assert ids_after_t3 == [1, 2, 3], \
+        f"A missed B's Transaction 3: got {ids_after_t3!r}"

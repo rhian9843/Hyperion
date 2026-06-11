@@ -271,11 +271,12 @@ class TestOrderByLimit(unittest.TestCase):
         )
         self.assertEqual(self._data_lines(lines, "name"), ["carol", "bob"])
 
-    def test_nulls_last(self):
+    def test_nulls_first_asc(self):
+        """ASC ORDER BY puts NULLs first (SQLite compatibility)."""
         db_run(["INSERT INTO users (id, name) VALUES (4, dave)", ".exit"], self.db)
         _, lines = db_run(["SELECT email FROM users ORDER BY email ASC", ".exit"], self.db)
         data = self._data_lines(lines, "email")
-        self.assertEqual(data[-1], "NULL")
+        self.assertEqual(data[0], "NULL")
 
 
 class TestDistinct(unittest.TestCase):

@@ -940,7 +940,17 @@ def _parse_create_table(t: list[str], i: int, temporary: bool) -> dict:
             elif col_kw == "DEFAULT":
                 if i + 1 >= len(t):
                     raise ParseError("Expected value after DEFAULT")
-                default = _unquote_token(t[i + 1]); i += 2
+                _raw = t[i + 1]
+                default = _unquote_token(_raw)
+                if not _raw.startswith("'"):
+                    try:
+                        default = int(_raw)
+                    except (ValueError, TypeError):
+                        try:
+                            default = float(_raw)
+                        except (ValueError, TypeError):
+                            pass
+                i += 2
             elif col_kw == "CHECK":
                 if i + 1 >= len(t) or t[i + 1] != "(":
                     raise ParseError("Expected ( after CHECK")
@@ -1412,6 +1422,8 @@ def _parse_select(t: list[str]) -> dict:
         col = " ".join(expr_parts)
         if not col:
             break
+        if paren_depth != 0:
+            raise ParseError(f"Unmatched '(' in SELECT expression")
         if i < len(t) and t[i].upper() == "AS":
             i += 1
             if i < len(t) and t[i].upper() not in ("FROM",):

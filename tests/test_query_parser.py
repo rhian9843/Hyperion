@@ -13,7 +13,7 @@ def test_join_multi_condition_on_basic():
     db.executemany("INSERT INTO b VALUES (?, ?, ?)", [(1, 10, "hit"), (1, 99, "miss"), (3, 30, "hit2")])
     rows = db.execute("SELECT a.x, b.val FROM a JOIN b ON a.x = b.x AND a.y = b.y").fetchall()
     assert len(rows) == 2
-    vals = {r["b.val"] for r in rows}
+    vals = {r["val"] for r in rows}
     assert vals == {"hit", "hit2"}
 
 
@@ -27,7 +27,7 @@ def test_join_multi_condition_three_predicates():
         "SELECT t2.label FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b = t2.b AND t1.c = t2.c"
     ).fetchall()
     assert len(rows) == 2
-    labels = {r["t2.label"] for r in rows}
+    labels = {r["label"] for r in rows}
     assert labels == {"match", "other"}
 
 
@@ -51,7 +51,7 @@ def test_join_multi_condition_left_outer():
         "SELECT a.x, b.v FROM a LEFT JOIN b ON a.x = b.x AND a.y = b.y"
     ).fetchall()
     assert len(rows) == 2
-    v_vals = {r.get("b.v") for r in rows}
+    v_vals = {r.get("v") for r in rows}
     assert "yes" in v_vals
     assert None in v_vals  # unmatched left row
 

@@ -1063,7 +1063,9 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
             rows.append({
                 "cid": cid, "name": col.name, "type": col.type,
                 "notnull": 0 if col.nullable else 1,
-                "dflt_value": col.default, "pk": is_pk,
+                "dflt_value": (f"'{col.default.replace(chr(39), chr(39) * 2)}'"
+                               if isinstance(col.default, str) else col.default),
+                "pk": is_pk,
             })
         cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
         return RowResult(rows, cols)
@@ -1125,6 +1127,7 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
             "row_count": row_count,
             "columns": {c: {"ndv": len(distinct[c])} for c in col_names},
         }
+        db._catalog.mark_stats_dirty()
 
         # Refresh session row-count cache
         if hasattr(db, "_opt_row_counts"):
@@ -1391,6 +1394,10 @@ def _exec_create_table(stmt: dict, db: Database) -> str:
             pk_idx = f"_pk_{stmt['name']}_{col.name}"
             if pk_idx not in db.indexes:
                 db.create_index(pk_idx, stmt["name"], [col.name])
+        elif col.unique:
+            uq_idx = f"_uq_{stmt['name']}_{col.name}"
+            if uq_idx not in db.indexes:
+                db.create_index(uq_idx, stmt["name"], [col.name], unique=True)
     if pk_cols and len(pk_cols) > 1:
         pk_idx = f"_pk_{stmt['name']}_{'_'.join(pk_cols)}"
         if pk_idx not in db.indexes:

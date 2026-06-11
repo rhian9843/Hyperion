@@ -271,19 +271,23 @@ class Cursor:
 
     def execute(self, sql: str, params=None, timeout_ms: int | None = None,
                max_rows: int | None = None) -> "Cursor":
-        # Parse and bind BEFORE acquiring any lock.  _plan_cache access is
-        # safe under the GIL: worst case two threads both parse the same SQL,
-        # and the final dict value is the same either way (benign race).
+        # Parse and bind BEFORE acquiring any lock so concurrent SELECTs can
+        # overlap in the execution phase.  _plan_cache_lock serialises all cache
+        # mutations (insert, move_to_end, popitem, and the final dict read) so
+        # the check-then-act sequence is atomic and LRU ordering is maintained
+        # correctly under concurrent access.
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)  # LRU: evict least-recently-used entry
-        else:
-            cache.move_to_end(sql)         # LRU: promote to most-recently-used
-        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)  # evict least-recently-used
+            else:
+                cache.move_to_end(sql)         # promote to most-recently-used
+            stmt_ast = cache[sql]
+        stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         op   = stmt.get("op", "")
 
         lock = (self._db._lock.read()
@@ -299,13 +303,15 @@ class Cursor:
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)
-        else:
-            cache.move_to_end(sql)
-        stmt = _bind_ast_params(cache[sql], params) if params is not None else cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)
+            else:
+                cache.move_to_end(sql)
+            stmt_ast = cache[sql]
+        stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         return self._execute_stmt(stmt, stmt.get("op", ""), timeout_ms, max_rows)
 
     def _execute_stmt(self, stmt: dict, op: str,
@@ -367,13 +373,14 @@ class Cursor:
         from .parser import parse
 
         cache = self._db._plan_cache
-        if sql not in cache:
-            cache[sql] = parse(sql)
-            if len(cache) > 512:
-                cache.popitem(last=False)
-        else:
-            cache.move_to_end(sql)
-        stmt_template = cache[sql]
+        with self._db._plan_cache_lock:
+            if sql not in cache:
+                cache[sql] = parse(sql)
+                if len(cache) > 512:
+                    cache.popitem(last=False)
+            else:
+                cache.move_to_end(sql)
+            stmt_template = cache[sql]
         op = stmt_template.get("op", "")
 
         with self._db._lock.write():
@@ -467,7 +474,41 @@ class Cursor:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
+    @staticmethod
+    def _bare(name: str) -> str:
+        """Strip table/alias prefix: 'o.quantity' → 'quantity'."""
+        if "." not in name:
+            return name
+        prefix = name.split(".", 1)[0]
+        if Cursor._IDENT_RE.match(prefix):
+            return name.split(".")[-1]
+        return name
+
+    @staticmethod
+    def _norm_row(row: dict) -> dict:
+        """Normalize a result row for SQLite compatibility.
+
+        Two transformations, both applied in one pass:
+        - Strip alias prefixes: 'o.quantity' key → 'quantity'
+          (explicit AS aliases are already bare; only auto-qualified names change)
+        - Float %.15g precision: 5*4.99 → 24.95, not 24.950000000000003
+          (mirrors SQLite's printf("%.15g") at the wire boundary)
+        """
+        has_float  = any(isinstance(v, float) for v in row.values())
+        has_prefix = any("." in k and Cursor._IDENT_RE.match(k.split(".", 1)[0])
+                         for k in row.keys())
+        if not has_float and not has_prefix:
+            return row
+        result: dict = {}
+        for k, v in row.items():
+            bare = Cursor._bare(k)
+            result[bare] = float(f"{v:.15g}") if isinstance(v, float) else v
+        return result
+
     def _apply_factory(self, row: dict) -> Any:
+        row = self._norm_row(row)
         if self.row_factory is None:
             return row
         return self.row_factory(self, row)
@@ -484,13 +525,14 @@ class Cursor:
         except StopIteration:
             self._iter = None
             self.rowcount = -1
-            col_names = _infer_col_names(stmt, self._db) if stmt is not None else None
+            raw_names = _infer_col_names(stmt, self._db) if stmt is not None else None
             self.description = (
-                tuple((k, None, None, None, None, None, None) for k in col_names)
-                if col_names is not None else None
+                tuple((self._bare(k), None, None, None, None, None, None)
+                      for k in raw_names)
+                if raw_names is not None else None
             )
             return
-        col_names = list(first.keys())
+        col_names = [self._bare(k) for k in first.keys()]
         self.description = tuple(
             (k, None, None, None, None, None, None) for k in col_names
         )

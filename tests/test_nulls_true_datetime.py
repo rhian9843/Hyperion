@@ -73,19 +73,19 @@ class TestNullsOrdering(unittest.TestCase):
             data.append(l)
         return data
 
-    def test_nulls_last_default(self):
-        """Default ORDER BY puts NULLs last."""
+    def test_nulls_first_default_asc(self):
+        """Default ASC ORDER BY puts NULLs first (SQLite compatibility)."""
         _, lines = db_run([
             "SELECT name, score FROM t ORDER BY score",
             ".exit",
         ], self.db)
         data = self._data_rows(lines)
-        # non-null first: Alice(10), Carol(20), then NULLs
+        # NULLs sort before all other values in ASC (SQLite behaviour)
         scores = [l.split("|")[1].strip() for l in data]
-        self.assertNotEqual(scores[0], "NULL")
-        self.assertNotEqual(scores[1], "NULL")
-        self.assertEqual(scores[-1], "NULL")
-        self.assertEqual(scores[-2], "NULL")
+        self.assertEqual(scores[0], "NULL")
+        self.assertEqual(scores[1], "NULL")
+        self.assertNotEqual(scores[-1], "NULL")
+        self.assertNotEqual(scores[-2], "NULL")
 
     def test_nulls_last_explicit(self):
         """ORDER BY score NULLS LAST puts NULLs last."""

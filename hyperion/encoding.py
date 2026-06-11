@@ -133,10 +133,17 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
         from .expr import eval_expr, is_expr
 
         def _key_val(row: dict, col: str):
-            v = row.get(col)
-            if v is None and col not in row and is_expr(col):
-                v = eval_expr(col, row)
-            return v
+            if col in row:
+                return row[col]
+            # alias.col pattern: try the bare column name (json_each rows use
+            # bare keys; the alias prefix is added later by _project_row)
+            if "." in col:
+                bare = col.split(".", 1)[1]
+                if bare in row:
+                    return row[bare]
+            if is_expr(col):
+                return eval_expr(col, row)
+            return None
 
         def _collate_key(v, collation: str | None):
             if v is None:
@@ -163,7 +170,14 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
                 non_null.sort(
                     key=lambda r, c=col, coll=collation: str(_collate_key(_key_val(r, c), coll)),
                     reverse=desc)
-            rows = (null_rows + non_null) if nulls_first else (non_null + null_rows)
+            # Default NULL placement matches SQLite: NULLs sort before all
+            # other values (ASC) or after all other values (DESC).
+            # NULLS FIRST / NULLS LAST override this when explicitly stated.
+            if nulls_first is None:
+                put_nulls_first = not desc   # ASC → first, DESC → last
+            else:
+                put_nulls_first = nulls_first
+            rows = (null_rows + non_null) if put_nulls_first else (non_null + null_rows)
     if offset is not None:
         rows = rows[offset:]
     if limit is not None:

@@ -132,6 +132,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self.row_factory     = None   # callable(cursor, row_dict) -> Any; None = dict
         self._authorizer     = None   # callable(action, table, col, db, trigger) -> int
         self._plan_cache: OrderedDict[str, dict] = OrderedDict()  # LRU: SQL → AST
+        self._plan_cache_lock = threading.Lock()  # guards all _plan_cache mutations
         # Schema bytes cache: skip page writes when structure hasn't changed.
         self._schema_flushed_bytes: bytes = self._catalog.schema_to_bytes()
         # Ops snapshot: detect which tables/indexes changed since last flush so
@@ -220,12 +221,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             pages_snap = {n: bytes(self._pager._working[n])
                           for n in self._pager._dirty if n in self._pager._working}
             dirty_snap  = set(self._pager._dirty)
-            cat_bytes   = self._catalog.to_bytes()
+            cat_snap    = self._catalog.snap()
             cat_extra   = list(self._catalog_extra)
             ops_pn      = self._catalog_ops_pn
             ops_extra   = list(self._catalog_ops_extra)
             self._savepoints.append(
-                (name, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra))
+                (name, pages_snap, dirty_snap, cat_snap, cat_extra, ops_pn, ops_extra))
 
     def release_savepoint(self, name: str) -> None:
         with self._lock.write():
@@ -235,7 +236,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def rollback_to_savepoint(self, name: str) -> None:
         with self._lock.write():
             idx = self._find_savepoint(name)
-            _, pages_snap, dirty_snap, cat_bytes, cat_extra, ops_pn, ops_extra = \
+            _, pages_snap, dirty_snap, cat_snap, cat_extra, ops_pn, ops_extra = \
                 self._savepoints[idx]
             del self._savepoints[idx + 1:]  # keep this savepoint alive (SQLite behaviour)
             # Evict pages added after the savepoint
@@ -246,12 +247,20 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 self._pager._working[pn] = bytearray(content)
             self._pager._dirty = set(dirty_snap)
             # Restore catalog and page-chain metadata
-            self._catalog           = Catalog.from_bytes(cat_bytes)
+            self._catalog.restore_snap(cat_snap)
             self._catalog_extra     = list(cat_extra)
             self._catalog_ops_pn    = ops_pn
             self._catalog_ops_extra = list(ops_extra)
             # Invalidate schema cache so the next commit forces a full schema write.
             self._schema_flushed_bytes = b""
+            # restore_snap() cleared the snippet caches but left _ops_snap_tables
+            # intact.  If a table's (root_page, next_page, next_key) matches the
+            # stale snapshot, _flush_ops would skip re-serializing it, producing
+            # an ops page with empty table_ops.  Clear both ops snapshots so
+            # _flush_ops unconditionally re-encodes every table/index on the
+            # next commit.
+            self._ops_snap_tables.clear()
+            self._ops_snap_indexes.clear()
 
     # ── Application-defined functions ──────────────────────────────────────────
 
@@ -895,6 +904,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for trig_name, trig_meta in list(self._catalog.triggers.items()):
             new_db.create_trigger(trig_name, trig_meta)
         new_db._catalog.stats = copy.deepcopy(self._catalog.stats)
+        new_db._catalog.mark_stats_dirty()
         new_db._catalog.meta  = copy.deepcopy(self._catalog.meta)
         new_db.commit()
         new_db._pager.close()
