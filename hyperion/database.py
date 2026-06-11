@@ -253,6 +253,14 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._catalog_ops_extra = list(ops_extra)
             # Invalidate schema cache so the next commit forces a full schema write.
             self._schema_flushed_bytes = b""
+            # restore_snap() cleared the snippet caches but left _ops_snap_tables
+            # intact.  If a table's (root_page, next_page, next_key) matches the
+            # stale snapshot, _flush_ops would skip re-serializing it, producing
+            # an ops page with empty table_ops.  Clear both ops snapshots so
+            # _flush_ops unconditionally re-encodes every table/index on the
+            # next commit.
+            self._ops_snap_tables.clear()
+            self._ops_snap_indexes.clear()
 
     # ── Application-defined functions ──────────────────────────────────────────
 
