@@ -474,10 +474,17 @@ class Cursor:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    _IDENT_RE = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*$')
+
     @staticmethod
     def _bare(name: str) -> str:
         """Strip table/alias prefix: 'o.quantity' → 'quantity'."""
-        return name.split(".")[-1] if "." in name else name
+        if "." not in name:
+            return name
+        prefix = name.split(".", 1)[0]
+        if Cursor._IDENT_RE.match(prefix):
+            return name.split(".")[-1]
+        return name
 
     @staticmethod
     def _norm_row(row: dict) -> dict:
@@ -490,12 +497,13 @@ class Cursor:
           (mirrors SQLite's printf("%.15g") at the wire boundary)
         """
         has_float  = any(isinstance(v, float) for v in row.values())
-        has_prefix = any("." in k for k in row.keys())
+        has_prefix = any("." in k and Cursor._IDENT_RE.match(k.split(".", 1)[0])
+                         for k in row.keys())
         if not has_float and not has_prefix:
             return row
         result: dict = {}
         for k, v in row.items():
-            bare = k.split(".")[-1] if "." in k else k
+            bare = Cursor._bare(k)
             result[bare] = float(f"{v:.15g}") if isinstance(v, float) else v
         return result
 
