@@ -1422,6 +1422,8 @@ def _parse_select(t: list[str]) -> dict:
         col = " ".join(expr_parts)
         if not col:
             break
+        if paren_depth != 0:
+            raise ParseError(f"Unmatched '(' in SELECT expression")
         if i < len(t) and t[i].upper() == "AS":
             i += 1
             if i < len(t) and t[i].upper() not in ("FROM",):

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
-from .errors import DataError
+from .errors import DataError, ParseError
 from .json_funcs import eval_json_func as _eval_json_func
 
 # ── Application-defined function registries ────────────────────────────────────
@@ -871,6 +871,8 @@ def _parse_expr_primary(toks: list[str], pos: int) -> tuple[Any, int]:
         val, pos = _parse_expr_comp(toks, pos + 1)
         if pos < len(toks) and toks[pos] == ")":
             pos += 1
+        else:
+            raise ParseError("Unmatched '(' in expression")
         return val, pos
 
     # CASE WHEN ... END

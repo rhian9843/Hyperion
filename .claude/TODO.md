@@ -382,6 +382,8 @@
 
 - [x] Fix `PRAGMA table_info` default value quoting — string defaults are returned without quotes (`pending`) instead of as SQL literals (`'pending'`) as SQLite does; numeric defaults are already bare numbers which is correct; fix by wrapping text default values in single quotes in the `PRAGMA table_info` result rows so tools that parse the output (e.g. ORMs, schema diffing libraries) can distinguish a string default `'now'` from a function call `now()`
 
+- [x] Fix unbalanced parentheses silently accepted in SELECT expressions — `SELECT (1 + 2` (missing closing `)`) was parsed without error: the `_parse_select` column loop exited with `paren_depth=1` and never checked for balance, and `_parse_expr_primary` in `expr.py` consumed the `(` then returned successfully even when no matching `)` followed; both layers now raise `ParseError("Unmatched '(' in expression")` on encountering an unclosed paren — string defaults are returned without quotes (`pending`) instead of as SQL literals (`'pending'`) as SQLite does; numeric defaults are already bare numbers which is correct; fix by wrapping text default values in single quotes in the `PRAGMA table_info` result rows so tools that parse the output (e.g. ORMs, schema diffing libraries) can distinguish a string default `'now'` from a function call `now()`
+
 ### Transactions
 
 - [ ] `SELECT FOR UPDATE` — row-level locking within a transaction; `SELECT * FROM t WHERE id = 1 FOR UPDATE` acquires an exclusive lock on matched rows, blocking concurrent writers until `COMMIT` or `ROLLBACK`; required for safe read-modify-write patterns
