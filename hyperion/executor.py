@@ -1063,7 +1063,9 @@ def _handle_pragma(stmt: dict, db: Database) -> str:
             rows.append({
                 "cid": cid, "name": col.name, "type": col.type,
                 "notnull": 0 if col.nullable else 1,
-                "dflt_value": col.default, "pk": is_pk,
+                "dflt_value": (f"'{col.default.replace(chr(39), chr(39) * 2)}'"
+                               if isinstance(col.default, str) else col.default),
+                "pk": is_pk,
             })
         cols = ["cid", "name", "type", "notnull", "dflt_value", "pk"]
         return RowResult(rows, cols)
