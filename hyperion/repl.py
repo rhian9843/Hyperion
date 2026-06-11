@@ -228,9 +228,8 @@ def run_sql_file(db: Database, path: str) -> None:
             result = execute(parse(part), db)
             if isinstance(result, RowResult) and result.rows:
                 print(_format_rows(result.rows, result.columns))
-        except (HyperionError, ParseError, RuntimeError, KeyError, struct.error) as e:
+        except Exception as e:
             print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
 
 
 def main() -> None:
