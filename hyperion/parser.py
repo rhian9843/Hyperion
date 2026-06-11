@@ -36,7 +36,7 @@ _AGG_RE = re.compile(
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
     "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW",
-    "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM",
+    "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM", "FOR",
 })
 
 _JSON_EACH_RE_PARSER = re.compile(r'^(json_each|json_tree)\s*\(', re.IGNORECASE)
@@ -677,9 +677,10 @@ def _parse_group_having(tokens: list[str], pos: int
 
 
 def _parse_order_limit(tokens: list[str], pos: int
-                       ) -> tuple[list[dict], int | None, int | None]:
-    """Parse optional ORDER BY … LIMIT n OFFSET m starting at pos.
-    Returns (order_by_list, limit, offset).  order_by items: {"col": str, "desc": bool}.
+                       ) -> tuple[list[dict], int | None, int | None, bool]:
+    """Parse optional ORDER BY … LIMIT n OFFSET m [FOR UPDATE] starting at pos.
+    Returns (order_by_list, limit, offset, for_update).
+    order_by items: {"col": str, "desc": bool}.
     """
     order_by: list[dict] = []
     limit:  int | None = None
@@ -690,7 +691,7 @@ def _parse_order_limit(tokens: list[str], pos: int
         if pos >= len(tokens) or tokens[pos].upper() != "BY":
             raise ParseError("Expected BY after ORDER")
         pos += 1
-        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT", "OFFSET"):
+        while pos < len(tokens) and tokens[pos].upper() not in ("LIMIT", "OFFSET", "FOR"):
             col = tokens[pos]; pos += 1
             desc = False
             collation: str | None = None
@@ -734,7 +735,12 @@ def _parse_order_limit(tokens: list[str], pos: int
         except ValueError:
             raise ParseError(f"Expected integer after OFFSET, got '{tokens[pos]}'")
 
-    return order_by, limit, offset
+    for_update = False
+    if (pos < len(tokens) and tokens[pos].upper() == "FOR"
+            and pos + 1 < len(tokens) and tokens[pos + 1].upper() == "UPDATE"):
+        for_update = True
+
+    return order_by, limit, offset, for_update
 
 
 # ── Module-level helper extracted from CREATE TABLE ───────────────────────────
@@ -1449,7 +1455,7 @@ def _parse_select(t: list[str]) -> dict:
             alias = t[i]; i += 1
         where, i          = _parse_where(t, i)
         group_by, having, i = _parse_group_having(t, i)
-        order_by, limit, offset = _parse_order_limit(t, i)
+        order_by, limit, offset, for_update = _parse_order_limit(t, i)
         return {
             "op": "SELECT", "table": None,
             "subquery_from": sub_ast, "subquery_alias": alias,
@@ -1458,6 +1464,7 @@ def _parse_select(t: list[str]) -> dict:
             "where": where, "group_by": group_by or None,
             "having": having, "order_by": order_by,
             "limit": limit, "offset": offset, "distinct": distinct,
+            "for_update": for_update,
         }
 
     table = t[i]; i += 1
@@ -1506,7 +1513,7 @@ def _parse_select(t: list[str]) -> dict:
             tail_extra = extra_implicit[1:]
         where, i          = _parse_where(t, i)
         group_by, having, i = _parse_group_having(t, i)
-        order_by, limit, offset = _parse_order_limit(t, i)
+        order_by, limit, offset, for_update = _parse_order_limit(t, i)
         base = {
             "op": "JOIN", "join_type": first_join_type,
             "left_table":  from_tables[0][0], "left_alias":  from_tables[0][1],
@@ -1517,7 +1524,7 @@ def _parse_select(t: list[str]) -> dict:
             "where": where, "group_by": group_by or None,
             "having": having, "order_by": order_by,
             "limit": limit, "offset": offset, "distinct": distinct,
-            "extra_joins": tail_extra,
+            "extra_joins": tail_extra, "for_update": for_update,
         }
         if len(from_tables) < 2:
             # Copy lateral_subquery from the promoted first extra join
@@ -1637,9 +1644,9 @@ def _parse_select(t: list[str]) -> dict:
                                 "on_left": ej_on_l, "on_right": ej_on_r,
                                 "on_clause": ej_on_clause,
                                 **({"lateral_subquery": ej_lat_sub} if ej_lat_sub else {})})
-        where, i                = _parse_where(t, i)
-        group_by, having, i     = _parse_group_having(t, i)
-        order_by, limit, offset = _parse_order_limit(t, i)
+        where, i                     = _parse_where(t, i)
+        group_by, having, i          = _parse_group_having(t, i)
+        order_by, limit, offset, for_update = _parse_order_limit(t, i)
         base_join: dict = {
             "op":           "JOIN",
             "join_type":    join_type,
@@ -1659,6 +1666,7 @@ def _parse_select(t: list[str]) -> dict:
             "limit":        limit,
             "offset":       offset,
             "extra_joins":  extra_joins,
+            "for_update":   for_update,
         }
         if lateral_subquery is not None:
             base_join["lateral_subquery"] = lateral_subquery
@@ -1666,7 +1674,7 @@ def _parse_select(t: list[str]) -> dict:
     where, i                    = _parse_where(t, i)
     group_by, having, i         = _parse_group_having(t, i)
     named_windows, i            = _parse_window_defs(t, i)
-    order_by, limit, offset     = _parse_order_limit(t, i)
+    order_by, limit, offset, for_update = _parse_order_limit(t, i)
     return {
         "op":             "SELECT",
         "table":          table,
@@ -1680,6 +1688,7 @@ def _parse_select(t: list[str]) -> dict:
         "limit":          limit,
         "offset":         offset,
         "distinct":       distinct,
+        "for_update":     for_update,
     }
 
 

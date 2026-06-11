@@ -290,6 +290,29 @@ class Cursor:
         stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         op   = stmt.get("op", "")
 
+        # SELECT FOR UPDATE: acquire an exclusive write lock that persists for the
+        # life of the transaction (released by commit/rollback, not here).
+        if stmt.get("for_update"):
+            from .errors import TransactionError
+            if not self._db.in_transaction:
+                raise TransactionError(
+                    "SELECT FOR UPDATE requires an active transaction — use BEGIN first"
+                )
+            if not self._db._for_update_held:
+                # Permanently acquire write lock; released by commit() or rollback()
+                self._db._lock.acquire_write()
+                self._db._for_update_held = True
+                try:
+                    return self._execute_stmt(stmt, op, timeout_ms, max_rows)
+                except Exception:
+                    self._db._for_update_held = False
+                    self._db._lock.release_write()
+                    raise
+                # try block always returns or re-raises; execution never reaches here
+            # Already holding the write lock from a prior FOR UPDATE — reentrant path
+            with self._db._lock.write():
+                return self._execute_stmt(stmt, op, timeout_ms, max_rows)
+
         lock = (self._db._lock.read()
                 if op in _SELECT_OPS or op == "EXPLAIN"
                 else self._db._lock.write())

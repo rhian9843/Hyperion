@@ -75,10 +75,18 @@ class _RWLock:
     @contextlib.contextmanager
     def write(self):
         """Exclusive (write) lock — reentrant for the same thread."""
+        self.acquire_write()
+        try:
+            yield
+        finally:
+            self.release_write()
+
+    def acquire_write(self) -> None:
+        """Acquire the write lock without a context manager (pair with release_write)."""
         tid = threading.get_ident()
         with self._cond:
             if self._write_owner == tid:
-                self._write_depth += 1  # reentrant
+                self._write_depth += 1
             else:
                 self._writers_waiting += 1
                 while self._readers > 0 or self._write_owner is not None:
@@ -86,14 +94,14 @@ class _RWLock:
                 self._writers_waiting -= 1
                 self._write_owner = tid
                 self._write_depth = 1
-        try:
-            yield
-        finally:
-            with self._cond:
-                self._write_depth -= 1
-                if self._write_depth == 0:
-                    self._write_owner = None
-                    self._cond.notify_all()
+
+    def release_write(self) -> None:
+        """Release one depth level of the write lock."""
+        with self._cond:
+            self._write_depth -= 1
+            if self._write_depth == 0:
+                self._write_owner = None
+                self._cond.notify_all()
 
 
 class _ReadOnlyContext:
@@ -147,6 +155,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # reentrant for the same thread so nested calls (e.g. executescript →
         # commit, close → begin/drop/commit) don't deadlock.
         self._lock = _RWLock()
+        self._for_update_held = False  # True while this txn holds a FOR UPDATE write lock
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
 
@@ -201,6 +210,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._flush_catalog()
             self._pager.commit()
             self._txn_depth = 0
+        if self._for_update_held:
+            self._for_update_held = False
+            self._lock.release_write()
 
     def rollback(self) -> None:
         with self._lock.write():
@@ -210,6 +222,21 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._pager.rollback()
             self._reload_catalog()
             self._txn_depth = 0
+        if self._for_update_held:
+            self._for_update_held = False
+            self._lock.release_write()
+
+    def _acquire_for_update(self) -> None:
+        """Escalate the current transaction to an exclusive write lock.
+
+        Called when executing SELECT ... FOR UPDATE.  The write lock is held
+        until the transaction ends (commit or rollback), blocking any other
+        thread from acquiring the write lock (and thereby blocking concurrent
+        INSERTs, UPDATEs, DELETEs) until this transaction commits or rolls back.
+        """
+        if not self._for_update_held:
+            self._lock.acquire_write()
+            self._for_update_held = True
 
     # ── Savepoints ─────────────────────────────────────────────────────────────
 
