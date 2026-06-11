@@ -441,10 +441,10 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
 
     if fname == "SUBSTR":
         # SUBSTR(str, start[, length]) — SQL uses 1-based indexing
-        if len(args) < 2 or args[0] is None:
+        if len(args) < 2 or args[0] is None or args[1] is None:
             return None
         s     = str(args[0])
-        start = int(args[1]) if args[1] is not None else 1
+        start = int(args[1])
         # SQL SUBSTR: negative start counts from end; 0 is treated as 1
         if start == 0:
             start = 1
@@ -456,17 +456,14 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
         return s[py_start:]
 
     if fname == "REPLACE":
-        if len(args) < 3 or args[0] is None:
+        if len(args) < 3 or args[0] is None or args[1] is None or args[2] is None:
             return None
-        return str(args[0]).replace(
-            str(args[1]) if args[1] is not None else "",
-            str(args[2]) if args[2] is not None else "",
-        )
+        return str(args[0]).replace(str(args[1]), str(args[2]))
 
     if fname == "INSTR":
         # INSTR(str, sub) — returns 1-based position of first occurrence, 0 if not found
         if len(args) < 2 or args[0] is None or args[1] is None:
-            return 0
+            return None
         idx = str(args[0]).find(str(args[1]))
         return idx + 1 if idx >= 0 else 0
 

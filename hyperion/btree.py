@@ -328,6 +328,16 @@ class BTree:
             self._merge_leaves(pn, rn, parent_num, parent, k)
             if freed is not None:
                 freed.add(rn)   # rn is orphaned; skip if seen later in candidates
+            # If pn is still underfull after absorbing an empty right sibling
+            # (e.g. both leaves were empty), recurse to try the next right
+            # sibling or the left sibling.  Guard against pn being orphaned
+            # when _remove_from_parent collapsed the root into pn's page —
+            # detected by the parent page now being a leaf, not an internal node.
+            page = self._p.get_page(pn)
+            if not page[1] and self._num_cells(page) < self._lmin:
+                p_num = self._parent(page)
+                if p_num and self._p.read_page(p_num)[0] == self.NODE_INTERNAL:
+                    self._rebalance_leaf(pn, freed)
             return
 
         if k > 0:   # left sibling exists at children[k-1]
