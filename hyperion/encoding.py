@@ -170,7 +170,14 @@ def _apply_order_limit(rows: list[dict], order_by: list[dict] | None,
                 non_null.sort(
                     key=lambda r, c=col, coll=collation: str(_collate_key(_key_val(r, c), coll)),
                     reverse=desc)
-            rows = (null_rows + non_null) if nulls_first else (non_null + null_rows)
+            # Default NULL placement matches SQLite: NULLs sort before all
+            # other values (ASC) or after all other values (DESC).
+            # NULLS FIRST / NULLS LAST override this when explicitly stated.
+            if nulls_first is None:
+                put_nulls_first = not desc   # ASC → first, DESC → last
+            else:
+                put_nulls_first = nulls_first
+            rows = (null_rows + non_null) if put_nulls_first else (non_null + null_rows)
     if offset is not None:
         rows = rows[offset:]
     if limit is not None:
