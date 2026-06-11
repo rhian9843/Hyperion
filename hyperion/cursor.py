@@ -474,7 +474,22 @@ class Cursor:
 
     # ── Internal ──────────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _norm_row(row: dict) -> dict:
+        """Normalize float values to SQLite-compatible %.15g precision.
+
+        IEEE 754 arithmetic often produces noise digits (e.g. 5*4.99 →
+        24.950000000000003).  SQLite formats REAL results through printf("%.15g")
+        before returning them, so Python's sqlite3 module gives back 24.95.
+        Apply the same normalization so Hyperion matches SQLite's output.
+        """
+        if not any(isinstance(v, float) for v in row.values()):
+            return row
+        return {k: float(f"{v:.15g}") if isinstance(v, float) else v
+                for k, v in row.items()}
+
     def _apply_factory(self, row: dict) -> Any:
+        row = self._norm_row(row)
         if self.row_factory is None:
             return row
         return self.row_factory(self, row)
