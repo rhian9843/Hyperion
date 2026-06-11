@@ -1392,6 +1392,10 @@ def _exec_create_table(stmt: dict, db: Database) -> str:
             pk_idx = f"_pk_{stmt['name']}_{col.name}"
             if pk_idx not in db.indexes:
                 db.create_index(pk_idx, stmt["name"], [col.name])
+        elif col.unique:
+            uq_idx = f"_uq_{stmt['name']}_{col.name}"
+            if uq_idx not in db.indexes:
+                db.create_index(uq_idx, stmt["name"], [col.name], unique=True)
     if pk_cols and len(pk_cols) > 1:
         pk_idx = f"_pk_{stmt['name']}_{'_'.join(pk_cols)}"
         if pk_idx not in db.indexes:
