@@ -475,18 +475,29 @@ class Cursor:
     # ── Internal ──────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _norm_row(row: dict) -> dict:
-        """Normalize float values to SQLite-compatible %.15g precision.
+    def _bare(name: str) -> str:
+        """Strip table/alias prefix: 'o.quantity' → 'quantity'."""
+        return name.split(".")[-1] if "." in name else name
 
-        IEEE 754 arithmetic often produces noise digits (e.g. 5*4.99 →
-        24.950000000000003).  SQLite formats REAL results through printf("%.15g")
-        before returning them, so Python's sqlite3 module gives back 24.95.
-        Apply the same normalization so Hyperion matches SQLite's output.
+    @staticmethod
+    def _norm_row(row: dict) -> dict:
+        """Normalize a result row for SQLite compatibility.
+
+        Two transformations, both applied in one pass:
+        - Strip alias prefixes: 'o.quantity' key → 'quantity'
+          (explicit AS aliases are already bare; only auto-qualified names change)
+        - Float %.15g precision: 5*4.99 → 24.95, not 24.950000000000003
+          (mirrors SQLite's printf("%.15g") at the wire boundary)
         """
-        if not any(isinstance(v, float) for v in row.values()):
+        has_float  = any(isinstance(v, float) for v in row.values())
+        has_prefix = any("." in k for k in row.keys())
+        if not has_float and not has_prefix:
             return row
-        return {k: float(f"{v:.15g}") if isinstance(v, float) else v
-                for k, v in row.items()}
+        result: dict = {}
+        for k, v in row.items():
+            bare = k.split(".")[-1] if "." in k else k
+            result[bare] = float(f"{v:.15g}") if isinstance(v, float) else v
+        return result
 
     def _apply_factory(self, row: dict) -> Any:
         row = self._norm_row(row)
@@ -506,13 +517,14 @@ class Cursor:
         except StopIteration:
             self._iter = None
             self.rowcount = -1
-            col_names = _infer_col_names(stmt, self._db) if stmt is not None else None
+            raw_names = _infer_col_names(stmt, self._db) if stmt is not None else None
             self.description = (
-                tuple((k, None, None, None, None, None, None) for k in col_names)
-                if col_names is not None else None
+                tuple((self._bare(k), None, None, None, None, None, None)
+                      for k in raw_names)
+                if raw_names is not None else None
             )
             return
-        col_names = list(first.keys())
+        col_names = [self._bare(k) for k in first.keys()]
         self.description = tuple(
             (k, None, None, None, None, None, None) for k in col_names
         )

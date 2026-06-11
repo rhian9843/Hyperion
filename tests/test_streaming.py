@@ -232,8 +232,8 @@ def test_join_still_works():
     db.execute("INSERT INTO a VALUES (1, 'foo')")
     db.execute("INSERT INTO b VALUES (1, 'bar')")
     row = db.execute("SELECT a.x, b.y FROM a JOIN b ON a.id = b.id").fetchone()
-    assert row["a.x"] == "foo"
-    assert row["b.y"] == "bar"
+    assert row["x"] == "foo"
+    assert row["y"] == "bar"
 
 
 # ── close ─────────────────────────────────────────────────────────────────────

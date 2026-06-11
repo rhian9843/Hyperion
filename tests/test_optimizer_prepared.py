@@ -73,7 +73,7 @@ def test_left_join_inlj_matched_and_unmatched():
     ).fetchall()
     # User 1 → 2 rows, User 2 → NULL, User 3 → 1 row, User 4 → NULL
     assert len(rows) == 5
-    null_rows = [r for r in rows if r["o.amount"] is None]
+    null_rows = [r for r in rows if r["amount"] is None]
     assert len(null_rows) == 2
 
 
@@ -86,7 +86,7 @@ def test_left_join_inlj_all_unmatched():
         db.execute("INSERT INTO a VALUES (?)", (i,))
     rows = db.execute("SELECT a.id, b.val FROM a LEFT JOIN b ON a.id = b.a_id").fetchall()
     assert len(rows) == 3
-    assert all(r["b.val"] is None for r in rows)
+    assert all(r["val"] is None for r in rows)
 
 
 def test_left_join_null_key_produces_null_row():
@@ -98,7 +98,7 @@ def test_left_join_null_key_produces_null_row():
     db.execute("INSERT INTO b VALUES (1, 'x')")
     rows = db.execute("SELECT a.id, b.name FROM a LEFT JOIN b ON a.fk = b.id").fetchall()
     assert len(rows) == 1
-    assert rows[0]["b.name"] is None
+    assert rows[0]["name"] is None
 
 
 def test_outer_join_with_inner_extras_reordered():
@@ -120,7 +120,7 @@ def test_outer_join_with_inner_extras_reordered():
     ).fetchall()
     # Only a.id=1 and a.id=2 are in both b and c
     assert len(rows) == 3
-    vals = [r["c.val"] for r in rows]
+    vals = [r["val"] for r in rows]
     assert vals == [10, 20, 30]
 
 

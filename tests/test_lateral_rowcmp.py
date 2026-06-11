@@ -90,7 +90,7 @@ def test_lateral_basic_comma_form():
         "ORDER BY u.name, o.amount"
     ).fetchall()
     assert len(rows) == 3
-    names = [r["u.name"] for r in rows]
+    names = [r["name"] for r in rows]
     assert names == ["Alice", "Alice", "Bob"]
 
 
@@ -107,7 +107,7 @@ def test_lateral_no_match_rows_excluded():
     ).fetchall()
     # Bob has no orders → no row for Bob (INNER semantics)
     assert len(rows) == 1
-    assert rows[0]["u.name"] == "Alice"
+    assert rows[0]["name"] == "Alice"
 
 
 def test_lateral_with_limit():
@@ -125,7 +125,7 @@ def test_lateral_with_limit():
         "ORDER BY u.name"
     ).fetchall()
     assert len(rows) == 2
-    by_user = {r["u.name"]: r["o.amount"] for r in rows}
+    by_user = {r["name"]: r["amount"] for r in rows}
     assert by_user["Alice"] == 300
     assert by_user["Bob"] == 80
 
@@ -145,7 +145,7 @@ def test_lateral_aggregate():
         "ORDER BY u.name"
     ).fetchall()
     assert len(rows) == 2
-    by_user = {r["u.name"]: r["s.total"] for r in rows}
+    by_user = {r["name"]: r["total"] for r in rows}
     assert by_user["Alice"] == 300
     assert by_user["Bob"] == 50
 
@@ -163,4 +163,4 @@ def test_lateral_join_on_true():
         "ORDER BY u.name, o.amount"
     ).fetchall()
     assert len(rows) == 3
-    assert [r["o.amount"] for r in rows if r["u.name"] == "Alice"] == [10, 20]
+    assert [r["amount"] for r in rows if r["name"] == "Alice"] == [10, 20]
