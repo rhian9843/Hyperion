@@ -409,7 +409,7 @@
   - Compatible clients: `mysql` CLI (`mysql -h 127.0.0.1 -P 4406 -u root --skip-ssl`), `mysql-connector-python`, `PyMySQL`, SQLAlchemy MySQL dialect
 - [x] Web Dashboard — browser UI served at `GET /` by the HTTP server; shows database stats, table list, schema browser, and an interactive SQL query editor; no external JS dependencies (single self-contained HTML page)
 - [x] DSN connection strings — `hyperion://host:port/dbname` format parsed by a `connect_dsn(dsn)` helper; standard format for ORMs and connection pool libraries; dispatches to `Database` for local files / `:memory:`, or `Connection` for remote TCP servers; exported from both `hyperion.client` and the top-level `hyperion` package
-- [ ] Server-side connection pooling — configurable pool size and max queue depth on the TCP server; reuses cursors across requests rather than spawning a new thread per connection; `SHOW PROCESSLIST` lists active connections with current query, user, and elapsed time
+- [x] Server-side connection pooling — configurable pool size and max queue depth on the TCP server; reuses cursors across requests rather than spawning a new thread per connection; `SHOW PROCESSLIST` lists active connections with current query, user, and elapsed time
 
 ### Analytics — Column Store
 

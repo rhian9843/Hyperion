@@ -39,14 +39,20 @@ def _run_server(argv: list[str]) -> None:
     p.add_argument("--port",   default=5433, type=int, help="TCP bind port (default: 5433)")
     p.add_argument("--socket", dest="socket_path", default=None,
                    help="Unix-domain socket path (overrides --host/--port)")
+    p.add_argument("--pool-size", default=10, type=int,
+                   help="Number of worker threads in the connection pool (default: 10)")
+    p.add_argument("--max-queue", default=100, type=int,
+                   help="Max queued connections before rejecting new ones (default: 100)")
     args = p.parse_args(argv)
 
     db = Database(args.database)
     if args.socket_path:
-        srv = Server(db, socket_path=args.socket_path)
+        srv = Server(db, socket_path=args.socket_path,
+                     pool_size=args.pool_size, max_queue=args.max_queue)
         addr = args.socket_path
     else:
-        srv = Server(db, host=args.host, port=args.port)
+        srv = Server(db, host=args.host, port=args.port,
+                     pool_size=args.pool_size, max_queue=args.max_queue)
         addr = f"{args.host}:{args.port}"
 
     print(f"Hyperion TCP server listening on {addr}  (Ctrl-C to stop)")

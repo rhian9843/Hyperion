@@ -20,6 +20,20 @@ Each TCP/Unix connection gets its own Cursor.  The underlying Database and
 its WAL lock are shared, so multi-reader / single-writer semantics are
 preserved across connections.
 
+Connection pooling
+------------------
+The server runs a fixed-size pool of worker threads (``pool_size``, default
+10).  Incoming connections are placed on a bounded queue (``max_queue``,
+default 100).  When the queue is full the server immediately responds with
+a ServerBusyError and closes the socket.
+
+SHOW PROCESSLIST
+----------------
+``SHOW PROCESSLIST`` is intercepted at the server layer and returns one row
+per currently-open connection:
+
+    id | host | command | time | state | info
+
 Usage
 -----
 Programmatic:
@@ -34,25 +48,33 @@ Programmatic:
     srv = Server(db, socket_path="/tmp/hyperion.sock")
     srv.serve_forever()
 
+    # Custom pool:
+    srv = Server(db, port=5433, pool_size=20, max_queue=200)
+
 CLI (via __main__.py):
     python -m hyperion server mydb.hyp --port 5433
     python -m hyperion server mydb.hyp --socket /tmp/hyperion.sock
+    python -m hyperion server mydb.hyp --pool-size 20 --max-queue 200
 """
 from __future__ import annotations
 
 import base64
+import itertools
 import json
 import os
+import queue
 import socket
-import socketserver
 import struct
 import threading
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .database import Database
 
 _HDR = struct.Struct("!I")   # 4-byte big-endian unsigned int (message length)
+
+_PL_COLS = ["id", "host", "command", "time", "state", "info"]
 
 
 def _json_default(obj):
@@ -131,44 +153,195 @@ def _handle_request(cur, req: dict) -> dict:
         }
 
 
-class _ConnectionHandler(socketserver.BaseRequestHandler):
-    """Handle one client connection for the duration of its lifetime.
+class _ConnInfo:
+    """Mutable snapshot of one active connection (used for SHOW PROCESSLIST)."""
+    __slots__ = ("id", "host", "command", "started", "state")
 
-    One Cursor is created per connection and reused for every request,
-    preserving transaction state across round-trips.
+    def __init__(self, conn_id: int, host: str) -> None:
+        self.id      = conn_id
+        self.host    = host
+        self.command = ""
+        self.started = time.monotonic()
+        self.state   = "idle"
+
+
+class _PooledServer:
+    """Fixed-size worker-thread pool for Hyperion connections.
+
+    Accepts connections on a listening socket and dispatches them to a
+    bounded queue.  A fixed number of worker threads drain the queue.
+    When the queue is full an immediate error response is returned.
     """
 
-    def handle(self) -> None:
-        db: "Database" = self.server.hyperion_db  # type: ignore[attr-defined]
-        cur  = db.cursor()   # one cursor per connection — preserves txn state
-        sock: socket.socket = self.request
+    def __init__(self, db: "Database", *,
+                 host: str = "127.0.0.1",
+                 port: int = 5433,
+                 socket_path: str | None = None,
+                 pool_size: int = 10,
+                 max_queue: int = 100) -> None:
+        self._db           = db
+        self._pool_size    = pool_size
+        self._shutdown     = threading.Event()
+        self._queue: queue.Queue = queue.Queue(maxsize=max_queue)
+        self._processlist: dict[int, _ConnInfo] = {}
+        self._pl_lock      = threading.Lock()
+        self._id_counter   = itertools.count(1)
+        self._socket_path  = socket_path
+
+        # Bind the listening socket
+        if socket_path:
+            if os.path.exists(socket_path):
+                os.unlink(socket_path)
+            self._sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self._sock.bind(socket_path)
+        else:
+            self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            self._sock.bind((host, port))
+        self._sock.listen(pool_size)
+        self.server_address = self._sock.getsockname()
+
+        # Start the fixed worker pool
+        self._workers: list[threading.Thread] = []
+        for _ in range(pool_size):
+            t = threading.Thread(target=self._worker, daemon=True)
+            t.start()
+            self._workers.append(t)
+
+    # ── Accept loop ──────────────────────────────────────────────────────────
+
+    def serve_forever(self) -> None:
+        self._sock.settimeout(1.0)
+        while not self._shutdown.is_set():
+            try:
+                conn, addr = self._sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            try:
+                self._queue.put_nowait((conn, addr))
+            except queue.Full:
+                try:
+                    _send(conn, {
+                        "status":     "error",
+                        "error_type": "ServerBusyError",
+                        "message":    (
+                            f"Server busy: connection queue full "
+                            f"(max_queue={self._queue.maxsize})"
+                        ),
+                    })
+                except OSError:
+                    pass
+                finally:
+                    conn.close()
+
+    # ── Worker threads ────────────────────────────────────────────────────────
+
+    def _worker(self) -> None:
+        while not self._shutdown.is_set():
+            try:
+                item = self._queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            if item is None:          # poison pill from shutdown()
+                self._queue.task_done()
+                break
+            conn, addr = item
+            try:
+                self._handle_conn(conn, addr)
+            finally:
+                self._queue.task_done()
+
+    def _handle_conn(self, conn: socket.socket, addr) -> None:
+        conn_id = next(self._id_counter)
+        host    = addr[0] if isinstance(addr, tuple) else (str(addr) or "unix")
+        info    = _ConnInfo(conn_id, host)
+        cur     = self._db.cursor()
+
+        with self._pl_lock:
+            self._processlist[conn_id] = info
+
         try:
             while True:
-                req = _recv(sock)
+                req = _recv(conn)
                 if req is None:
                     break
-                resp = _handle_request(cur, req)
-                _send(sock, resp)
+                sql = (req.get("sql") or "").strip()
+                if sql.upper().startswith("SHOW PROCESSLIST"):
+                    resp = self._processlist_resp()
+                else:
+                    with self._pl_lock:
+                        info.command = sql
+                        info.started = time.monotonic()
+                        info.state   = "active"
+                    resp = _handle_request(cur, req)
+                    with self._pl_lock:
+                        info.command = ""
+                        info.started = time.monotonic()
+                        info.state   = "idle"
+                _send(conn, resp)
         except (ConnectionResetError, BrokenPipeError, OSError):
             pass
+        finally:
+            with self._pl_lock:
+                self._processlist.pop(conn_id, None)
+            try:
+                conn.close()
+            except OSError:
+                pass
 
+    # ── SHOW PROCESSLIST ──────────────────────────────────────────────────────
 
-class _ThreadingUnixServer(socketserver.ThreadingMixIn, socketserver.UnixStreamServer):
-    daemon_threads = True
-    allow_reuse_address = True
+    def _processlist_resp(self) -> dict:
+        now = time.monotonic()
+        with self._pl_lock:
+            rows = [
+                {
+                    "id":      info.id,
+                    "host":    info.host,
+                    "command": info.state.upper(),
+                    "time":    round(now - info.started, 3),
+                    "state":   info.state,
+                    "info":    info.command or None,
+                }
+                for info in self._processlist.values()
+            ]
+        return {
+            "status":      "ok",
+            "rows":        rows,
+            "rowcount":    len(rows),
+            "lastrowid":   None,
+            "description": [{"name": c, "type_code": None} for c in _PL_COLS],
+        }
 
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
 
-class _ThreadingTCPServer(socketserver.ThreadingMixIn, socketserver.TCPServer):
-    daemon_threads = True
-    allow_reuse_address = True
+    def shutdown(self) -> None:
+        self._shutdown.set()
+        # Unblock workers with poison pills
+        for _ in self._workers:
+            try:
+                self._queue.put_nowait(None)
+            except queue.Full:
+                pass
+        try:
+            self._sock.close()
+        except OSError:
+            pass
+        if self._socket_path:
+            try:
+                os.unlink(self._socket_path)
+            except OSError:
+                pass
 
 
 class Server:
     """Hyperion database server.
 
-    Binds a TCP port or a Unix-domain socket and dispatches each incoming
-    connection to a dedicated thread.  Thread safety is provided by the
-    Database's internal RWLock — no extra locking is needed here.
+    Binds a TCP port or a Unix-domain socket and dispatches incoming
+    connections to a fixed-size worker thread pool.  Thread safety is
+    provided by the Database's internal RWLock.
 
     Parameters
     ----------
@@ -177,38 +350,41 @@ class Server:
     port        : TCP port to bind (ignored when socket_path is set).
     socket_path : Path to a Unix-domain socket file.  Takes priority over
                   host/port when set.
+    pool_size   : Number of worker threads (default 10).
+    max_queue   : Maximum pending connections before rejecting (default 100).
     """
 
     def __init__(self, db: "Database", *,
                  host: str = "127.0.0.1",
                  port: int = 5433,
-                 socket_path: str | None = None) -> None:
-        self._db = db
-        if socket_path:
-            if os.path.exists(socket_path):
-                os.unlink(socket_path)
-            self._server: socketserver.BaseServer = _ThreadingUnixServer(
-                socket_path, _ConnectionHandler)
-        else:
-            self._server = _ThreadingTCPServer((host, port), _ConnectionHandler)
-        self._server.hyperion_db = db  # type: ignore[attr-defined]
+                 socket_path: str | None = None,
+                 pool_size: int = 10,
+                 max_queue: int = 100) -> None:
+        self._db   = db
+        self._pool = _PooledServer(
+            db,
+            host=host,
+            port=port,
+            socket_path=socket_path,
+            pool_size=pool_size,
+            max_queue=max_queue,
+        )
 
     @property
     def address(self) -> tuple | str:
         """Bound address — (host, port) for TCP or socket path for Unix."""
-        return self._server.server_address
+        return self._pool.server_address
 
     def serve_forever(self) -> None:
         """Block and serve until shutdown() is called from another thread."""
-        self._server.serve_forever()
+        self._pool.serve_forever()
 
     def start(self) -> threading.Thread:
         """Start serving in a background daemon thread and return it."""
-        t = threading.Thread(target=self._server.serve_forever, daemon=True)
+        t = threading.Thread(target=self._pool.serve_forever, daemon=True)
         t.start()
         return t
 
     def shutdown(self) -> None:
-        """Stop accepting new connections and close the server socket."""
-        self._server.shutdown()
-        self._server.server_close()
+        """Stop accepting new connections and signal workers to exit."""
+        self._pool.shutdown()
