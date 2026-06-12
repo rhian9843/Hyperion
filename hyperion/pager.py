@@ -48,7 +48,7 @@ class Pager:
             # will handle it on its own close/checkpoint.
             _ex_acquired = _flock_try_ex(self._file.fileno())
             if _ex_acquired:
-                WAL.replay_if_exists(wal_path, self._file)
+                self._recovery_logical = WAL.replay_if_exists(wal_path, self._file)
             # _flock(LOCK_SH) is blocking: we wait here until any active writer
             # releases LOCK_EX.
             _flock(self._file.fileno(), 1)   # LOCK_SH — hold while open
@@ -61,6 +61,8 @@ class Pager:
         self._write_tid:      int | None = None   # thread-id that owns the write txn
         self._wal_txn_offset: int = 0             # WAL offset at transaction start
         self._wal_applied_offset: int = WAL.HDR_SIZE  # WAL tail already in _cache
+        # Logical entries recovered from the WAL on startup — drained by Database.__init__
+        self._recovery_logical: list[dict] = []
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -128,6 +130,8 @@ class Pager:
                 for ppn, data in pending:
                     self._cache[ppn] = data
                 pending.clear()
+            elif pn == WAL.LOGICAL_PN:
+                pass  # logical frames don't go into the page cache
             else:
                 pending.append((pn, bytearray(frame[4:])))
         self._wal_applied_offset = read_pos  # last complete frame boundary
@@ -154,7 +158,14 @@ class Pager:
         self._in_txn  = True
         self._write_tid = threading.get_ident()
 
-    def commit(self) -> None:
+    def commit(self, min_consumed_lsn: int = 0) -> None:
+        """Commit the current transaction.
+
+        If the WAL has accumulated CHECKPOINT_PAGES dirty pages, a checkpoint
+        is triggered: all committed PAGE frames are applied to the db file, and
+        only LOGICAL frames with lsn > min_consumed_lsn are retained in the WAL.
+        The WAL is then rewritten compactly (no archive file needed).
+        """
         if not self._in_txn:
             raise TransactionError("No active transaction")
         assert self._wal is not None
@@ -166,16 +177,11 @@ class Pager:
         self._dirty.clear()
         self._in_txn    = False
         self._write_tid = None
-        # Lazy checkpoint: only flush WAL frames to the main file once the
-        # accumulated dirty-page count reaches CHECKPOINT_PAGES.  The WAL's
-        # own fsync (inside commit_txn) already guarantees durability of the
-        # committed transaction.  A full checkpoint always happens in close(),
-        # so no committed data is ever left unreachable.
         if self._wal.needs_checkpoint():
-            self._wal.checkpoint(self._file)
-        # Advance the applied watermark: our pages are already in _cache via
-        # _cache.update(_working), so the next begin() must not re-apply them.
-        # After a checkpoint begin_offset() returns HDR_SIZE (WAL truncated).
+            self._wal.checkpoint(self._file, min_consumed_lsn)
+        # Advance the applied watermark so the next begin() skips already-cached
+        # pages.  After a checkpoint, begin_offset() returns the end of the
+        # compacted WAL (HDR_SIZE + retained logical frames).
         self._wal_applied_offset = self._wal.begin_offset()
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
 
@@ -190,19 +196,27 @@ class Pager:
         self._write_tid = None
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after abort
 
-    def close(self) -> None:
+    def close(self, min_consumed_lsn: int = 0) -> None:
+        """Flush and close the database file.
+
+        Performs a final checkpoint: PAGE frames are applied to the db file, and
+        LOGICAL frames with lsn > min_consumed_lsn are retained in the WAL for
+        future subscribers.  If the WAL is empty after the checkpoint (no retained
+        logical frames), the WAL file is deleted.  Otherwise it is kept so that
+        replay_if_exists can recover the retained entries on next open.
+        """
         if self._in_txn and self._wal is not None:
             self._wal.rollback_txn(self._wal_txn_offset)
             self._in_txn = False
         if self._wal is not None:
-            # Final checkpoint: flush accumulated WAL frames to main file.
             _flock(self._file.fileno(), 2)   # LOCK_EX briefly for checkpoint
-            self._wal.checkpoint(self._file)
+            self._wal.checkpoint(self._file, min_consumed_lsn)
             self._wal.close()
             self._wal = None
-            # WAL file was truncated to header by checkpoint; remove it.
             wal_path = self._path.with_suffix(".wal")
-            wal_path.unlink(missing_ok=True)
+            # Keep WAL only if there are retained logical frames (size > header).
+            if wal_path.exists() and wal_path.stat().st_size <= WAL.HDR_SIZE:
+                wal_path.unlink(missing_ok=True)
         self._file.flush()
         _flock(self._file.fileno(), 8)   # LOCK_UN
         self._file.close()
@@ -270,7 +284,7 @@ class MemoryPager:
         self._in_txn    = True
         self._write_tid = threading.get_ident()
 
-    def commit(self) -> None:
+    def commit(self, min_consumed_lsn: int = 0) -> None:
         if not self._in_txn:
             raise TransactionError("No active transaction")
         self._cache.update(self._working)
@@ -288,5 +302,5 @@ class MemoryPager:
         self._in_txn    = False
         self._write_tid = None
 
-    def close(self) -> None:
-        pass
+    def close(self, min_consumed_lsn: int = 0) -> None:
+        pass  # no WAL, nothing to flush

@@ -8,6 +8,20 @@ from .schema import Schema
 
 
 @dataclass
+class PublicationMeta:
+    name:   str
+    tables: list[str]   # empty list = FOR ALL TABLES
+
+
+@dataclass
+class SubscriptionMeta:
+    name:        str
+    connection:  str    # 'http://host:port'
+    publication: str    # publication name on primary
+    last_lsn:    int = 0
+
+
+@dataclass
 class TriggerMeta:
     table:       str
     timing:      str        # "BEFORE" or "AFTER"
@@ -53,6 +67,9 @@ class Catalog:
     # meta[object_type][object_name][key] = value
     # e.g. meta["table"]["users"]["description"] = "User account records"
     meta:           dict[str, dict]           = field(default_factory=dict)
+    publications:   dict[str, PublicationMeta]  = field(default_factory=dict)
+    subscriptions:  dict[str, SubscriptionMeta] = field(default_factory=dict)
+    lsn:            int                         = 0   # advances on each published DML commit
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
     # Pre-computed JSON fragments per table/index so ops_to_bytes() only
@@ -117,6 +134,10 @@ class Catalog:
                 for n, m in self.triggers.items()
             },
             "meta": self.meta,
+            "publications": {
+                n: {"tables": p.tables}
+                for n, p in self.publications.items()
+            },
         }).encode()
 
     def ops_to_bytes(self) -> bytes:
@@ -151,14 +172,15 @@ class Catalog:
                 )
         self._ops_dirty_indexes.clear()
 
-        # Re-encode global state only when next_free_page / free_pages changed
+        # Re-encode global state only when next_free_page / free_pages / lsn changed
         if self._ops_global_dirty:
             fp_bin = (struct.pack(f'>{len(self.free_pages)}I', *self.free_pages)
                       if self.free_pages else b'')
             fp_b64 = base64.b64encode(fp_bin).decode()
             self._ops_global_snippet = (
                 f'"next_free_page":{self.next_free_page},'
-                f'"free_pages_b64":"{fp_b64}"'
+                f'"free_pages_b64":"{fp_b64}",'
+                f'"lsn":{self.lsn}'
             )
             self._ops_global_dirty = False
 
@@ -169,9 +191,15 @@ class Catalog:
 
         table_part = ",".join(self._t_snippets.values())
         index_part = ",".join(self._i_snippets.values())
+        subs_json = json.dumps({
+            n: {"connection": s.connection, "publication": s.publication,
+                "last_lsn": s.last_lsn}
+            for n, s in self.subscriptions.items()
+        })
         return (
             f'{{{self._ops_global_snippet},'
             f'"stats":{self._stats_snippet},'
+            f'"subscriptions":{subs_json},'
             f'"table_ops":{{{table_part}}},'
             f'"index_ops":{{{index_part}}}}}'
         ).encode()
@@ -199,17 +227,25 @@ class Catalog:
             "vws":  dict(self.views),
             "trgs": dict(self.triggers),
             "meta": {k: dict(v) for k, v in self.meta.items()},
+            "pubs": {n: PublicationMeta(n, list(p.tables))
+                     for n, p in self.publications.items()},
+            "subs": {n: SubscriptionMeta(n, s.connection, s.publication, s.last_lsn)
+                     for n, s in self.subscriptions.items()},
+            "lsn":  self.lsn,
         }
 
     def restore_snap(self, snap: dict) -> None:
         """Restore this catalog in-place to a previously taken snap()."""
         self.next_free_page = snap["nfp"]
         self.free_pages     = snap["fp"]
-        self.tables.clear();   self.tables.update(snap["tbls"])
-        self.indexes.clear();  self.indexes.update(snap["idxs"])
-        self.views.clear();    self.views.update(snap["vws"])
-        self.triggers.clear(); self.triggers.update(snap["trgs"])
-        self.meta.clear();     self.meta.update(snap["meta"])
+        self.tables.clear();        self.tables.update(snap["tbls"])
+        self.indexes.clear();       self.indexes.update(snap["idxs"])
+        self.views.clear();         self.views.update(snap["vws"])
+        self.triggers.clear();      self.triggers.update(snap["trgs"])
+        self.meta.clear();          self.meta.update(snap["meta"])
+        self.publications.clear();  self.publications.update(snap.get("pubs", {}))
+        self.subscriptions.clear(); self.subscriptions.update(snap.get("subs", {}))
+        self.lsn = snap.get("lsn", self.lsn)
         # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
         self._t_snippets.clear()
         self._i_snippets.clear()
@@ -305,6 +341,16 @@ class Catalog:
         else:
             free_pages = d_o.get("free_pages", [])
 
+        publications = {
+            n: PublicationMeta(n, p.get("tables", []))
+            for n, p in d_s.get("publications", {}).items()
+        }
+        subscriptions = {
+            n: SubscriptionMeta(n, s["connection"], s["publication"],
+                                s.get("last_lsn", 0))
+            for n, s in d_o.get("subscriptions", {}).items()
+        }
+
         cat = cls(
             tables=tables,
             indexes=indexes,
@@ -314,6 +360,9 @@ class Catalog:
             stats=stats,
             triggers=triggers,
             meta=d_s.get("meta", {}),
+            publications=publications,
+            subscriptions=subscriptions,
+            lsn=d_o.get("lsn", 0),
         )
         # Initialise snippet cache and mark stats clean so the first ops flush
         # doesn't re-serialise unchanged stats.

@@ -382,6 +382,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(*self._get_indexes())
         elif path == "/health":
             self._send(*self._get_health())
+        elif path == "/replication/changes":
+            self._send(*self._get_replication_changes())
         else:
             self._send(*_not_found(f"No route for GET {self.path}"))
 
@@ -497,6 +499,21 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             self._db.execute("ANALYZE")
             return _ok({})
+        except Exception as exc:
+            return _err(exc, 500)
+
+    def _get_replication_changes(self) -> tuple[int, dict]:
+        try:
+            qs     = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+            pub_name  = params.get("publication", "")
+            since_lsn = int(params.get("since", "0"))
+            if pub_name not in self._db._catalog.publications:
+                return _not_found(f"No such publication: '{pub_name}'")
+            pub     = self._db._catalog.publications[pub_name]
+            changes = self._db.changelog.read_for_publication(pub.tables, since_lsn)
+            return _ok({"changes": [e.to_dict() for e in changes],
+                        "lsn": self._db._catalog.lsn})
         except Exception as exc:
             return _err(exc, 500)
 

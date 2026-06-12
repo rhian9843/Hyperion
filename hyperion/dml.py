@@ -92,6 +92,7 @@ class DMLMixin:
                 self._index_btree(idx_meta).insert(
                     _make_index_key(_encode_composite_key(vals, col_types), rowid),
                     struct.pack("q", rowid))
+        self._append_changelog(table, "INSERT", row)
         return row
 
     def update(self, table: str, assignments: dict[str, str],
@@ -106,6 +107,7 @@ class DMLMixin:
         updates_row:  dict[int, bytes] = {}  # for row store
         idx_ops:      list[tuple]      = []
         updated_rows: list[dict]       = []
+        _chg_log:     list[tuple]      = []  # (old_row, new_row) for changelog
 
         old_overflow: list[int] = []
         count = 0
@@ -165,6 +167,7 @@ class DMLMixin:
                 if self._cell_is_overflow(raw):
                     old_overflow.append(struct.unpack_from("I", raw, 5)[0])
                 updates_row[rowid] = self._pack_row_cell(serialize_row(schema, new_row))
+            _chg_log.append((dict(row), new_row))
             updated_rows.append(new_row)
             count += 1
             for im in idxs:
@@ -194,6 +197,8 @@ class DMLMixin:
                 itree.delete({old_k})
             if new_k is not None:
                 itree.insert(new_k, struct.pack("q", rowid))
+        for old_row, new_row in _chg_log:
+            self._append_changelog(table, "UPDATE", new_row, row_before=old_row)
         return updated_rows
 
     def delete(self, table: str, where: "WhereClause | None",
@@ -247,4 +252,6 @@ class DMLMixin:
                     idx_keys.add(
                         _make_index_key(_encode_composite_key(vals, col_types), rowid))
             itree.delete(idx_keys)
+        for _, row in victims:
+            self._append_changelog(table, "DELETE", row)
         return [row for _, row in victims]

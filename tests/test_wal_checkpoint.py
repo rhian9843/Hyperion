@@ -341,14 +341,14 @@ def test_catalog_flushed_bytes_reset_on_rollback():
 
 # ── WAL unit tests ────────────────────────────────────────────────────────────
 
-def test_wal_version_2_format(tmp_path):
+def test_wal_version_3_format(tmp_path):
     wal_path = tmp_path / "test.wal"
     w = WAL(wal_path)
     assert wal_path.exists()
     with open(wal_path, "rb") as f:
         hdr = f.read(WAL.HDR_SIZE)
     assert hdr[:4] == WAL.MAGIC
-    assert struct.unpack_from("<I", hdr, 4)[0] == 2
+    assert struct.unpack_from("<I", hdr, 4)[0] == 3
     w.close()
 
 
@@ -734,3 +734,141 @@ def test_multi_txn_wal_catchup_sees_all_commits(tmp_path):
     )
     assert ids_after_t3 == [1, 2, 3], \
         f"A missed B's Transaction 3: got {ids_after_t3!r}"
+
+
+# ── WAL logical-frame tests ───────────────────────────────────────────────────
+
+def test_logical_frame_written_to_wal(tmp_path):
+    """LOGICAL_PN frames appear in the WAL file after DML on a published table."""
+    db_path = tmp_path / "test.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("CREATE PUBLICATION pub FOR TABLE t")
+    db.execute("INSERT INTO t VALUES (1, 'hello')")
+
+    wal_path = db_path.with_suffix(".wal")
+    assert wal_path.exists()
+    logical_count = 0
+    with open(wal_path, "rb") as f:
+        f.read(WAL.HDR_SIZE)
+        while True:
+            frame = f.read(WAL.FRAME_SZ)
+            if len(frame) < WAL.FRAME_SZ:
+                break
+            pn = struct.unpack_from("<I", frame)[0]
+            if pn == WAL.LOGICAL_PN:
+                logical_count += 1
+    assert logical_count == 1, f"Expected 1 LOGICAL frame, got {logical_count}"
+    db.close()
+
+
+def test_logical_frames_retained_after_checkpoint(tmp_path):
+    """After checkpoint, LOGICAL frames survive in the WAL (no .changelog file).
+
+    The WAL checkpoint rewrites the WAL retaining only unconsumed LOGICAL frames
+    (lsn > min(subscriber.last_lsn)).  With one subscriber at last_lsn=0 all
+    frames are retained — they must be readable via db.changelog after checkpoint.
+    """
+    db_path = tmp_path / "test.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("CREATE PUBLICATION pub FOR TABLE t")
+    # A subscriber at last_lsn=0 means min_consumed=0 → all entries retained.
+    db.execute("CREATE SUBSCRIPTION sub CONNECTION 'http://localhost:9999' PUBLICATION pub")
+
+    # Force enough writes to trigger at least one checkpoint (CHECKPOINT_PAGES = 64).
+    for i in range(200):
+        db.execute(f"INSERT INTO t VALUES ({i}, 'x')")
+
+    # No .changelog file should exist — WAL is the only replication log.
+    assert not db_path.with_suffix(".changelog").exists(), \
+        ".changelog file must not be created in the WAL-backed design"
+
+    # All 200 INSERT entries must still be readable via the changelog.
+    entries = db.changelog.read_since(0)
+    assert len(entries) == 200, \
+        f"Expected 200 retained logical entries, got {len(entries)}"
+    db.close()
+
+
+def test_logical_frames_in_inflight_before_checkpoint(tmp_path):
+    """Before checkpoint, LOGICAL frames are visible via the in-memory buffer."""
+    db_path = tmp_path / "test.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("CREATE PUBLICATION pub FOR TABLE t")
+    db.execute("INSERT INTO t VALUES (1, 'a')")
+    db.execute("INSERT INTO t VALUES (2, 'b')")
+
+    # No checkpoint yet — should see entries via in-flight buffer
+    entries = db.changelog.read_since(0)
+    assert len(entries) == 2
+    assert entries[0].op == "INSERT"
+    assert {e.lsn for e in entries} == {1, 2}
+    db.close()
+
+
+def test_logical_frames_survive_crash_recovery(tmp_path):
+    """LOGICAL frames committed to the WAL are recovered after simulated crash."""
+    import json as _json
+    db_path  = tmp_path / "test.hdb"
+    arch_path = db_path.with_suffix(".changelog")
+    wal_path  = db_path.with_suffix(".wal")
+
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("CREATE PUBLICATION pub FOR TABLE t")
+    db.execute("INSERT INTO t VALUES (1, 'crash_me')")
+    # Close WITHOUT checkpoint — simulate the pager's commit path but leave WAL
+    # with logical frames by calling the wal commit directly.
+    db._pager._wal.commit_txn({})   # empty extra commit to make WAL non-empty
+    db._pager._wal._file.flush()
+    db._pager._wal.close()
+    db._pager._wal = None
+    # Leave WAL on disk (don't call db.close() normally)
+    db._pager._file.close()
+
+    # Simulate reopening after crash — replay_if_exists should extract logical frames
+    with open(db_path, "r+b") as dbf:
+        logical = WAL.replay_if_exists(wal_path, dbf)
+    assert len(logical) >= 1
+    assert any(e.get("table") == "t" for e in logical)
+
+
+def test_no_logical_frame_for_unpublished_table(tmp_path):
+    """DML on a table with no publication produces no LOGICAL frames."""
+    db_path = tmp_path / "test.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    # No publication
+    db.execute("INSERT INTO t VALUES (1, 'x')")
+
+    wal_path = db_path.with_suffix(".wal")
+    logical_count = 0
+    if wal_path.exists():
+        with open(wal_path, "rb") as f:
+            f.read(WAL.HDR_SIZE)
+            while True:
+                frame = f.read(WAL.FRAME_SZ)
+                if len(frame) < WAL.FRAME_SZ:
+                    break
+                if struct.unpack_from("<I", frame)[0] == WAL.LOGICAL_PN:
+                    logical_count += 1
+    assert logical_count == 0
+    db.close()
+
+
+def test_rollback_discards_staged_logical_frames(tmp_path):
+    """Rolling back a transaction discards staged LOGICAL frames."""
+    db_path = tmp_path / "test.hdb"
+    db = Database(db_path)
+    db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+    db.execute("CREATE PUBLICATION pub FOR TABLE t")
+
+    db.begin()
+    db.execute("INSERT INTO t VALUES (1, 'rolled_back')")
+    db.rollback()
+
+    entries = db.changelog.read_since(0)
+    assert entries == [], f"Expected no entries after rollback, got {entries}"
+    db.close()

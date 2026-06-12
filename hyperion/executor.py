@@ -88,6 +88,8 @@ _WRITE_OPS = frozenset({
     "INSERT", "INSERT_SELECT", "UPDATE", "DELETE", "TRUNCATE",
     "CREATE_TABLE", "CREATE_TABLE_AS_SELECT", "DROP_TABLE",
     "CREATE_COLUMN_TABLE",
+    "CREATE_PUBLICATION", "DROP_PUBLICATION",
+    "CREATE_SUBSCRIPTION", "DROP_SUBSCRIPTION",
     "CREATE_INDEX", "DROP_INDEX",
     "CREATE_VIEW", "DROP_VIEW",
     "CREATE_TRIGGER", "DROP_TRIGGER",
@@ -1799,6 +1801,50 @@ def _exec_delete(stmt: dict, db: Database) -> str:
     return f"{n} row{'s' if n != 1 else ''} deleted."
 
 
+def _exec_create_publication(stmt: dict, db: Database) -> str:
+    name   = stmt["name"]
+    tables = stmt.get("tables", [])
+    db.create_publication(name, tables)
+    desc = "FOR ALL TABLES" if not tables else f"FOR TABLE {', '.join(tables)}"
+    return f"Publication '{name}' created ({desc})."
+
+
+def _exec_drop_publication(stmt: dict, db: Database) -> str:
+    db.drop_publication(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"Publication '{stmt['name']}' dropped."
+
+
+def _exec_create_subscription(stmt: dict, db: Database) -> str:
+    name   = stmt["name"]
+    conn   = stmt["connection"]
+    pub    = stmt["publication"]
+    db.create_subscription(name, conn, pub)
+    return f"Subscription '{name}' created (connecting to '{conn}', publication '{pub}')."
+
+
+def _exec_drop_subscription(stmt: dict, db: Database) -> str:
+    db.drop_subscription(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"Subscription '{stmt['name']}' dropped."
+
+
+def _exec_show_publications(stmt: dict, db: Database) -> RowResult:
+    rows = [
+        {"name": p.name,
+         "tables": ", ".join(p.tables) if p.tables else "(all tables)"}
+        for p in db._catalog.publications.values()
+    ]
+    return RowResult(rows, ["name", "tables"])
+
+
+def _exec_show_subscriptions(stmt: dict, db: Database) -> RowResult:
+    rows = [
+        {"name": s.name, "connection": s.connection,
+         "publication": s.publication, "last_lsn": s.last_lsn}
+        for s in db._catalog.subscriptions.values()
+    ]
+    return RowResult(rows, ["name", "connection", "publication", "last_lsn"])
+
+
 _DISPATCH: dict[str, Any] = {
     "ANALYZE":                  _execute_analyze,
     "CREATE_TABLE_AS_SELECT":   _exec_create_table_as_select,
@@ -1817,6 +1863,12 @@ _DISPATCH: dict[str, Any] = {
     "DROP_INDEX":               _exec_drop_index,
     "CREATE_TRIGGER":           _exec_create_trigger,
     "DROP_TRIGGER":             _exec_drop_trigger,
+    "CREATE_PUBLICATION":       _exec_create_publication,
+    "DROP_PUBLICATION":         _exec_drop_publication,
+    "CREATE_SUBSCRIPTION":      _exec_create_subscription,
+    "DROP_SUBSCRIPTION":        _exec_drop_subscription,
+    "SHOW_PUBLICATIONS":        _exec_show_publications,
+    "SHOW_SUBSCRIPTIONS":       _exec_show_subscriptions,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

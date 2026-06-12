@@ -12,7 +12,7 @@ from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
-from .catalog import Catalog, TableMeta, IndexMeta
+from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta
 from .pager import Pager, MemoryPager
 from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
@@ -161,6 +161,17 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._txn_start_time: float | None = None  # monotonic time when BEGIN was called
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
+        self._changelog     = None   # lazily-created changelog view
+        self._sub_workers: dict = {}    # sub_name → SubscriptionWorker
+        # Crash recovery: re-stage any logical entries recovered from the WAL back
+        # into a fresh WAL transaction.  This preserves retention (entries with
+        # lsn > min_consumed_lsn survive subsequent checkpoints) without needing
+        # a separate archive file.
+        if not isinstance(self._pager, MemoryPager) and self._pager._recovery_logical:
+            self._restage_recovery_logical()
+        # Restart subscription workers for any subscriptions already in catalog
+        for sub_name in list(self._catalog.subscriptions):
+            self._start_sub_worker(sub_name)
 
     def _exec_stmt_with_ctes(self, stmt: dict, ctes: dict) -> list[dict]:
         from .executor import _rows_for_stmt
@@ -219,7 +230,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if self._txn_depth == 0:
                 raise TransactionError("No active transaction")
             self._flush_catalog()
-            self._pager.commit()
+            self._pager.commit(min_consumed_lsn=self._min_consumed_lsn())
             self._txn_depth = 0
             self._txn_start_time = None
         if self._for_update_held:
@@ -957,7 +968,149 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 raise NoSuchTableError(f"No such view: '{name}'")
             del self._catalog.views[name]
 
+    # ── Logical replication ───────────────────────────────────────────────────
+
+    @property
+    def changelog(self):
+        """Changelog view backed by the WAL (on-disk) or an in-memory log (:memory:).
+
+        On-disk: WALBackedChangelog reads WAL._committed_logical — the single
+        in-memory mirror of all retained LOGICAL frames.  No archive file exists.
+        In-memory: InMemoryChangelog used by tests and the HTTP test suite.
+        """
+        if self._changelog is None:
+            if isinstance(self._pager, MemoryPager):
+                from .changelog import InMemoryChangelog
+                self._changelog = InMemoryChangelog()
+            else:
+                from .changelog import WALBackedChangelog
+                self._changelog = WALBackedChangelog(self._pager)
+        return self._changelog
+
+    def _is_published(self, table: str) -> bool:
+        """True if table is covered by at least one publication."""
+        for pub in self._catalog.publications.values():
+            if not pub.tables or table in pub.tables:
+                return True
+        return False
+
+    def _append_changelog(self, table: str, op: str, row: dict,
+                           row_before: dict | None = None) -> None:
+        """Record a DML event for logical replication if the table is published.
+
+        For on-disk databases the record is staged into the WAL and committed
+        atomically with the page writes — no separate I/O or crash window.
+        For :memory: databases (no WAL) it is appended directly to the in-memory
+        changelog.
+        """
+        if not self._catalog.publications:
+            return
+        if not self._is_published(table):
+            return
+        import time as _t
+        from .changelog import ChangelogEntry
+        self._catalog.lsn += 1
+        self._catalog.mark_global_ops_dirty()
+        entry = ChangelogEntry(
+            lsn=self._catalog.lsn, table=table, op=op,
+            row=row, row_before=row_before, ts=_t.time(),
+        )
+        if isinstance(self._pager, MemoryPager):
+            self.changelog.append(entry)
+        else:
+            # Stage in WAL — written atomically with page frames on commit.
+            if self._pager._wal is not None:
+                self._pager._wal.stage_logical(entry.to_dict())
+
+    def _min_consumed_lsn(self) -> int:
+        """Minimum LSN that has been confirmed by all active subscribers.
+
+        Passed to pager.commit/close so the WAL checkpoint knows how far back
+        to retain LOGICAL frames.  Returns catalog.lsn (i.e. retain nothing)
+        when there are no subscriptions — no subscriber means no retention needed.
+        """
+        subs = self._catalog.subscriptions
+        if not subs:
+            return self._catalog.lsn
+        return min(s.last_lsn for s in subs.values())
+
+    def _restage_recovery_logical(self) -> None:
+        """Re-stage recovered logical entries into a fresh WAL after crash recovery.
+
+        replay_if_exists extracts LOGICAL frames from a crash-surviving WAL,
+        applies PAGE frames to the db file, and deletes the WAL.  The recovered
+        logical entries live in pager._recovery_logical.  We re-stage them by
+        opening a WAL transaction, staging each entry, and committing with no
+        page changes — so they appear in _committed_logical and survive the next
+        checkpoint at the appropriate min_consumed_lsn.
+        """
+        entries = self._pager._recovery_logical
+        if not entries:
+            return
+        self._pager.begin()
+        for entry in entries:
+            self._pager._wal.stage_logical(entry)
+        self._pager.commit(min_consumed_lsn=self._min_consumed_lsn())
+        self._pager._recovery_logical = []
+
+    def create_publication(self, name: str, tables: list[str],
+                           if_not_exists: bool = False) -> None:
+        with self._lock.write():
+            if name in self._catalog.publications:
+                if if_not_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"Publication '{name}' already exists")
+            self._catalog.publications[name] = PublicationMeta(name, list(tables))
+
+    def drop_publication(self, name: str, if_exists: bool = False) -> None:
+        with self._lock.write():
+            if name not in self._catalog.publications:
+                if if_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"No such publication: '{name}'")
+            del self._catalog.publications[name]
+
+    def create_subscription(self, name: str, connection: str,
+                             publication: str,
+                             if_not_exists: bool = False) -> None:
+        with self._lock.write():
+            if name in self._catalog.subscriptions:
+                if if_not_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"Subscription '{name}' already exists")
+            self._catalog.subscriptions[name] = SubscriptionMeta(
+                name, connection, publication)
+        self._start_sub_worker(name)
+
+    def drop_subscription(self, name: str, if_exists: bool = False) -> None:
+        self._stop_sub_worker(name)
+        with self._lock.write():
+            if name not in self._catalog.subscriptions:
+                if if_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"No such subscription: '{name}'")
+            del self._catalog.subscriptions[name]
+
+    def _start_sub_worker(self, sub_name: str) -> None:
+        if sub_name in self._sub_workers:
+            return
+        from .replication import SubscriptionWorker
+        w = SubscriptionWorker(self, sub_name)
+        self._sub_workers[sub_name] = w
+        w.start()
+
+    def _stop_sub_worker(self, sub_name: str) -> None:
+        w = self._sub_workers.pop(sub_name, None)
+        if w is not None:
+            w.stop()
+
     def close(self) -> None:
+        for name in list(self._sub_workers):
+            self._stop_sub_worker(name)
         with self._lock.write():
             temp_tables = [n for n, m in self._catalog.tables.items() if m.temporary]
             if temp_tables:
@@ -965,7 +1118,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 for name in temp_tables:
                     self.drop_table(name)
                 self.commit()
-            self._pager.close()
+            self._pager.close(min_consumed_lsn=self._min_consumed_lsn())
 
     def vacuum(self) -> str:
         """Rebuild the database file compactly, reclaiming space from deleted rows."""

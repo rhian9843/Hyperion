@@ -1190,7 +1190,60 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_index(t, 3, unique=True)
     if sub == "TRIGGER":
         return _parse_create_trigger(t, 2)
+    if sub == "PUBLICATION":
+        return _parse_create_publication(t, 2)
+    if sub == "SUBSCRIPTION":
+        return _parse_create_subscription(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
+
+
+def _parse_create_publication(t: list[str], i: int) -> dict:
+    if i >= len(t):
+        raise ParseError("Expected publication name after CREATE PUBLICATION")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "FOR":
+        raise ParseError("Expected FOR after publication name")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected TABLE or ALL TABLES after FOR")
+    if t[i].upper() == "ALL":
+        i += 1
+        if i >= len(t) or t[i].upper() != "TABLES":
+            raise ParseError("Expected TABLES after FOR ALL")
+        i += 1
+        return {"op": "CREATE_PUBLICATION", "name": name, "tables": []}
+    if t[i].upper() != "TABLE":
+        raise ParseError("Expected TABLE or ALL TABLES after FOR")
+    i += 1
+    tables: list[str] = []
+    while i < len(t):
+        if t[i] not in (",",):
+            tables.append(t[i])
+        i += 1
+    if not tables:
+        raise ParseError("Expected at least one table name after FOR TABLE")
+    return {"op": "CREATE_PUBLICATION", "name": name, "tables": tables}
+
+
+def _parse_create_subscription(t: list[str], i: int) -> dict:
+    if i >= len(t):
+        raise ParseError("Expected subscription name after CREATE SUBSCRIPTION")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "CONNECTION":
+        raise ParseError("Expected CONNECTION after subscription name")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected connection string after CONNECTION")
+    conn = t[i].strip("'\""); i += 1
+    if i >= len(t) or t[i].upper() != "PUBLICATION":
+        raise ParseError("Expected PUBLICATION after connection string")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected publication name after PUBLICATION")
+    pub = t[i]; i += 1
+    return {"op": "CREATE_SUBSCRIPTION", "name": name,
+            "connection": conn, "publication": pub}
+
 
 
 def _parse_alter(t: list[str]) -> dict:
@@ -1275,7 +1328,25 @@ def _parse_drop(t: list[str]) -> dict:
         if sub == "VIEW":
             return {"op": "DROP_VIEW",    "name":     t[i], "if_exists": if_exists}
         if sub == "TRIGGER":
-            return {"op": "DROP_TRIGGER", "name":     t[i], "if_exists": if_exists}
+            return {"op": "DROP_TRIGGER",      "name": t[i], "if_exists": if_exists}
+    if sub == "PUBLICATION":
+        i = 2
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+        if i >= len(t):
+            raise ParseError("Expected publication name after DROP PUBLICATION")
+        return {"op": "DROP_PUBLICATION", "name": t[i], "if_exists": if_exists}
+    if sub == "SUBSCRIPTION":
+        i = 2
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+        if i >= len(t):
+            raise ParseError("Expected subscription name after DROP SUBSCRIPTION")
+        return {"op": "DROP_SUBSCRIPTION", "name": t[i], "if_exists": if_exists}
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -1965,5 +2036,9 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "STORAGE"
                 and t[2].upper() == "FORMAT"):
             return {"op": "SHOW_STORAGE_FORMAT"}
+        if len(t) > 1 and t[1].upper() == "PUBLICATIONS":
+            return {"op": "SHOW_PUBLICATIONS"}
+        if len(t) > 1 and t[1].upper() == "SUBSCRIPTIONS":
+            return {"op": "SHOW_SUBSCRIPTIONS"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     raise ParseError(f"Unrecognized statement: '{t[0]}'")

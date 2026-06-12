@@ -93,7 +93,7 @@ from .constants import PAGE_SIZE, PAGE_CKSUM_SZ, PAGE_CKSUM_OFF, INTEGER, REAL, 
 from .checksum import page_checksum, stamp_page, verify_page
 from .schema import Column, ForeignKey, Schema, serialize_row, deserialize_row
 from .btree import BTree
-from .catalog import TableMeta, IndexMeta, TriggerMeta, Catalog
+from .catalog import TableMeta, IndexMeta, TriggerMeta, Catalog, PublicationMeta, SubscriptionMeta
 from .wal import WAL
 from .pager import Pager, MemoryPager
 from .encoding import (
