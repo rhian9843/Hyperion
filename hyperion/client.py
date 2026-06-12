@@ -17,6 +17,23 @@ TCP:
 
 Unix socket:
     conn = connect(socket_path="/tmp/hyperion.sock")
+
+DSN string (``connect_dsn``):
+    # Remote server
+    from hyperion.client import connect_dsn
+    conn = connect_dsn("hyperion://127.0.0.1:5433/mydb")
+
+    # Local file (returns a Database, not a network Connection)
+    db = connect_dsn("hyperion:///path/to/mydb.hdb")
+
+    # In-memory
+    db = connect_dsn("hyperion://:memory:")
+
+DSN format::
+
+    hyperion://[host[:port]][/dbname]
+    hyperion:///absolute/path/to/file.hdb   (local file — host is empty)
+    hyperion://:memory:                      (in-memory database)
 """
 from __future__ import annotations
 
@@ -291,3 +308,49 @@ def connect(*,
     if timeout is not None:
         sock.settimeout(timeout)
     return Connection(sock)
+
+
+def connect_dsn(dsn: str, *, timeout: float | None = None):
+    """Parse a Hyperion DSN string and return a connected object.
+
+    DSN format
+    ----------
+    ``hyperion://host:port/dbname``   — connect to a remote TCP server
+    ``hyperion:///path/to/file.hdb``  — open a local database file
+    ``hyperion://:memory:``           — open an in-memory database
+
+    Returns
+    -------
+    ``Connection``  when the DSN points to a remote server (host present).
+    ``Database``    when the DSN points to a local file or ``:memory:``.
+
+    Raises
+    ------
+    ``ValueError``  on an unrecognised DSN format.
+    """
+    if not dsn.startswith("hyperion://"):
+        raise ValueError(
+            f"Unsupported DSN scheme (expected 'hyperion://'): {dsn!r}"
+        )
+
+    # Strip scheme; what remains is [host[:port]][/path] or :memory:
+    rest = dsn[len("hyperion://"):]
+
+    # :memory: — handle before urlparse which trips on the colon
+    if rest.startswith(":memory:") or rest == "":
+        from .database import Database
+        return Database(":memory:")
+
+    # Local absolute path: hyperion:///path/to/file  → rest starts with /
+    if rest.startswith("/"):
+        from .database import Database
+        return Database(rest)
+
+    # Remote: hyperion://host[:port][/dbname]
+    from urllib.parse import urlparse
+    parsed = urlparse(dsn)
+    host = parsed.hostname
+    port = parsed.port or 5433
+    if not host:
+        raise ValueError(f"DSN has no host and no file path: {dsn!r}")
+    return connect(host=host, port=port, timeout=timeout)
