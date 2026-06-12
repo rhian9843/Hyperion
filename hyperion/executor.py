@@ -87,6 +87,7 @@ class TooManyRowsError(RuntimeError):
 _WRITE_OPS = frozenset({
     "INSERT", "INSERT_SELECT", "UPDATE", "DELETE", "TRUNCATE",
     "CREATE_TABLE", "CREATE_TABLE_AS_SELECT", "DROP_TABLE",
+    "CREATE_COLUMN_TABLE",
     "CREATE_INDEX", "DROP_INDEX",
     "CREATE_VIEW", "DROP_VIEW",
     "CREATE_TRIGGER", "DROP_TRIGGER",
@@ -592,8 +593,11 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
                 and _find_eq_index(db, right_table, rcol) is not None)
 
     if not use_inlj:
-        right_rows = [deserialize_row(rmeta.schema, db._unpack_row_cell(r))
-                      for _, r in db._table_btree(rmeta).scan()]
+        if rmeta.storage_type == "column":
+            right_rows = [row for _, row in db._table_btree(rmeta).scan_rows()]
+        else:
+            right_rows = [deserialize_row(rmeta.schema, db._unpack_row_cell(r))
+                          for _, r in db._table_btree(rmeta).scan()]
 
     result: list[dict] = []
     matched_right: set[int] = set()
@@ -697,9 +701,14 @@ def _materialize_table(tname: str, db: "Database", ctes: dict,
         from .schema import deserialize_row
         meta = db._meta(tname)
         raw = []
-        for _, r in db._table_btree(meta).scan():
-            _check_timeout(db)
-            raw.append(deserialize_row(meta.schema, db._unpack_row_cell(r)))
+        if meta.storage_type == "column":
+            for _, row in db._table_btree(meta).scan_rows():
+                _check_timeout(db)
+                raw.append(row)
+        else:
+            for _, r in db._table_btree(meta).scan():
+                _check_timeout(db)
+                raw.append(deserialize_row(meta.schema, db._unpack_row_cell(r)))
     if alias:
         return [{f"{alias}.{k}": v for k, v in row.items()} for row in raw]
     return raw
@@ -999,9 +1008,12 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
             offset = s.get("offset") or 0
             skipped = 0
             count   = 0
-            for _, raw in db._table_btree(meta).scan():
+            _tbl_tree = db._table_btree(meta)
+            _row_iter = (_tbl_tree.scan_rows() if meta.storage_type == "column"
+                         else ((rid, deserialize_row(schema, db._unpack_row_cell(raw)))
+                               for rid, raw in _tbl_tree.scan()))
+            for _, row in _row_iter:
                 _check_timeout(db)
-                row = deserialize_row(schema, db._unpack_row_cell(raw))
                 if where and not where.evaluate(row, db):
                     continue
                 if skipped < offset:
@@ -1116,13 +1128,19 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
         row_count = 0
         distinct: dict[str, set] = {c: set() for c in col_names}
 
-        for _, raw in db._table_btree(meta).scan():
-            row = deserialize_row(schema, db._unpack_row_cell(raw))
-            row_count += 1
-            for c in col_names:
-                val = row.get(c)
-                # Use a hashable sentinel for None so it counts as a distinct value
-                distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
+        if meta.storage_type == "column":
+            for _, row in db._table_btree(meta).scan_rows():
+                row_count += 1
+                for c in col_names:
+                    val = row.get(c)
+                    distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
+        else:
+            for _, raw in db._table_btree(meta).scan():
+                row = deserialize_row(schema, db._unpack_row_cell(raw))
+                row_count += 1
+                for c in col_names:
+                    val = row.get(c)
+                    distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
 
         db._catalog.stats[tname] = {
             "row_count": row_count,
@@ -1433,6 +1451,50 @@ def _exec_create_table(stmt: dict, db: Database) -> str:
     return f"Table '{stmt['name']}' created."
 
 
+def _exec_create_column_table(stmt: dict, db: Database) -> str:
+    from .schema import Schema
+    if stmt.get("if_not_exists") and stmt["name"] in db.tables:
+        return f"Table '{stmt['name']}' already exists."
+    pk_cols = stmt.get("primary_key_columns") or []
+    if pk_cols:
+        for col in stmt["columns"]:
+            if col.name in pk_cols:
+                col.nullable = False
+        uc = list(stmt.get("unique_constraints") or [])
+        if pk_cols not in uc:
+            uc.append(pk_cols)
+        stmt = {**stmt, "unique_constraints": uc}
+    db.create_table(Schema(name=stmt["name"], columns=stmt["columns"],
+                           foreign_keys=stmt.get("foreign_keys", []),
+                           unique_constraints=stmt.get("unique_constraints", []),
+                           primary_key_columns=pk_cols),
+                    temporary=stmt.get("temporary", False),
+                    storage_type="column")
+    for col in stmt["columns"]:
+        if col.primary_key:
+            pk_idx = f"_pk_{stmt['name']}_{col.name}"
+            if pk_idx not in db.indexes:
+                db.create_index(pk_idx, stmt["name"], [col.name])
+        elif col.unique:
+            uq_idx = f"_uq_{stmt['name']}_{col.name}"
+            if uq_idx not in db.indexes:
+                db.create_index(uq_idx, stmt["name"], [col.name], unique=True)
+    if pk_cols and len(pk_cols) > 1:
+        pk_idx = f"_pk_{stmt['name']}_{'_'.join(pk_cols)}"
+        if pk_idx not in db.indexes:
+            db.create_index(pk_idx, stmt["name"], pk_cols)
+    return f"Column table '{stmt['name']}' created."
+
+
+def _exec_show_storage_format(stmt: dict, db: Database) -> "RowResult":
+    rows = [
+        {"table": name, "storage": meta.storage_type.upper()}
+        for name, meta in sorted(db.tables.items())
+        if not meta.temporary
+    ]
+    return RowResult(rows, ["table", "storage"])
+
+
 def _exec_drop_table(stmt: dict, db: Database) -> str:
     if stmt.get("if_exists") and stmt["name"] not in db.tables:
         return f"Table '{stmt['name']}' does not exist."
@@ -1717,6 +1779,8 @@ _DISPATCH: dict[str, Any] = {
     "ANALYZE":                  _execute_analyze,
     "CREATE_TABLE_AS_SELECT":   _exec_create_table_as_select,
     "CREATE_TABLE":             _exec_create_table,
+    "CREATE_COLUMN_TABLE":      _exec_create_column_table,
+    "SHOW_STORAGE_FORMAT":      _exec_show_storage_format,
     "DROP_TABLE":               _exec_drop_table,
     "CREATE_VIEW":              _exec_create_view,
     "DROP_VIEW":                _exec_drop_view,
@@ -1815,13 +1879,22 @@ def _remove_conflicting_rows(db: "Database", meta, new_row: dict) -> None:
     """Delete all rows that would conflict with new_row on UNIQUE/PK constraints."""
     schema = meta.schema
     victims: list[tuple[int, dict]] = []
-    for rowid, raw in db._table_btree(meta).scan():
-        existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if _would_conflict(schema, existing, new_row, db):
-            victims.append((rowid, existing))
+    if meta.storage_type == "column":
+        for rowid, existing in db._table_btree(meta).scan_rows():
+            if _would_conflict(schema, existing, new_row, db):
+                victims.append((rowid, existing))
+    else:
+        for rowid, raw in db._table_btree(meta).scan():
+            existing = deserialize_row(schema, db._unpack_row_cell(raw))
+            if _would_conflict(schema, existing, new_row, db):
+                victims.append((rowid, existing))
     if not victims:
         return
-    db._table_btree(meta).delete({r for r, _ in victims})
+    victim_ids = {r for r, _ in victims}
+    if meta.storage_type == "column":
+        db._table_btree(meta).apply_deletes(victim_ids)
+    else:
+        db._table_btree(meta).delete(victim_ids)
     for im in db._indexes_for(schema.name):
         col_types = [next(c.type for c in schema.columns if c.name == n)
                      for n in im.columns]
@@ -1838,18 +1911,27 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
                                assignments: dict[str, str]) -> None:
     """Find the conflicting row and apply SET assignments (excluded.col supported)."""
     import struct
-    schema = meta.schema
-    for rowid, raw in db._table_btree(meta).scan():
-        existing = deserialize_row(schema, db._unpack_row_cell(raw))
-        if not _would_conflict(schema, existing, new_row, db):
+    is_col  = (meta.storage_type == "column")
+    _schema = meta.schema
+
+    if is_col:
+        scan_iter = ((rid, row) for rid, row in db._table_btree(meta).scan_rows())
+    else:
+        scan_iter = (
+            (rid, deserialize_row(_schema, db._unpack_row_cell(raw)))
+            for rid, raw in db._table_btree(meta).scan()
+        )
+
+    for rowid, existing in scan_iter:
+        if not _would_conflict(_schema, existing, new_row, db):
             continue
         updated = dict(existing)
         for col_name, val in assignments.items():
-            if val.lower().startswith("excluded."):
+            if isinstance(val, str) and val.lower().startswith("excluded."):
                 src_col = val.split(".", 1)[1]
                 updated[col_name] = new_row.get(src_col)
             else:
-                col_obj = next((c for c in schema.columns if c.name == col_name), None)
+                col_obj = next((c for c in _schema.columns if c.name == col_name), None)
                 if col_obj and col_obj.type == INTEGER:
                     try:
                         updated[col_name] = int(val)
@@ -1865,11 +1947,15 @@ def _apply_on_conflict_update(db: "Database", meta, new_row: dict,
                 else:
                     try: updated[col_name] = eval_expr(str(val), updated)
                     except Exception: updated[col_name] = val
-        db._table_btree(meta).update({rowid: db._pack_row_cell(serialize_row(schema, updated))})
-        for im in db._indexes_for(schema.name):
+        if is_col:
+            db._table_btree(meta).apply_updates({rowid: updated}, set(assignments.keys()))
+        else:
+            db._table_btree(meta).update(
+                {rowid: db._pack_row_cell(serialize_row(_schema, updated))})
+        for im in db._indexes_for(_schema.name):
             if not any(c in assignments for c in im.columns):
                 continue
-            col_types = [next(c.type for c in schema.columns if c.name == n)
+            col_types = [next(c.type for c in _schema.columns if c.name == n)
                          for n in im.columns]
             itree = db._index_btree(im)
             old_vals = [existing.get(n) for n in im.columns]

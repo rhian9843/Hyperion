@@ -19,11 +19,12 @@ class TriggerMeta:
 
 @dataclass
 class TableMeta:
-    schema:    Schema
-    root_page: int
-    next_page: int
-    next_key:  int
-    temporary: bool = False
+    schema:       Schema
+    root_page:    int
+    next_page:    int
+    next_key:     int
+    temporary:    bool = False
+    storage_type: str  = "row"   # "row" or "column"
 
 
 @dataclass
@@ -99,7 +100,8 @@ class Catalog:
         """
         return json.dumps({
             "tables": {
-                n: {"schema": m.schema.to_dict(), "temporary": m.temporary}
+                n: {"schema": m.schema.to_dict(), "temporary": m.temporary,
+                    "storage_type": m.storage_type}
                 for n, m in self.tables.items() if not m.temporary
             },
             "indexes": {
@@ -189,7 +191,7 @@ class Catalog:
             "nfp":  self.next_free_page,
             "fp":   list(self.free_pages),
             "tbls": {n: TableMeta(m.schema, m.root_page, m.next_page,
-                                  m.next_key, m.temporary)
+                                  m.next_key, m.temporary, m.storage_type)
                      for n, m in self.tables.items()},
             "idxs": {n: IndexMeta(m.table_name, list(m.columns),
                                   m.root_page, m.next_page, m.unique)
@@ -225,7 +227,8 @@ class Catalog:
             "free_pages":     self.free_pages,
             "tables": {
                 n: {"schema": m.schema.to_dict(), "root_page": m.root_page,
-                    "next_page": m.next_page, "next_key": m.next_key}
+                    "next_page": m.next_page, "next_key": m.next_key,
+                    "storage_type": m.storage_type}
                 for n, m in self.tables.items() if not m.temporary
             },
             "indexes": {
@@ -268,6 +271,7 @@ class Catalog:
                 next_page=ops.get("next_page", 0),
                 next_key=ops.get("next_key",  1),
                 temporary=t.get("temporary", False),
+                storage_type=t.get("storage_type", "row"),
             )
 
         indexes: dict[str, IndexMeta] = {}
@@ -326,7 +330,8 @@ class Catalog:
         d = json.loads(raw.decode())
         tables = {
             n: TableMeta(Schema.from_dict(t["schema"]), t["root_page"],
-                         t["next_page"], t["next_key"])
+                         t["next_page"], t["next_key"],
+                         storage_type=t.get("storage_type", "row"))
             for n, t in d.get("tables", {}).items()
         }
         indexes = {

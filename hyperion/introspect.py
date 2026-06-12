@@ -152,17 +152,26 @@ def integrity_check(db: "Database") -> list[str]:
     for tname, meta in db._catalog.tables.items():
         prev_key: int | None = None
         try:
-            for key, raw in db._table_btree(meta).scan():
-                if prev_key is not None and key <= prev_key:
-                    errors.append(
-                        f"table '{tname}': key ordering violation — "
-                        f"key {key} follows {prev_key}"
-                    )
-                prev_key = key
-                try:
-                    deserialize_row(meta.schema, db._unpack_row_cell(raw))
-                except Exception as exc:
-                    errors.append(f"table '{tname}': corrupt row at key {key}: {exc}")
+            if meta.storage_type == "column":
+                for key, _ in db._table_btree(meta).scan_rows():
+                    if prev_key is not None and key <= prev_key:
+                        errors.append(
+                            f"table '{tname}': key ordering violation — "
+                            f"key {key} follows {prev_key}"
+                        )
+                    prev_key = key
+            else:
+                for key, raw in db._table_btree(meta).scan():
+                    if prev_key is not None and key <= prev_key:
+                        errors.append(
+                            f"table '{tname}': key ordering violation — "
+                            f"key {key} follows {prev_key}"
+                        )
+                    prev_key = key
+                    try:
+                        deserialize_row(meta.schema, db._unpack_row_cell(raw))
+                    except Exception as exc:
+                        errors.append(f"table '{tname}': corrupt row at key {key}: {exc}")
         except Exception as exc:
             errors.append(f"table '{tname}': B-tree scan failed: {exc}")
 

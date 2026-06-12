@@ -413,9 +413,9 @@
 
 ### Analytics — Column Store
 
-- [ ] `CREATE COLUMN TABLE` — alternative storage layout where each column is stored as a contiguous array rather than row-by-row; enables vectorised `SUM/AVG/COUNT/MIN/MAX` scans that skip irrelevant columns entirely
-- [ ] Columnar aggregate scans — when the query touches only a subset of columns and the table is a column table, scan only those column arrays; `GROUP BY` fallback to row-store path when needed
-- [ ] `SHOW STORAGE FORMAT` — introspection command returning `ROW` or `COLUMN` for each table
+- [x] `CREATE COLUMN TABLE` — alternative storage layout where each column is stored as a contiguous array rather than row-by-row; enables vectorised `SUM/AVG/COUNT/MIN/MAX` scans that skip irrelevant columns entirely
+- [x] Columnar aggregate scans — when the query touches only a subset of columns and the table is a column table, scan only those column arrays; `GROUP BY` fallback to row-store path when needed
+- [x] `SHOW STORAGE FORMAT` — introspection command returning `ROW` or `COLUMN` for each table
 
 ### Replication
 

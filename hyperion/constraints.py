@@ -142,19 +142,45 @@ class ConstraintsMixin:
                     f"UNIQUE constraint failed: "
                     f"{schema.name}({', '.join(cols)})")
             elif conflict is None:
-                # No backing index found (shouldn't happen, but fall back to scan)
-                for rowid, raw in self._table_btree(meta).scan():
-                    if rowid == exclude_rowid:
-                        continue
-                    existing = deserialize_row(schema, self._unpack_row_cell(raw))
-                    ex_vals = [existing.get(c) for c in cols]
-                    if vals == ex_vals:
-                        raise UniqueConstraintError(
-                            f"UNIQUE constraint failed: "
-                            f"{schema.name}({', '.join(cols)})")
+                # No backing index found — fall back to scan
+                if meta.storage_type == "column":
+                    for rowid, existing in self._table_btree(meta).scan_rows():
+                        if rowid == exclude_rowid:
+                            continue
+                        ex_vals = [existing.get(c) for c in cols]
+                        if vals == ex_vals:
+                            raise UniqueConstraintError(
+                                f"UNIQUE constraint failed: "
+                                f"{schema.name}({', '.join(cols)})")
+                else:
+                    for rowid, raw in self._table_btree(meta).scan():
+                        if rowid == exclude_rowid:
+                            continue
+                        existing = deserialize_row(schema, self._unpack_row_cell(raw))
+                        ex_vals = [existing.get(c) for c in cols]
+                        if vals == ex_vals:
+                            raise UniqueConstraintError(
+                                f"UNIQUE constraint failed: "
+                                f"{schema.name}({', '.join(cols)})")
 
         # Full scan only for constraints that had no backing index
         if not scan_single and not scan_mc:
+            return
+        if meta.storage_type == "column":
+            for rowid, existing in self._table_btree(meta).scan_rows():
+                if rowid == exclude_rowid:
+                    continue
+                for col in scan_single:
+                    v = typed[col.name]
+                    if v is not None and existing.get(col.name) == v:
+                        raise UniqueConstraintError(
+                            f"UNIQUE constraint failed: {schema.name}.{col.name}")
+                for uc_cols, new_vals in scan_mc:
+                    ex_vals = [existing.get(c) for c in uc_cols]
+                    if new_vals == ex_vals:
+                        raise UniqueConstraintError(
+                            f"UNIQUE constraint failed: "
+                            f"{schema.name}({', '.join(uc_cols)})")
             return
         for rowid, raw in self._table_btree(meta).scan():
             if rowid == exclude_rowid:
@@ -252,12 +278,19 @@ class ConstraintsMixin:
             found = self._fk_index_lookup(parent_meta, fk.ref_columns, vals)
             if found is None:  # no usable index — fall back to full scan
                 found = False
-                for _, raw in self._table_btree(parent_meta).scan():
-                    parent_row = deserialize_row(parent_schema, self._unpack_row_cell(raw))
-                    if all(parent_row.get(rc) == v
-                           for rc, v in zip(fk.ref_columns, vals)):
-                        found = True
-                        break
+                if parent_meta.storage_type == "column":
+                    for _, parent_row in self._table_btree(parent_meta).scan_rows():
+                        if all(parent_row.get(rc) == v
+                               for rc, v in zip(fk.ref_columns, vals)):
+                            found = True
+                            break
+                else:
+                    for _, raw in self._table_btree(parent_meta).scan():
+                        parent_row = deserialize_row(parent_schema, self._unpack_row_cell(raw))
+                        if all(parent_row.get(rc) == v
+                               for rc, v in zip(fk.ref_columns, vals)):
+                            found = True
+                            break
             if not found:
                 raise ForeignKeyConstraintError(
                     f"FOREIGN KEY constraint failed: "
@@ -283,7 +316,7 @@ class ConstraintsMixin:
                 idx_meta = m
                 break
 
-        if idx_meta is not None:
+        if idx_meta is not None and tmeta.storage_type != "column":
             col_types = []
             for col_name in fk.columns:
                 col_obj = next((c for c in child_schema.columns
@@ -307,13 +340,19 @@ class ConstraintsMixin:
                         matching.append((rowid, child_row))
                 return matching
 
-        # Full scan fallback (no index on FK columns)
+        # Full scan fallback (no index on FK columns, or column-store child table)
         matching = []
-        for rowid, raw in self._table_btree(tmeta).scan():
-            child_row = deserialize_row(child_schema, self._unpack_row_cell(raw))
-            if all(child_row.get(cc) == rv
-                   for cc, rv in zip(fk.columns, ref_vals)):
-                matching.append((rowid, child_row))
+        if tmeta.storage_type == "column":
+            for rowid, child_row in self._table_btree(tmeta).scan_rows():
+                if all(child_row.get(cc) == rv
+                       for cc, rv in zip(fk.columns, ref_vals)):
+                    matching.append((rowid, child_row))
+        else:
+            for rowid, raw in self._table_btree(tmeta).scan():
+                child_row = deserialize_row(child_schema, self._unpack_row_cell(raw))
+                if all(child_row.get(cc) == rv
+                       for cc, rv in zip(fk.columns, ref_vals)):
+                    matching.append((rowid, child_row))
         return matching
 
     def _check_fk_parent(self, table: str, old_row: dict[str, Any],

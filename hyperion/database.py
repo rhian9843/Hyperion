@@ -465,8 +465,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
 
         for tname, tmeta in self._catalog.tables.items():
             yield _schema_to_sql(tname, tmeta.schema, tmeta.temporary) + ";"
-            for _, raw in self._table_btree(tmeta).scan():
-                row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
+            if tmeta.storage_type == "column":
+                row_iter = (row for _, row in self._table_btree(tmeta).scan_rows())
+            else:
+                row_iter = (deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
+                            for _, raw in self._table_btree(tmeta).scan())
+            for row in row_iter:
                 cols = [c.name for c in tmeta.schema.columns if not c.is_generated]
                 vals = ", ".join(_sql_literal(row.get(c)) for c in cols)
                 yield f"INSERT INTO \"{tname}\" VALUES ({vals});"
@@ -792,7 +796,11 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                     stack.append(sibling)
         return pages
 
-    def _table_btree(self, meta: TableMeta) -> BTree:
+    def _table_btree(self, meta: TableMeta):
+        if meta.storage_type == "column":
+            from .column_store import ColumnStore
+            return ColumnStore(self._pager, meta.root_page, meta.schema,
+                               self._make_alloc(meta), self._free_page)
         return BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
                      self._make_alloc(meta))
 
@@ -959,7 +967,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         new_db = Database(tmp_path)
         new_db.begin()
         for tname, tmeta in list(self._catalog.tables.items()):
-            new_db.create_table(tmeta.schema)
+            new_db.create_table(tmeta.schema,
+                                storage_type=tmeta.storage_type)
             for _, raw in self._table_btree(tmeta).scan():
                 row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
                 new_db.insert(tname, row)

@@ -1176,6 +1176,10 @@ def _parse_create(t: list[str]) -> dict:
         temporary_table = True
         sub = "TABLE"
         t = [t[0]] + t[2:]
+    if sub == "COLUMN" and len(t) > 2 and t[2].upper() == "TABLE":
+        result = _parse_create_table(t, 3, temporary_table)
+        result["op"] = "CREATE_COLUMN_TABLE"
+        return result
     if sub == "TABLE":
         return _parse_create_table(t, 2, temporary_table)
     if sub == "VIEW":
@@ -1958,5 +1962,8 @@ def _parse_tokens(t: list[str]) -> dict:
     if kw == "SHOW":
         if len(t) > 1 and t[1].upper() == "TRANSACTIONS":
             return {"op": "SHOW_TRANSACTIONS"}
+        if (len(t) > 2 and t[1].upper() == "STORAGE"
+                and t[2].upper() == "FORMAT"):
+            return {"op": "SHOW_STORAGE_FORMAT"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     raise ParseError(f"Unrecognized statement: '{t[0]}'")

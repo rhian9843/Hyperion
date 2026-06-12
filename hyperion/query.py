@@ -170,11 +170,17 @@ class QueryMixin:
         # Collect full rows first so ORDER BY can reference columns not in SELECT list.
         # Projection and DISTINCT dedup happen after sorting/limiting.
         _need_full = bool(order_by and columns)
-        for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, self._unpack_row_cell(raw))
-            if where and not where.evaluate(row, self):
-                continue
-            results.append(row)
+        if meta.storage_type == "column":
+            for _, row in self._table_btree(meta).scan_rows():
+                if where and not where.evaluate(row, self):
+                    continue
+                results.append(row)
+        else:
+            for _, raw in self._table_btree(meta).scan():
+                row = deserialize_row(schema, self._unpack_row_cell(raw))
+                if where and not where.evaluate(row, self):
+                    continue
+                results.append(row)
         results = _apply_order_limit(results, order_by, limit, offset)
         out = []
         for row in results:
@@ -334,13 +340,25 @@ class QueryMixin:
 
     def _aggregate_select(self, meta, columns: list[str],
                           where: "WhereClause | None") -> list[dict[str, Any]]:
+        # Aggregate pushdown for column store without WHERE
+        if meta.storage_type == "column" and not where:
+            result = self._table_btree(meta).scan_aggregate(columns)
+            if result is not None:
+                return result
+
         schema = meta.schema
         rows: list[dict] = []
-        for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, self._unpack_row_cell(raw))
-            if where and not where.evaluate(row, self):
-                continue
-            rows.append(row)
+        if meta.storage_type == "column":
+            for _, row in self._table_btree(meta).scan_rows():
+                if where and not where.evaluate(row, self):
+                    continue
+                rows.append(row)
+        else:
+            for _, raw in self._table_btree(meta).scan():
+                row = deserialize_row(schema, self._unpack_row_cell(raw))
+                if where and not where.evaluate(row, self):
+                    continue
+                rows.append(row)
         return [self._compute_aggregates(rows, columns)]
 
     def _group_by_select(self, meta, columns: list[str] | None,
@@ -351,11 +369,17 @@ class QueryMixin:
                          offset: int | None = None) -> list[dict[str, Any]]:
         schema = meta.schema
         all_rows: list[dict] = []
-        for _, raw in self._table_btree(meta).scan():
-            row = deserialize_row(schema, self._unpack_row_cell(raw))
-            if where and not where.evaluate(row, self):
-                continue
-            all_rows.append(row)
+        if meta.storage_type == "column":
+            for _, row in self._table_btree(meta).scan_rows():
+                if where and not where.evaluate(row, self):
+                    continue
+                all_rows.append(row)
+        else:
+            for _, raw in self._table_btree(meta).scan():
+                row = deserialize_row(schema, self._unpack_row_cell(raw))
+                if where and not where.evaluate(row, self):
+                    continue
+                all_rows.append(row)
         def _gb_val(c: str, r: dict) -> Any:
             if c in r:
                 return r[c]
@@ -395,10 +419,16 @@ class QueryMixin:
              offset: int | None = None,
              on_clause: "WhereClause | None" = None) -> list[dict[str, Any]]:
         lmeta, rmeta = self._meta(left_table), self._meta(right_table)
-        left_rows  = [deserialize_row(lmeta.schema, self._unpack_row_cell(r))
-                      for _, r in self._table_btree(lmeta).scan()]
-        right_rows = [deserialize_row(rmeta.schema, self._unpack_row_cell(r))
-                      for _, r in self._table_btree(rmeta).scan()]
+        if lmeta.storage_type == "column":
+            left_rows = [row for _, row in self._table_btree(lmeta).scan_rows()]
+        else:
+            left_rows = [deserialize_row(lmeta.schema, self._unpack_row_cell(r))
+                         for _, r in self._table_btree(lmeta).scan()]
+        if rmeta.storage_type == "column":
+            right_rows = [row for _, row in self._table_btree(rmeta).scan_rows()]
+        else:
+            right_rows = [deserialize_row(rmeta.schema, self._unpack_row_cell(r))
+                          for _, r in self._table_btree(rmeta).scan()]
 
         la = left_alias  or left_table
         ra = right_alias or right_table

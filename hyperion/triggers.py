@@ -197,10 +197,14 @@ def scan_matching_rows(db: Any, table: str, where: Any,
     schema = meta.schema
     rows: list[dict] = []
     count = 0
-    for _, raw in db._table_btree(meta).scan():
+    if meta.storage_type == "column":
+        _scan = ((rid, row) for rid, row in db._table_btree(meta).scan_rows())
+    else:
+        _scan = ((rid, deserialize_row(schema, db._unpack_row_cell(raw)))
+                 for rid, raw in db._table_btree(meta).scan())
+    for _, row in _scan:
         if limit is not None and count >= limit:
             break
-        row = deserialize_row(schema, db._unpack_row_cell(raw))
         if not where or where.evaluate(row, db):
             rows.append(row)
             count += 1

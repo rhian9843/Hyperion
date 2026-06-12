@@ -41,7 +41,12 @@ def estimate_rows(db, table: str) -> int:
             return 100
         else:
             meta = db._meta(table)
-            db._opt_row_counts[table] = sum(1 for _ in db._table_btree(meta).scan())
+            if meta.storage_type == "column":
+                import struct as _s
+                hdr = db._pager.read_page(meta.root_page)
+                db._opt_row_counts[table] = _s.unpack_from('<I', hdr, 1)[0]
+            else:
+                db._opt_row_counts[table] = sum(1 for _ in db._table_btree(meta).scan())
     return db._opt_row_counts[table]
 
 

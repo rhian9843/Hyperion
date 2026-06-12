@@ -55,25 +55,36 @@ def _make_type_cast(old_type: str, new_type: str, col_name: str):
 class DDLMixin:
     """DDL methods (CREATE / DROP / ALTER) mixed into Database."""
 
-    def create_table(self, schema: Schema, temporary: bool = False) -> None:
+    def create_table(self, schema: Schema, temporary: bool = False,
+                     storage_type: str = "row") -> None:
         if schema.name in self._catalog.tables:
             raise TableExistsError(f"Table '{schema.name}' already exists")
         root = self._alloc_page()
-        BTree.init_root_leaf(self._pager, root)
-        self._catalog.tables[schema.name] = TableMeta(
+        meta = TableMeta(
             schema=schema, root_page=root,
             next_page=self._catalog.next_free_page, next_key=1,
-            temporary=temporary,
+            temporary=temporary, storage_type=storage_type,
         )
+        if storage_type == "column":
+            from .column_store import ColumnStore
+            ColumnStore.init_root(self._pager, root, schema, self._make_alloc(meta))
+        else:
+            BTree.init_root_leaf(self._pager, root)
+        self._catalog.tables[schema.name] = meta
 
     def drop_table(self, name: str) -> None:
         meta = self._meta(name)
-        import struct as _s
-        for _, raw in self._table_btree(meta).scan():
-            if self._cell_is_overflow(raw):
-                self._free_overflow(_s.unpack_from("I", raw, 5)[0])
-        for pn in self._collect_tree_pages(meta.root_page):
-            self._free_page(pn)
+        if meta.storage_type == "column":
+            from .column_store import ColumnStore
+            ColumnStore(self._pager, meta.root_page, meta.schema,
+                        self._make_alloc(meta), self._free_page).drop()
+        else:
+            import struct as _s
+            for _, raw in self._table_btree(meta).scan():
+                if self._cell_is_overflow(raw):
+                    self._free_overflow(_s.unpack_from("I", raw, 5)[0])
+            for pn in self._collect_tree_pages(meta.root_page):
+                self._free_page(pn)
         to_drop = [n for n, m in self._catalog.indexes.items()
                    if m.table_name == name]
         for n in to_drop:
@@ -154,36 +165,51 @@ class DDLMixin:
     def _rewrite_table(self, meta: TableMeta, old_schema: Schema,
                        new_schema: Schema,
                        cast_map: "dict | None" = None) -> None:
-        """Scan old tree, reserialize rows with new_schema, rebuild on a fresh root."""
-        from .constants import ROW_CELL_SIZE
-        old_tree   = BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
-                           self._make_alloc(meta))
-        old_scanned = list(old_tree.scan())
-        old_overflow_pages: list[int] = []
-        saved: list[tuple] = []
-        for rowid, raw in old_scanned:
-            if self._cell_is_overflow(raw):
-                import struct as _s
-                old_overflow_pages.append(_s.unpack_from("I", raw, 5)[0])
-            saved.append((rowid, deserialize_row(old_schema, self._unpack_row_cell(raw))))
-        old_pages = self._collect_tree_pages(meta.root_page)
+        """Scan old storage, reserialize rows with new_schema, rebuild on a fresh root."""
+        is_col = meta.storage_type == "column"
+
+        if is_col:
+            from .column_store import ColumnStore
+            old_cs = ColumnStore(self._pager, meta.root_page, old_schema,
+                                 self._make_alloc(meta), self._free_page)
+            saved: list[tuple] = list(old_cs.scan_rows())
+            old_pages_col_drop = meta.root_page   # marker: drop via ColumnStore.drop()
+            old_cs_ref = old_cs
+        else:
+            from .constants import ROW_CELL_SIZE
+            old_tree    = BTree(self._pager, meta.root_page, ROW_CELL_SIZE,
+                                self._make_alloc(meta))
+            old_overflow_pages: list[int] = []
+            saved = []
+            for rowid, raw in old_tree.scan():
+                if self._cell_is_overflow(raw):
+                    import struct as _s
+                    old_overflow_pages.append(_s.unpack_from("I", raw, 5)[0])
+                saved.append((rowid, deserialize_row(old_schema, self._unpack_row_cell(raw))))
+            old_pages = self._collect_tree_pages(meta.root_page)
 
         new_root = self._alloc_page()
-        BTree.init_root_leaf(self._pager, new_root)
         meta.root_page = new_root
         meta.schema    = new_schema
+        if is_col:
+            from .column_store import ColumnStore
+            ColumnStore.init_root(self._pager, new_root, new_schema, self._make_alloc(meta))
+        else:
+            BTree.init_root_leaf(self._pager, new_root)
         new_tree = self._table_btree(meta)
         for rowid, old_row in saved:
             new_row = {
-                c.name: old_row[c.name] if c.name in old_row
-                else (c.default if c.default is not None else None)
+                c.name: old_row.get(c.name, c.default if c.default is not None else None)
                 for c in new_schema.columns
             }
             if cast_map:
                 for cname, fn in cast_map.items():
                     if cname in new_row and new_row[cname] is not None:
                         new_row[cname] = fn(new_row[cname])
-            new_tree.insert(rowid, self._pack_row_cell(serialize_row(new_schema, new_row)))
+            if is_col:
+                new_tree.insert_row(rowid, new_row)
+            else:
+                new_tree.insert(rowid, self._pack_row_cell(serialize_row(new_schema, new_row)))
 
         old_idx_pages: list[int] = []
         for idx in self._catalog.indexes.values():
@@ -207,10 +233,15 @@ class DDLMixin:
                         _make_index_key(_encode_composite_key(vals, col_types), rowid),
                         struct.pack("q", rowid))
 
-        for pn in old_pages + old_idx_pages:
+        for pn in old_idx_pages:
             self._free_page(pn)
-        for fp in old_overflow_pages:
-            self._free_overflow(fp)
+        if is_col:
+            old_cs_ref.drop()
+        else:
+            for pn in old_pages:
+                self._free_page(pn)
+            for fp in old_overflow_pages:
+                self._free_overflow(fp)
 
     def create_index(self, idx_name: str, table: str, cols: list[str],
                      unique: bool = False) -> None:
