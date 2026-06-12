@@ -1193,6 +1193,32 @@ def execute(stmt: dict, db: Database) -> str:
     if op == "VACUUM":
         return db.vacuum()
 
+    if op == "SET_ISOLATION_LEVEL":
+        db.set_isolation_level(stmt["level"])
+        return f"Isolation level set to '{stmt['level']}'."
+
+    if op == "SHOW_TRANSACTIONS":
+        import time as _time
+        import datetime as _dt
+        if db.in_transaction:
+            elapsed = _time.time() - (db._txn_start_time or _time.time())
+            started = _dt.datetime.fromtimestamp(db._txn_start_time).strftime(
+                "%Y-%m-%d %H:%M:%S") if db._txn_start_time else "unknown"
+            rows = [{
+                "isolation_level": db._isolation_level,
+                "started_at":      started,
+                "elapsed_s":       round(elapsed, 3),
+                "status":          "active",
+            }]
+        else:
+            rows = [{
+                "isolation_level": db._isolation_level,
+                "started_at":      None,
+                "elapsed_s":       None,
+                "status":          "idle",
+            }]
+        return RowResult(rows, ["isolation_level", "started_at", "elapsed_s", "status"])
+
     # All other statements: auto-commit if not inside an explicit BEGIN
     auto = not db.in_transaction
     if auto:

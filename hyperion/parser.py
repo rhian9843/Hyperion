@@ -1929,4 +1929,34 @@ def _parse_tokens(t: list[str]) -> dict:
     if kw == "ANALYZE":
         table = t[1] if len(t) > 1 and t[1] != ";" else None
         return {"op": "ANALYZE", "table": table}
+    if kw == "SET":
+        # SET TRANSACTION ISOLATION LEVEL <level>
+        # SET SESSION TRANSACTION ISOLATION LEVEL <level>  (MySQL compat)
+        i = 1
+        if i < len(t) and t[i].upper() == "SESSION":
+            i += 1
+        if i < len(t) and t[i].upper() == "TRANSACTION":
+            i += 1
+            if i < len(t) and t[i].upper() == "ISOLATION":
+                i += 1
+                if i < len(t) and t[i].upper() == "LEVEL":
+                    i += 1
+                    # Consume multi-word level name
+                    level_parts = []
+                    while i < len(t) and t[i] not in (";",):
+                        level_parts.append(t[i].upper())
+                        i += 1
+                    level = " ".join(level_parts)
+                    valid = {"READ UNCOMMITTED", "READ COMMITTED",
+                             "REPEATABLE READ", "SERIALIZABLE"}
+                    if level not in valid:
+                        raise ParseError(
+                            f"Unknown isolation level '{level}'; "
+                            f"expected one of: {', '.join(sorted(valid))}")
+                    return {"op": "SET_ISOLATION_LEVEL", "level": level}
+        raise ParseError("Expected: SET TRANSACTION ISOLATION LEVEL <level>")
+    if kw == "SHOW":
+        if len(t) > 1 and t[1].upper() == "TRANSACTIONS":
+            return {"op": "SHOW_TRANSACTIONS"}
+        raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     raise ParseError(f"Unrecognized statement: '{t[0]}'")

@@ -389,7 +389,7 @@
 ### Transactions
 
 - [x] `SELECT FOR UPDATE` — row-level locking within a transaction; `SELECT * FROM t WHERE id = 1 FOR UPDATE` acquires an exclusive lock on matched rows, blocking concurrent writers until `COMMIT` or `ROLLBACK`; required for safe read-modify-write patterns; implemented as a database-level exclusive write lock held for the transaction lifetime: parser detects `FOR UPDATE` clause, cursor acquires write lock permanently (released by commit/rollback, not by the SELECT itself), `_for_update_held` flag prevents double-acquisition; `FOR` added to `_ALIAS_BLOCKLIST` to prevent it being parsed as a table alias
-- [ ] Transaction isolation levels — `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ|SERIALIZABLE`; current engine uses a readers-writer lock but exposes no user-visible isolation level; `SHOW TRANSACTIONS` lists active transactions with their isolation level and start time
+- [x] Transaction isolation levels — `SET TRANSACTION ISOLATION LEVEL REPEATABLE READ|SERIALIZABLE`; current engine uses a readers-writer lock but exposes no user-visible isolation level; `SHOW TRANSACTIONS` lists active transactions with their isolation level and start time; implemented: parser handles all four standard levels plus MySQL `SET SESSION TRANSACTION ISOLATION LEVEL`; READ UNCOMMITTED treated as READ COMMITTED (can't expose uncommitted pages); REPEATABLE READ and SERIALIZABLE acquire exclusive write lock at BEGIN (held until commit/rollback via `_isolation_held` flag, same pattern as `_for_update_held`); `SHOW TRANSACTIONS` returns isolation level, start timestamp, elapsed seconds, and status (active/idle)
 
 ### Network
 

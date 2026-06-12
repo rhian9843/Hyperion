@@ -156,6 +156,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # commit, close → begin/drop/commit) don't deadlock.
         self._lock = _RWLock()
         self._for_update_held = False  # True while this txn holds a FOR UPDATE write lock
+        self._isolation_level: str = "READ COMMITTED"  # current isolation level
+        self._isolation_held  = False  # True when isolation level holds a write lock
+        self._txn_start_time: float | None = None  # monotonic time when BEGIN was called
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
 
@@ -192,6 +195,13 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         return self._txn_depth > 0
 
     def begin(self) -> None:
+        import time as _time
+        # REPEATABLE READ and SERIALIZABLE: acquire write lock before BEGIN so
+        # no other writer can interleave; lock is held until commit/rollback.
+        needs_excl = self._isolation_level in ("REPEATABLE READ", "SERIALIZABLE")
+        if needs_excl and not self._isolation_held and not self._for_update_held:
+            self._lock.acquire_write()
+            self._isolation_held = True
         with self._lock.write():
             if self._txn_depth > 0:
                 raise TransactionError("Transaction already active")
@@ -202,6 +212,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if getattr(self._pager, '_wal_had_pending', False):
                 self._reload_catalog()
             self._txn_depth = 1
+            self._txn_start_time = _time.time()
 
     def commit(self) -> None:
         with self._lock.write():
@@ -210,8 +221,12 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._flush_catalog()
             self._pager.commit()
             self._txn_depth = 0
+            self._txn_start_time = None
         if self._for_update_held:
             self._for_update_held = False
+            self._lock.release_write()
+        if self._isolation_held:
+            self._isolation_held = False
             self._lock.release_write()
 
     def rollback(self) -> None:
@@ -222,9 +237,34 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             self._pager.rollback()
             self._reload_catalog()
             self._txn_depth = 0
+            self._txn_start_time = None
         if self._for_update_held:
             self._for_update_held = False
             self._lock.release_write()
+        if self._isolation_held:
+            self._isolation_held = False
+            self._lock.release_write()
+
+    def set_isolation_level(self, level: str) -> None:
+        """Set the transaction isolation level for subsequent transactions.
+
+        Must be called outside an active transaction.
+        Levels: READ UNCOMMITTED, READ COMMITTED (default),
+                REPEATABLE READ, SERIALIZABLE.
+        READ UNCOMMITTED is treated as READ COMMITTED (Hyperion cannot expose
+        uncommitted pages from other connections).
+        REPEATABLE READ and SERIALIZABLE both acquire an exclusive write lock
+        for the full transaction duration.
+        """
+        if self._txn_depth > 0:
+            raise TransactionError(
+                "Cannot change isolation level inside an active transaction"
+            )
+        valid = {"READ UNCOMMITTED", "READ COMMITTED",
+                 "REPEATABLE READ", "SERIALIZABLE"}
+        if level not in valid:
+            raise ValueError(f"Unknown isolation level: '{level}'")
+        self._isolation_level = level
 
     def _acquire_for_update(self) -> None:
         """Escalate the current transaction to an exclusive write lock.
