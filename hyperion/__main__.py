@@ -17,6 +17,10 @@ server
 http
     python -m hyperion http mydb.hdb [--host HOST] [--port PORT]
     Start a REST HTTP server for the database.
+
+mysql
+    python -m hyperion mysql mydb.hdb [--host HOST] [--port PORT]
+    Start a MySQL-protocol server; connect with any MySQL client.
 """
 import sys
 
@@ -82,11 +86,41 @@ def _run_http(argv: list[str]) -> None:
         db.close()
 
 
+def _run_mysql(argv: list[str]) -> None:
+    import argparse
+    from .database import Database
+    from .mysql_server import MySQLServer
+
+    p = argparse.ArgumentParser(
+        prog="python -m hyperion mysql",
+        description="Serve a Hyperion database over the MySQL wire protocol.",
+    )
+    p.add_argument("database", help="Database file path (use :memory: for in-memory)")
+    p.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    p.add_argument("--port", default=4406, type=int, help="Bind port (default: 4406)")
+    args = p.parse_args(argv)
+
+    db  = Database(args.database)
+    srv = MySQLServer(db, host=args.host, port=args.port)
+    host, port = srv.address
+    print(f"Hyperion MySQL server listening on {host}:{port}  (Ctrl-C to stop)")
+    print(f"Connect: mysql -h {host} -P {port} -u root --skip-ssl")
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+    finally:
+        srv.shutdown()
+        db.close()
+
+
 def main() -> None:
     if len(sys.argv) >= 2 and sys.argv[1] == "server":
         _run_server(sys.argv[2:])
     elif len(sys.argv) >= 2 and sys.argv[1] == "http":
         _run_http(sys.argv[2:])
+    elif len(sys.argv) >= 2 and sys.argv[1] == "mysql":
+        _run_mysql(sys.argv[2:])
     else:
         from .repl import main as repl_main
         repl_main()

@@ -393,7 +393,7 @@
 
 ### Network
 
-- [ ] MySQL wire protocol server — `python -m hyperion mysql mydb.hdb --port 4406`; implements the MySQL client/server protocol so any MySQL-compatible client connects without a Hyperion-specific driver:
+- [x] MySQL wire protocol server — `python -m hyperion mysql mydb.hdb --port 4406`; implements the MySQL client/server protocol so any MySQL-compatible client connects without a Hyperion-specific driver:
   - Server greeting / capability handshake — send server version string and capability flags; accept unauthenticated or password-bypass connections (`--skip-ssl`, empty password)
   - `COM_QUERY` — receive SQL string, execute against the database, return column-definition packets + row data packets + EOF/OK packet
   - `COM_PING` — respond with OK packet (keepalive)
