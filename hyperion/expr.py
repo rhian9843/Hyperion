@@ -21,6 +21,9 @@ def _get_user_funcs() -> dict:
 def _get_user_aggs() -> dict:
     return getattr(_tls, "user_aggs", {})
 
+def _get_eval_db() -> Any:
+    return getattr(_tls, "eval_db", None)
+
 # ── Last insert rowid tracking ─────────────────────────────────────────────────
 # Thread-local so concurrent inserts on different threads don't clobber each
 # other's cursor.lastrowid / LAST_INSERT_ROWID() result.
@@ -196,13 +199,39 @@ class CaseExpr:
         return None
 
 
+@dataclass
+class ScalarSubquery:
+    """(SELECT ...) scalar subquery embedded inside an expression."""
+    sql: str   # the SELECT statement text, without surrounding parens
+
+    def evaluate(self, row: dict) -> Any:
+        db = _get_eval_db()
+        if db is None:
+            return None
+        # Lazy imports to avoid circular dependency (where.py imports expr.py)
+        from .parser import parse as _parse_sql
+        from .where import _exec_correlated_subquery
+        try:
+            ast = _parse_sql(self.sql)
+        except Exception:
+            return None
+        rows = _exec_correlated_subquery(ast, db, row)
+        if not rows:
+            return None
+        first = rows[0]
+        if isinstance(first, dict):
+            return next(iter(first.values()), None)
+        return first[0] if first else None
+
+
 # Detect expressions that need evaluation (not a bare column name / simple literal)
 _IS_EXPR_RE = re.compile(
     r'\|\|'                                        # string concat
     r'|[+\-*/%]'                                   # arithmetic
     r'|^\s*(CASE|COALESCE|NULLIF|IFNULL|CAST)\b'   # known keywords / functions
     r'|\b(TRUE|FALSE|CURRENT_TIMESTAMP|CURRENT_DATE|CURRENT_TIME)\b'
-    r'|\w+\s*\(',                                  # any function call
+    r'|\w+\s*\('                                   # any function call
+    r'|\(\s*SELECT\b',                             # scalar subquery
     re.IGNORECASE | re.MULTILINE,
 )
 
@@ -866,8 +895,24 @@ def _parse_expr_primary(toks: list[str], pos: int) -> tuple[Any, int]:
     tok = toks[pos]
     upper = tok.upper()
 
-    # Parenthesised expression
+    # Parenthesised expression — or scalar subquery (SELECT ...)
     if tok == "(":
+        # Peek: if the first token inside is SELECT, treat as a scalar subquery
+        if pos + 1 < len(toks) and toks[pos + 1].upper() == "SELECT":
+            depth = 1
+            j = pos + 1
+            sub_toks: list[str] = []
+            while j < len(toks) and depth > 0:
+                t2 = toks[j]
+                if t2 == "(":
+                    depth += 1
+                elif t2 == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                sub_toks.append(t2)
+                j += 1
+            return ScalarSubquery(" ".join(sub_toks)), j + 1
         val, pos = _parse_expr_comp(toks, pos + 1)
         if pos < len(toks) and toks[pos] == ")":
             pos += 1

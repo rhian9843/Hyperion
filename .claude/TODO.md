@@ -386,6 +386,11 @@
 
 - [x] Fix unbalanced parentheses silently accepted in SELECT expressions — `SELECT (1 + 2` (missing closing `)`) was parsed without error: the `_parse_select` column loop exited with `paren_depth=1` and never checked for balance, and `_parse_expr_primary` in `expr.py` consumed the `(` then returned successfully even when no matching `)` followed; both layers now raise `ParseError("Unmatched '(' in expression")` on encountering an unclosed paren — string defaults are returned without quotes (`pending`) instead of as SQL literals (`'pending'`) as SQLite does; numeric defaults are already bare numbers which is correct; fix by wrapping text default values in single quotes in the `PRAGMA table_info` result rows so tools that parse the output (e.g. ORMs, schema diffing libraries) can distinguish a string default `'now'` from a function call `now()`
 
+### Bugs Found During Dashboard Testing (2026-06-12)
+
+- [x] Fix scalar subquery inside `CASE WHEN` condition — `CASE WHEN (SELECT SUM(amount) FROM orders WHERE user_id = users.id) > 50 THEN 'VIP' ...` raised `Unknown column: 'CASE WHEN ...'`; `_parse_expr_primary` in `expr.py` saw `(` and tried to parse the body as a regular arithmetic expression; `SELECT` is not a valid primary so the ParseError was swallowed by the column resolver into a misleading `NoSuchColumnError`; fixed by peeking at the next token after `(` — when it is `SELECT`, collect tokens to the matching `)` and return a `ScalarSubquery` AST node that executes via `_tls.eval_db` at evaluation time
+- [x] Fix scalar subquery as function argument — `COALESCE((SELECT COUNT(*) FROM orders WHERE user_id = users.id), 0)` and `ROUND(ut.total * 100.0 / (SELECT SUM(amount) FROM orders), 1)` raised `Unknown column` or `Unmatched '(' in expression`; same root cause as the CASE bug — function argument splitting produced a leading `(SELECT ...)` token group that the expression parser could not handle; fixed by the same `ScalarSubquery` node: the `( SELECT` peek in `_parse_expr_primary` intercepts the pattern before the regular paren-expression path is attempted
+
 ### Transactions
 
 - [x] `SELECT FOR UPDATE` — row-level locking within a transaction; `SELECT * FROM t WHERE id = 1 FOR UPDATE` acquires an exclusive lock on matched rows, blocking concurrent writers until `COMMIT` or `ROLLBACK`; required for safe read-modify-write patterns; implemented as a database-level exclusive write lock held for the transaction lifetime: parser detects `FOR UPDATE` clause, cursor acquires write lock permanently (released by commit/rollback, not by the SELECT itself), `_for_update_held` flag prevents double-acquisition; `FOR` added to `_ALIAS_BLOCKLIST` to prevent it being parsed as a table alias
@@ -402,7 +407,7 @@
   - Error packet — `ERR_Packet` with SQL state and typed message on any exception
   - `COM_INIT_DB` — handle `USE database` command sent by MySQL clients on connection or schema switch
   - Compatible clients: `mysql` CLI (`mysql -h 127.0.0.1 -P 4406 -u root --skip-ssl`), `mysql-connector-python`, `PyMySQL`, SQLAlchemy MySQL dialect
-- [ ] Web Dashboard — browser UI served at `GET /` by the HTTP server; shows database stats, table list, schema browser, and an interactive SQL query editor; no external JS dependencies (single self-contained HTML page)
+- [x] Web Dashboard — browser UI served at `GET /` by the HTTP server; shows database stats, table list, schema browser, and an interactive SQL query editor; no external JS dependencies (single self-contained HTML page)
 - [ ] DSN connection strings — `hyperion://host:port/dbname` format parsed by a `connect(dsn=...)` helper; standard format for ORMs and connection pool libraries
 - [ ] Server-side connection pooling — configurable pool size and max queue depth on the TCP server; reuses cursors across requests rather than spawning a new thread per connection; `SHOW PROCESSLIST` lists active connections with current query, user, and elapsed time
 

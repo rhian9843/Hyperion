@@ -789,6 +789,7 @@ def _rows_for_stmt(stmt: dict, db: "Database",
     from .expr import _tls
     _tls.user_funcs = db._user_funcs
     _tls.user_aggs  = db._user_aggs
+    _tls.eval_db    = db
     _check_timeout(db)
     ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     _prev_active_ctes = getattr(db, '_active_ctes', None)
@@ -1149,6 +1150,7 @@ def execute(stmt: dict, db: Database) -> str:
     from .expr import _tls
     _tls.user_funcs = db._user_funcs
     _tls.user_aggs  = db._user_aggs
+    _tls.eval_db    = db
 
     # Authorizer check (DML/DDL ops; SELECT ops are checked in Cursor.execute)
     if db._authorizer is not None:
