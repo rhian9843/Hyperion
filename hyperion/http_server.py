@@ -384,6 +384,10 @@ class _Handler(BaseHTTPRequestHandler):
             self._send(*self._get_health())
         elif path == "/replication/changes":
             self._send(*self._get_replication_changes())
+        elif path == "/replication/physical/snapshot":
+            self._send(*self._get_physical_snapshot())
+        elif path == "/replication/physical/changes":
+            self._send(*self._get_physical_changes())
         else:
             self._send(*_not_found(f"No route for GET {self.path}"))
 
@@ -514,6 +518,48 @@ class _Handler(BaseHTTPRequestHandler):
             changes = self._db.changelog.read_for_publication(pub.tables, since_lsn)
             return _ok({"changes": [e.to_dict() for e in changes],
                         "lsn": self._db._catalog.lsn})
+        except Exception as exc:
+            return _err(exc, 500)
+
+    def _get_physical_snapshot(self) -> tuple[int, dict]:
+        try:
+            from .pager import MemoryPager
+            db = self._db
+            if isinstance(db._pager, MemoryPager):
+                return _err(ValueError("Cannot snapshot an in-memory database"))
+            with db._lock.read():
+                db._pager._file.seek(0)
+                db_bytes = db._pager._file.read()
+                wal_path = db._pager._path.with_suffix(".wal")
+                wal_bytes = wal_path.read_bytes() if wal_path.exists() else b""
+                lsn = db._pager._phys_current_lsn
+            return _ok({
+                "lsn":      lsn,
+                "db_data":  base64.b64encode(db_bytes).decode(),
+                "wal_data": base64.b64encode(wal_bytes).decode() if wal_bytes else "",
+            })
+        except Exception as exc:
+            return _err(exc, 500)
+
+    def _get_physical_changes(self) -> tuple[int, dict]:
+        try:
+            qs        = self.path.split("?", 1)[1] if "?" in self.path else ""
+            params    = dict(p.split("=", 1) for p in qs.split("&") if "=" in p)
+            since_lsn = int(params.get("since", "0"))
+            db = self._db
+            from .pager import MemoryPager
+            if isinstance(db._pager, MemoryPager):
+                return _ok({"lsn": 0, "pages": [], "snapshot_required": False})
+            with db._lock.read():
+                lsn = db._pager._phys_current_lsn
+                if since_lsn == 0 or since_lsn < db._pager._phys_checkpoint_lsn:
+                    return _ok({"lsn": lsn, "snapshot_required": True})
+                pages = [
+                    {"page_num": pn, "data": base64.b64encode(data).decode()}
+                    for pn, (page_lsn, data) in db._pager._phys_dirty.items()
+                    if page_lsn > since_lsn
+                ]
+            return _ok({"lsn": lsn, "pages": pages, "snapshot_required": False})
         except Exception as exc:
             return _err(exc, 500)
 

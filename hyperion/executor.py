@@ -1845,6 +1845,43 @@ def _exec_show_subscriptions(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, ["name", "connection", "publication", "last_lsn"])
 
 
+def _exec_create_physical_subscription(stmt: dict, db: Database) -> str:
+    db.create_physical_subscription(stmt["name"], stmt["connection"],
+                                    if_not_exists=stmt.get("if_not_exists", False))
+    return f"Physical subscription '{stmt['name']}' created."
+
+
+def _exec_drop_physical_subscription(stmt: dict, db: Database) -> str:
+    db.drop_physical_subscription(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"Physical subscription '{stmt['name']}' dropped."
+
+
+def _exec_start_slave(stmt: dict, db: Database) -> str:
+    return db.start_slave(stmt.get("name"))
+
+
+def _exec_stop_slave(stmt: dict, db: Database) -> str:
+    return db.stop_slave(stmt.get("name"))
+
+
+def _exec_show_master_status(stmt: dict, db: Database) -> RowResult:
+    rows = db.show_master_status()
+    cols = ["binlog_pos", "db_size", "wal_size"]
+    return RowResult(rows, cols)
+
+
+def _exec_show_slave_status(stmt: dict, db: Database) -> RowResult:
+    rows = db.show_slave_status()
+    cols = ["name", "connection", "last_lsn", "status", "last_error", "last_sync"]
+    return RowResult(rows, cols)
+
+
+def _exec_show_binlog(stmt: dict, db: Database) -> RowResult:
+    rows = db.show_binlog()
+    cols = ["page_num", "catalog_lsn"]
+    return RowResult(rows, cols)
+
+
 _DISPATCH: dict[str, Any] = {
     "ANALYZE":                  _execute_analyze,
     "CREATE_TABLE_AS_SELECT":   _exec_create_table_as_select,
@@ -1867,8 +1904,15 @@ _DISPATCH: dict[str, Any] = {
     "DROP_PUBLICATION":         _exec_drop_publication,
     "CREATE_SUBSCRIPTION":      _exec_create_subscription,
     "DROP_SUBSCRIPTION":        _exec_drop_subscription,
-    "SHOW_PUBLICATIONS":        _exec_show_publications,
-    "SHOW_SUBSCRIPTIONS":       _exec_show_subscriptions,
+    "SHOW_PUBLICATIONS":              _exec_show_publications,
+    "SHOW_SUBSCRIPTIONS":             _exec_show_subscriptions,
+    "CREATE_PHYSICAL_SUBSCRIPTION":   _exec_create_physical_subscription,
+    "DROP_PHYSICAL_SUBSCRIPTION":     _exec_drop_physical_subscription,
+    "START_SLAVE":                    _exec_start_slave,
+    "STOP_SLAVE":                     _exec_stop_slave,
+    "SHOW_MASTER_STATUS":             _exec_show_master_status,
+    "SHOW_SLAVE_STATUS":              _exec_show_slave_status,
+    "SHOW_BINLOG":                    _exec_show_binlog,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

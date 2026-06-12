@@ -1,4 +1,6 @@
 import contextlib
+import json
+import os
 import struct
 import threading
 from collections import OrderedDict
@@ -163,6 +165,14 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
         self._changelog     = None   # lazily-created changelog view
         self._sub_workers: dict = {}    # sub_name → SubscriptionWorker
+        # Physical replication state — stored in <db>.phys_state JSON (not catalog)
+        self._phys_subs_path: Path | None = (
+            Path(path).with_suffix(".phys_state")
+            if str(path) != ":memory:" else None
+        )
+        self._phys_subs: dict = {}     # name → PhysicalSubscriptionMeta
+        self._phys_workers: dict = {}  # name → PhysicalReplicationWorker
+        self._load_phys_subs()
         # Crash recovery: re-stage any logical entries recovered from the WAL back
         # into a fresh WAL transaction.  This preserves retention (entries with
         # lsn > min_consumed_lsn survive subsequent checkpoints) without needing
@@ -172,6 +182,10 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         # Restart subscription workers for any subscriptions already in catalog
         for sub_name in list(self._catalog.subscriptions):
             self._start_sub_worker(sub_name)
+        # Restart physical replication workers marked auto_start
+        for sub_name, sub in list(self._phys_subs.items()):
+            if sub.auto_start:
+                self._start_phys_worker(sub_name)
 
     def _exec_stmt_with_ctes(self, stmt: dict, ctes: dict) -> list[dict]:
         from .executor import _rows_for_stmt
@@ -230,7 +244,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             if self._txn_depth == 0:
                 raise TransactionError("No active transaction")
             self._flush_catalog()
-            self._pager.commit(min_consumed_lsn=self._min_consumed_lsn())
+            self._pager.commit(min_consumed_lsn=self._min_consumed_lsn(),
+                               catalog_lsn=1)  # non-zero → track phys_dirty
             self._txn_depth = 0
             self._txn_start_time = None
         if self._for_update_held:
@@ -1108,7 +1123,122 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         if w is not None:
             w.stop()
 
+    # ── Physical replication ──────────────────────────────────────────────────
+
+    def _load_phys_subs(self) -> None:
+        from .physical_replication import PhysicalSubscriptionMeta
+        self._phys_subs = {}
+        if self._phys_subs_path is None or not self._phys_subs_path.exists():
+            return
+        try:
+            entries = json.loads(self._phys_subs_path.read_text())
+            for entry in entries:
+                m = PhysicalSubscriptionMeta(**entry)
+                self._phys_subs[m.name] = m
+        except Exception:
+            pass
+
+    def _save_phys_subs(self) -> None:
+        if self._phys_subs_path is None:
+            return
+        from dataclasses import asdict
+        data = [asdict(m) for m in self._phys_subs.values()]
+        self._phys_subs_path.write_text(json.dumps(data, indent=2))
+
+    def create_physical_subscription(self, name: str, connection: str,
+                                     if_not_exists: bool = False) -> None:
+        with self._lock.write():
+            if name in self._phys_subs:
+                if if_not_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"Physical subscription '{name}' already exists")
+            from .physical_replication import PhysicalSubscriptionMeta
+            self._phys_subs[name] = PhysicalSubscriptionMeta(name, connection)
+            self._save_phys_subs()
+
+    def drop_physical_subscription(self, name: str, if_exists: bool = False) -> None:
+        self._stop_phys_worker(name)
+        with self._lock.write():
+            if name not in self._phys_subs:
+                if if_exists:
+                    return
+                from .errors import SchemaError
+                raise SchemaError(f"No such physical subscription: '{name}'")
+            del self._phys_subs[name]
+            self._save_phys_subs()
+
+    def _start_phys_worker(self, sub_name: str) -> None:
+        if sub_name in self._phys_workers:
+            return
+        from .physical_replication import PhysicalReplicationWorker
+        w = PhysicalReplicationWorker(self, sub_name)
+        self._phys_workers[sub_name] = w
+        w.start()
+
+    def _stop_phys_worker(self, sub_name: str) -> None:
+        w = self._phys_workers.pop(sub_name, None)
+        if w is not None:
+            w.stop()
+
+    def start_slave(self, name: str | None = None) -> str:
+        with self._lock.write():
+            targets = [name] if name else list(self._phys_subs)
+            for sub_name in targets:
+                if sub_name not in self._phys_subs:
+                    from .errors import SchemaError
+                    raise SchemaError(f"No such physical subscription: '{sub_name}'")
+                self._phys_subs[sub_name].auto_start = True
+                self._start_phys_worker(sub_name)
+            self._save_phys_subs()
+        return "Slave started."
+
+    def stop_slave(self, name: str | None = None) -> str:
+        targets = [name] if name else list(self._phys_workers)
+        for sub_name in list(targets):
+            self._stop_phys_worker(sub_name)
+            if sub_name in self._phys_subs:
+                self._phys_subs[sub_name].auto_start = False
+        self._save_phys_subs()
+        self._readonly = False  # promote: re-enable writes regardless of worker state
+        return "Slave stopped."
+
+    def show_master_status(self) -> list[dict]:
+        if isinstance(self._pager, MemoryPager):
+            return [{"binlog_pos": 0, "db_size": 0, "wal_size": 0}]
+        wal_path = self._pager._path.with_suffix(".wal")
+        return [{
+            "binlog_pos": self._pager._phys_current_lsn,
+            "db_size":    os.path.getsize(self._pager._path),
+            "wal_size":   os.path.getsize(wal_path) if wal_path.exists() else 0,
+        }]
+
+    def show_slave_status(self) -> list[dict]:
+        rows = []
+        for name, sub in self._phys_subs.items():
+            worker = self._phys_workers.get(name)
+            rows.append({
+                "name":       name,
+                "connection": sub.connection,
+                "last_lsn":   sub.last_lsn,
+                "status":     worker.status if worker else "Stopped",
+                "last_error": worker._last_error if worker else "",
+                "last_sync":  round(worker._last_sync_ts, 3) if worker else 0.0,
+            })
+        return rows
+
+    def show_binlog(self) -> list[dict]:
+        if isinstance(self._pager, MemoryPager):
+            return []
+        phys_dirty = dict(self._pager._phys_dirty)
+        return [
+            {"page_num": pn, "catalog_lsn": lsn}
+            for pn, (lsn, _) in sorted(phys_dirty.items(), key=lambda x: x[1][0])
+        ]
+
     def close(self) -> None:
+        for name in list(self._phys_workers):
+            self._stop_phys_worker(name)
         for name in list(self._sub_workers):
             self._stop_sub_worker(name)
         with self._lock.write():

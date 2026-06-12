@@ -1194,6 +1194,8 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_publication(t, 2)
     if sub == "SUBSCRIPTION":
         return _parse_create_subscription(t, 2)
+    if sub == "PHYSICAL" and len(t) > 2 and t[2].upper() == "SUBSCRIPTION":
+        return _parse_create_physical_subscription(t, 3)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -1223,6 +1225,28 @@ def _parse_create_publication(t: list[str], i: int) -> dict:
     if not tables:
         raise ParseError("Expected at least one table name after FOR TABLE")
     return {"op": "CREATE_PUBLICATION", "name": name, "tables": tables}
+
+
+def _parse_create_physical_subscription(t: list[str], i: int) -> dict:
+    if_not_exists = False
+    if i < len(t) and t[i].upper() == "IF":
+        if (i + 2 < len(t)
+                and t[i + 1].upper() == "NOT"
+                and t[i + 2].upper() == "EXISTS"):
+            if_not_exists = True; i += 3
+        else:
+            raise ParseError("Expected NOT EXISTS after IF in CREATE PHYSICAL SUBSCRIPTION")
+    if i >= len(t):
+        raise ParseError("Expected subscription name after CREATE PHYSICAL SUBSCRIPTION")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "CONNECTION":
+        raise ParseError("Expected CONNECTION after subscription name")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected connection string after CONNECTION")
+    conn = t[i].strip("'\""); i += 1
+    return {"op": "CREATE_PHYSICAL_SUBSCRIPTION", "name": name,
+            "connection": conn, "if_not_exists": if_not_exists}
 
 
 def _parse_create_subscription(t: list[str], i: int) -> dict:
@@ -1347,6 +1371,15 @@ def _parse_drop(t: list[str]) -> dict:
         if i >= len(t):
             raise ParseError("Expected subscription name after DROP SUBSCRIPTION")
         return {"op": "DROP_SUBSCRIPTION", "name": t[i], "if_exists": if_exists}
+    if sub == "PHYSICAL" and len(t) > 2 and t[2].upper() == "SUBSCRIPTION":
+        i = 3
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+        if i >= len(t):
+            raise ParseError("Expected name after DROP PHYSICAL SUBSCRIPTION")
+        return {"op": "DROP_PHYSICAL_SUBSCRIPTION", "name": t[i], "if_exists": if_exists}
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -2040,5 +2073,21 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "SHOW_PUBLICATIONS"}
         if len(t) > 1 and t[1].upper() == "SUBSCRIPTIONS":
             return {"op": "SHOW_SUBSCRIPTIONS"}
+        if len(t) > 2 and t[1].upper() == "MASTER" and t[2].upper() == "STATUS":
+            return {"op": "SHOW_MASTER_STATUS"}
+        if len(t) > 2 and t[1].upper() == "SLAVE" and t[2].upper() == "STATUS":
+            return {"op": "SHOW_SLAVE_STATUS"}
+        if len(t) > 1 and t[1].upper() == "BINLOG":
+            return {"op": "SHOW_BINLOG"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
+    if kw == "START":
+        if len(t) > 1 and t[1].upper() == "SLAVE":
+            name = t[2] if len(t) > 2 else None
+            return {"op": "START_SLAVE", "name": name}
+        raise ParseError(f"Unknown START variant: '{' '.join(t[1:])}'")
+    if kw == "STOP":
+        if len(t) > 1 and t[1].upper() == "SLAVE":
+            name = t[2] if len(t) > 2 else None
+            return {"op": "STOP_SLAVE", "name": name}
+        raise ParseError(f"Unknown STOP variant: '{' '.join(t[1:])}'")
     raise ParseError(f"Unrecognized statement: '{t[0]}'")

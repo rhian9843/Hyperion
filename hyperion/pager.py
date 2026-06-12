@@ -63,6 +63,10 @@ class Pager:
         self._wal_applied_offset: int = WAL.HDR_SIZE  # WAL tail already in _cache
         # Logical entries recovered from the WAL on startup — drained by Database.__init__
         self._recovery_logical: list[dict] = []
+        # Physical replication: track which pages changed since last checkpoint
+        self._phys_dirty: dict[int, tuple[int, bytes]] = {}  # pn → (catalog_lsn, page_bytes)
+        self._phys_current_lsn:    int = 0  # catalog_lsn of most recent commit
+        self._phys_checkpoint_lsn: int = 0  # catalog_lsn at last checkpoint
 
     def _load(self, num: int) -> bytearray:
         if num not in self._cache:
@@ -158,8 +162,12 @@ class Pager:
         self._in_txn  = True
         self._write_tid = threading.get_ident()
 
-    def commit(self, min_consumed_lsn: int = 0) -> None:
+    def commit(self, min_consumed_lsn: int = 0, catalog_lsn: int = 0) -> None:
         """Commit the current transaction.
+
+        catalog_lsn > 0: record dirty pages in _phys_dirty for the physical
+        replication changes endpoint.  Pass 0 (default) on replica databases
+        to suppress tracking — pages applied from the primary are not re-exported.
 
         If the WAL has accumulated CHECKPOINT_PAGES dirty pages, a checkpoint
         is triggered: all committed PAGE frames are applied to the db file, and
@@ -171,6 +179,10 @@ class Pager:
         assert self._wal is not None
         for page in self._working.values():
             stamp_page(page)
+        if catalog_lsn > 0 and self._working:
+            self._phys_current_lsn += 1
+            for pn, page in self._working.items():
+                self._phys_dirty[pn] = (self._phys_current_lsn, bytes(page))
         self._wal.commit_txn(self._working)
         self._cache.update(self._working)
         self._working.clear()
@@ -179,6 +191,8 @@ class Pager:
         self._write_tid = None
         if self._wal.needs_checkpoint():
             self._wal.checkpoint(self._file, min_consumed_lsn)
+            self._phys_checkpoint_lsn = self._phys_current_lsn
+            self._phys_dirty.clear()
         # Advance the applied watermark so the next begin() skips already-cached
         # pages.  After a checkpoint, begin_offset() returns the end of the
         # compacted WAL (HDR_SIZE + retained logical frames).
@@ -284,7 +298,7 @@ class MemoryPager:
         self._in_txn    = True
         self._write_tid = threading.get_ident()
 
-    def commit(self, min_consumed_lsn: int = 0) -> None:
+    def commit(self, min_consumed_lsn: int = 0, catalog_lsn: int = 0) -> None:
         if not self._in_txn:
             raise TransactionError("No active transaction")
         self._cache.update(self._working)
@@ -302,5 +316,5 @@ class MemoryPager:
         self._in_txn    = False
         self._write_tid = None
 
-    def close(self, min_consumed_lsn: int = 0) -> None:
+    def close(self, min_consumed_lsn: int = 0, catalog_lsn: int = 0) -> None:
         pass  # no WAL, nothing to flush
