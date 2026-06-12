@@ -1452,9 +1452,33 @@ def _exec_create_table(stmt: dict, db: Database) -> str:
 
 
 def _exec_create_column_table(stmt: dict, db: Database) -> str:
-    from .schema import Schema
+    from .schema import Schema, Column
     if stmt.get("if_not_exists") and stmt["name"] in db.tables:
         return f"Table '{stmt['name']}' already exists."
+
+    # Handle: CREATE COLUMN TABLE t AS SELECT ...
+    if "select" in stmt:
+        rows = _rows_for_stmt(stmt["select"], db)
+        if not rows:
+            sel_cols = stmt["select"].get("columns") or []
+            columns = [Column(c, TEXT, DEFAULT_TEXT_SIZE) for c in sel_cols if c != "*"]
+        else:
+            columns = []
+            for col_name, val in rows[0].items():
+                if isinstance(val, int):
+                    columns.append(Column(col_name, INTEGER, 8))
+                elif isinstance(val, float):
+                    columns.append(Column(col_name, REAL, 8))
+                else:
+                    max_len = max(len(str(r.get(col_name) or "")) for r in rows)
+                    columns.append(Column(col_name, TEXT, max(DEFAULT_TEXT_SIZE, max_len + 16)))
+        db.create_table(Schema(name=stmt["name"], columns=columns), storage_type="column")
+        for row in rows:
+            db.insert(stmt["name"], row)
+        n = len(rows)
+        _invalidate_rc(db, stmt["name"])
+        return f"Column table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
+
     pk_cols = stmt.get("primary_key_columns") or []
     if pk_cols:
         for col in stmt["columns"]:

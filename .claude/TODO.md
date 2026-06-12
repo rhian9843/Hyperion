@@ -417,6 +417,26 @@
 - [x] Columnar aggregate scans — when the query touches only a subset of columns and the table is a column table, scan only those column arrays; `GROUP BY` fallback to row-store path when needed
 - [x] `SHOW STORAGE FORMAT` — introspection command returning `ROW` or `COLUMN` for each table
 
+#### Column Store — Bugs & Gaps (Post-Implementation Audit)
+
+##### Critical — Data Loss / Corruption
+
+- [x] Fix VACUUM corrupts column tables — `database.py:_vacuum_inner()` calls `deserialize_row(schema, db._unpack_row_cell(raw))` on the output of `.scan()` for every table without checking `storage_type`; column store's `.scan()` returns packed cells in column-store encoding, not row-store cells, so the deserialiser produces garbage rows; the vacuumed copy of a column table contains corrupt or no data; fix by branching on `tmeta.storage_type == "column"` and using `.scan_rows()` + `tree.insert_row()` for the copy step
+- [x] Fix ON DELETE CASCADE / SET NULL broken when column table is the FK parent — `constraints.py:_check_fk_parent()` calls `tree.delete(victim_ids)` and `tree.update()` which are BTree-only methods; column store has no `.delete()` / `.update()` methods so these raise `AttributeError` at runtime; any schema with a column-table parent and a cascading FK is silently broken; fix by detecting `tmeta.storage_type == "column"` and calling `tree.apply_deletes()` / `tree.apply_updates()` instead
+- [x] Fix `CREATE COLUMN TABLE AS SELECT` silently creates a row table — `parser.py:_parse_create_table()` detects `AS SELECT` and overwrites the op to `CREATE_TABLE_AS_SELECT` before returning; `executor.py:_exec_create_table_as_select` always calls `create_table(..., storage_type="row")`; the COLUMN intent is dropped with no error; fix by threading `storage_type` through the AST node and passing it to `create_table()` in the AS-SELECT executor
+- [x] Fix INSERT OR REPLACE corrupts indexes on column tables — audit finding was a false positive; `apply_deletes()` only rewrites column chunk pages and does not touch index BTrees; the separate index cleanup loop in `_remove_conflicting_rows` is necessary and correct for both storage types; verified with a direct test
+
+##### High Priority — Silent Wrong Answers
+
+- [x] Fix FK child index probe unconditionally excluded for column tables — `constraints.py:_matching_child_rows()` has a hard `and tmeta.storage_type != "column"` guard at line 319 that skips the index lookup path and forces an O(n) full scan even when a perfect index exists on the FK column; fix by removing the guard and implementing a `lookup(rowid)` compatible path for column tables, or by routing through `probe_index` + `scan_rows` filter
+
+##### Medium Priority — Missing Optimisations
+
+- [x] Push down GROUP BY aggregates to column store — `query.py:_group_by_select()` always materialises all rows via `scan_rows()` regardless of storage type; `scan_aggregate()` is never invoked from the GROUP BY path so `SELECT region, SUM(revenue) FROM cs_sales GROUP BY region` reads every column in every row; fix by calling `scan_aggregate()` per group bucket when the table is a column store and the aggregates are pushdown-eligible (no DISTINCT, no expressions)
+- [x] Push down aggregates with WHERE clause to column store — `query.py:_aggregate_select()` only calls `scan_aggregate()` when `not where`; a query like `SELECT SUM(revenue) FROM cs_sales WHERE region = 'East'` materialises the full table then aggregates in Python; fix by passing the WHERE predicate into `scan_aggregate()` so rows failing the filter are skipped during the chunk-page traversal
+- [x] Fix `integrity_check` skipping column store page checksums — `introspect.py:integrity_check()` validates BTree structural invariants and calls `verify_page()` on BTree pages but never reads or verifies `PAGE_COLUMN_HDR` / `PAGE_COLUMN_CHUNK` pages; a corrupted column store page goes undetected; fix by adding a column-store branch that walks all header and chunk pages via the directory and calls `verify_page()` on each
+- [x] Add column store visibility to EXPLAIN / EXPLAIN QUERY PLAN — query plan output shows `SCAN TABLE t` regardless of storage format; users have no way to confirm column storage or aggregate pushdown is being used; fix by appending `[COLUMN STORE]` to the scan node label and `[AGGREGATE PUSHDOWN]` when `scan_aggregate()` is invoked
+
 ### Replication
 
 - [ ] Logical replication — `CREATE PUBLICATION pub FOR TABLE t1, t2` on the primary; `CREATE SUBSCRIPTION sub CONNECTION '...' PUBLICATION pub` on the replica; changes are streamed as an append-only change log and applied on the subscriber

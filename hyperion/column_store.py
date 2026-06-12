@@ -365,13 +365,20 @@ class ColumnStore:
 
     # ── Aggregate pushdown ────────────────────────────────────────────────────
 
-    def scan_aggregate(self, columns: list[str]) -> list[dict] | None:
-        """Streaming aggregates without WHERE.
+    def scan_aggregate(self, columns: list[str],
+                       row_filter: "Callable[[dict], bool] | None" = None,
+                       ) -> list[dict] | None:
+        """Streaming aggregates, optionally filtered by a WHERE predicate.
 
-        Returns a single-element list (same shape as _compute_aggregates) or
-        None if any column is not a plain aggregate or uses DISTINCT.
+        When row_filter is None (no WHERE) and the query is COUNT(*), uses the
+        O(1) header read.  When row_filter is provided, scans via scan_rows() and
+        accumulates in O(1) memory — never builds a matching-rows list.
+
+        Returns a single-element list or None if pushdown is not applicable
+        (DISTINCT, unknown column, non-aggregate expression).
         """
-        result: dict[str, Any] = {}
+        # Parse and validate all aggregate specs up front.
+        specs: list[tuple[str, str, str]] = []  # (expr, FUNC, arg)
         for expr in columns:
             m = _AGG_PAT.match(expr.strip())
             if not m:
@@ -380,17 +387,59 @@ class ColumnStore:
                                       m.group(2),
                                       m.group(3).strip())
             if distinct_kw:
-                return None   # DISTINCT requires materialization
-
-            if func == "COUNT" and arg == "*":
-                hdr_pg = self._pager.read_page(self._root)
-                result[expr] = struct.unpack_from('<I', hdr_pg, 1)[0]
-            else:
-                col_idx, col_type = self._col_index_and_type(arg)
+                return None
+            if func != "COUNT" or arg != "*":
+                col_idx, _ = self._col_index_and_type(arg)
                 if col_idx is None:
                     return None
-                result[expr] = self._stream_agg(col_idx, col_type, func)
+            specs.append((expr, func, arg))
 
+        # Fast path: no WHERE — COUNT(*) is O(1), others stream chunk pages directly.
+        if row_filter is None:
+            result: dict[str, Any] = {}
+            for expr, func, arg in specs:
+                if func == "COUNT" and arg == "*":
+                    hdr_pg = self._pager.read_page(self._root)
+                    result[expr] = struct.unpack_from('<I', hdr_pg, 1)[0]
+                else:
+                    col_idx, col_type = self._col_index_and_type(arg)
+                    result[expr] = self._stream_agg(col_idx, col_type, func)
+            return [result]
+
+        # Filtered path: scan_rows() for WHERE evaluation, accumulate inline.
+        totals:  dict[str, float] = {e: 0.0 for e, f, _ in specs if f in ("SUM", "AVG")}
+        counts:  dict[str, int]   = {e: 0   for e, _, _ in specs}
+        extrema: dict[str, Any]   = {e: None for e, f, _ in specs if f in ("MIN", "MAX")}
+
+        for _, row in self.scan_rows():
+            if not row_filter(row):
+                continue
+            for expr, func, arg in specs:
+                if func == "COUNT" and arg == "*":
+                    counts[expr] += 1
+                else:
+                    v = row.get(arg)
+                    if v is not None:
+                        counts[expr] += 1
+                        if func in ("SUM", "AVG"):
+                            totals[expr] += float(v)
+                        elif func == "MIN":
+                            if extrema[expr] is None or v < extrema[expr]:
+                                extrema[expr] = v
+                        elif func == "MAX":
+                            if extrema[expr] is None or v > extrema[expr]:
+                                extrema[expr] = v
+
+        result = {}
+        for expr, func, arg in specs:
+            if func == "COUNT":
+                result[expr] = counts[expr]
+            elif func == "SUM":
+                result[expr] = totals[expr] if counts[expr] > 0 else None
+            elif func == "AVG":
+                result[expr] = totals[expr] / counts[expr] if counts[expr] > 0 else None
+            else:
+                result[expr] = extrema[expr]
         return [result]
 
     def _col_index_and_type(self, col_name: str) -> tuple[int | None, str | None]:
@@ -431,6 +480,92 @@ class ColumnStore:
         if func == 'SUM':    return total if count > 0 else None
         if func == 'AVG':    return total / count if count > 0 else None
         return extremum  # MIN or MAX
+
+    def scan_aggregate_grouped(self, group_cols: list[str],
+                               columns: list[str]) -> list[dict] | None:
+        """Streaming GROUP BY aggregates reading only the needed column chains.
+
+        Only reads the GROUP BY columns and aggregate argument columns — all other
+        columns are skipped entirely. Returns None if any selected column is not
+        a GROUP BY key or a pushdown-eligible aggregate (no DISTINCT, no expressions,
+        known functions only).
+        """
+        # Classify every selected column as a GROUP BY key or an aggregate spec.
+        group_col_set = set(group_cols)
+        agg_specs: list[tuple[str, str, str]] = []  # (expr, FUNC, arg_or_star)
+        for col in columns:
+            if col in group_col_set:
+                continue  # GROUP BY key — handled separately
+            m = _AGG_PAT.match(col.strip())
+            if not m:
+                return None  # expression or alias we can't push down
+            func, distinct_kw, arg = (m.group(1).upper(),
+                                      m.group(2),
+                                      m.group(3).strip())
+            if distinct_kw:
+                return None
+            agg_specs.append((col, func, arg))
+
+        # Read GROUP BY column chains (only these columns).
+        group_chains: list[list] = []
+        for gc in group_cols:
+            col_idx, col_type = self._col_index_and_type(gc)
+            if col_idx is None:
+                return None
+            group_chains.append(self._read_col_entries(col_idx, col_type))
+
+        if not group_chains:
+            return None
+        n_rows = len(group_chains[0])
+
+        # Build buckets: group_key_tuple → list of physical row indices.
+        buckets: dict[tuple, list[int]] = {}
+        for i in range(n_rows):
+            key = tuple(chain[i] for chain in group_chains)
+            if key not in buckets:
+                buckets[key] = []
+            buckets[key].append(i)
+
+        # Pre-read each distinct aggregate argument column (deduplicated).
+        agg_col_data: dict[int, list] = {}
+        for _, func, arg in agg_specs:
+            if func == "COUNT" and arg == "*":
+                continue
+            col_idx, col_type = self._col_index_and_type(arg)
+            if col_idx is None:
+                return None
+            if col_idx not in agg_col_data:
+                agg_col_data[col_idx] = self._read_col_entries(col_idx, col_type)
+
+        # Assemble one result row per bucket.
+        results: list[dict] = []
+        for key, indices in buckets.items():
+            row: dict[str, Any] = {}
+            for gc, kv in zip(group_cols, key):
+                row[gc] = kv
+            for expr, func, arg in agg_specs:
+                if func == "COUNT" and arg == "*":
+                    row[expr] = len(indices)
+                else:
+                    col_idx, _ = self._col_index_and_type(arg)
+                    col_vals = agg_col_data[col_idx]
+                    vals = [col_vals[i] for i in indices if col_vals[i] is not None]
+                    if func == "COUNT":
+                        row[expr] = len(vals)
+                    elif func == "SUM":
+                        row[expr] = sum(float(v) for v in vals) if vals else None
+                    elif func == "AVG":
+                        row[expr] = (sum(float(v) for v in vals) / len(vals)
+                                     if vals else None)
+                    elif func == "MIN":
+                        row[expr] = min(vals) if vals else None
+                    elif func == "MAX":
+                        row[expr] = max(vals) if vals else None
+                    else:
+                        return None
+            results.append(row)
+
+        return results
 
     # ── BTree-compatible scan (for vacuum / iterdump / ANALYZE) ───────────────
 

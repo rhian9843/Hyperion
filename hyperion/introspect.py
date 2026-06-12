@@ -145,14 +145,43 @@ def integrity_check(db: "Database") -> list[str]:
     from .encoding import _idx_key_sz
     from .catalog import Catalog
 
+    from .column_store import PAGE_COLUMN_HDR, PAGE_COLUMN_CHUNK
+
     errors: list[str] = []
 
-    # ── B-tree structural checks ──────────────────────────────────────────────
+    # ── Structural checks ─────────────────────────────────────────────────────
 
     for tname, meta in db._catalog.tables.items():
         prev_key: int | None = None
         try:
             if meta.storage_type == "column":
+                # Page-type validation for HDR and chunk pages.
+                hdr_pg = db._pager.read_page(meta.root_page)
+                if hdr_pg[0] != PAGE_COLUMN_HDR:
+                    errors.append(
+                        f"table '{tname}': root page {meta.root_page} has "
+                        f"type 0x{hdr_pg[0]:02x}, expected PAGE_COLUMN_HDR (0x10)"
+                    )
+                # Walk all chunk pages and check their type flag.
+                for pn in db._collect_column_store_pages(meta.root_page):
+                    if pn == meta.root_page:
+                        continue
+                    cp = db._pager.read_page(pn)
+                    if cp[0] != PAGE_COLUMN_CHUNK:
+                        errors.append(
+                            f"table '{tname}': chunk page {pn} has "
+                            f"type 0x{cp[0]:02x}, expected PAGE_COLUMN_CHUNK (0x11)"
+                        )
+                # Row-count consistency: header row_count vs rowid chain length.
+                import struct as _s
+                hdr_count = _s.unpack_from('<I', hdr_pg, 1)[0]
+                actual_count = sum(1 for _ in db._table_btree(meta).scan_rows())
+                if hdr_count != actual_count:
+                    errors.append(
+                        f"table '{tname}': header row_count={hdr_count} "
+                        f"but rowid chain has {actual_count} entries"
+                    )
+                # Rowid ordering check.
                 for key, _ in db._table_btree(meta).scan_rows():
                     if prev_key is not None and key <= prev_key:
                         errors.append(
@@ -173,7 +202,7 @@ def integrity_check(db: "Database") -> list[str]:
                     except Exception as exc:
                         errors.append(f"table '{tname}': corrupt row at key {key}: {exc}")
         except Exception as exc:
-            errors.append(f"table '{tname}': B-tree scan failed: {exc}")
+            errors.append(f"table '{tname}': scan failed: {exc}")
 
     for iname, imeta in db._catalog.indexes.items():
         if imeta.table_name not in db._catalog.tables:
@@ -202,7 +231,10 @@ def integrity_check(db: "Database") -> list[str]:
         known.add(db._catalog_ops_pn)
     known.update(db._catalog_ops_extra)
     for tmeta in db._catalog.tables.values():
-        known.update(db._collect_tree_pages(tmeta.root_page))
+        if tmeta.storage_type == "column":
+            known.update(db._collect_column_store_pages(tmeta.root_page))
+        else:
+            known.update(db._collect_tree_pages(tmeta.root_page))
     for imeta in db._catalog.indexes.values():
         known.update(db._collect_tree_pages(imeta.root_page,
                                             key_sz=_idx_key_sz(len(imeta.columns))))
@@ -266,11 +298,15 @@ def _plan_rows(stmt: dict, db: "Database", out: list[dict],
         where    = stmt.get("where")
         group_by = stmt.get("group_by")
         order_by = stmt.get("order_by")
+        columns  = stmt.get("columns") or []
         idx_name = _pick_index_name(db, tbl, where)
+        is_col   = (tbl in db._catalog.tables and
+                    db._catalog.tables[tbl].storage_type == "column")
         if idx_name:
             detail = f"SEARCH TABLE {tbl} USING INDEX {idx_name}"
         else:
-            detail = f"SCAN TABLE {tbl}"
+            col_tag = " [COLUMN STORE]" if is_col else ""
+            detail  = f"SCAN TABLE {tbl}{col_tag}"
         if group_by:
             detail += f" (GROUP BY {', '.join(group_by)})"
         if order_by:
@@ -278,6 +314,8 @@ def _plan_rows(stmt: dict, db: "Database", out: list[dict],
                 f"{o['col']} {'DESC' if o.get('desc') else 'ASC'}" for o in order_by
             )
             detail += f" (ORDER BY {order_cols})"
+        if is_col and _is_aggregate_pushdown(columns, group_by):
+            detail += " [AGGREGATE PUSHDOWN]"
         out.append({"id": my_id, "parent": parent, "notused": 0, "detail": detail})
         return
 
@@ -329,7 +367,8 @@ def _table_scan_detail(db: "Database", tbl: str) -> str:
     if tbl in db._catalog.views:
         return f"MATERIALIZE VIEW {tbl}"
     if tbl in db._catalog.tables:
-        return f"SCAN TABLE {tbl}"
+        tag = " [COLUMN STORE]" if db._catalog.tables[tbl].storage_type == "column" else ""
+        return f"SCAN TABLE {tbl}{tag}"
     return f"SCAN {tbl}"
 
 
@@ -354,3 +393,23 @@ def _find_index_for_col(db: "Database", tbl: str, col: str) -> str | None:
     if idx:
         return next((n for n, m in db.indexes.items() if m is idx), None)
     return None
+
+
+def _is_aggregate_pushdown(columns: list[str],
+                            group_by: list[str] | None) -> bool:
+    """Return True if all selected columns would be handled by aggregate pushdown."""
+    import re as _re
+    _PAT = _re.compile(
+        r'^(COUNT|MIN|MAX|SUM|AVG)\s*\(\s*(DISTINCT\s+)?(.+?)\s*\)$',
+        _re.IGNORECASE,
+    )
+    group_set = set(group_by or [])
+    for col in columns:
+        if col in group_set:
+            continue
+        m = _PAT.match(col.strip())
+        if not m:
+            return False
+        if m.group(2):           # DISTINCT — requires materialisation
+            return False
+    return bool(columns)         # at least one column selected

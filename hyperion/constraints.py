@@ -316,7 +316,7 @@ class ConstraintsMixin:
                 idx_meta = m
                 break
 
-        if idx_meta is not None and tmeta.storage_type != "column":
+        if idx_meta is not None:
             col_types = []
             for col_name in fk.columns:
                 col_obj = next((c for c in child_schema.columns
@@ -330,17 +330,26 @@ class ConstraintsMixin:
                 lo = _make_index_key(val_key, 0)
                 hi = _make_index_key(val_key, 0xFFFFFFFFFFFFFFFF)
                 matching: list[tuple[int, dict]] = []
-                child_btree = self._table_btree(tmeta)
-                for _, rowid_raw in self._index_btree(idx_meta).scan_range(lo, hi):
-                    rowid = struct.unpack("q", rowid_raw)[0]
-                    raw = child_btree.lookup(rowid)
-                    if raw is not None:
-                        child_row = deserialize_row(
-                            child_schema, self._unpack_row_cell(raw))
-                        matching.append((rowid, child_row))
+                if tmeta.storage_type == "column":
+                    # Column store has no lookup(rowid); collect wanted rowids from
+                    # the index then filter during scan_rows.
+                    wanted = {struct.unpack("q", rb)[0]
+                              for _, rb in self._index_btree(idx_meta).scan_range(lo, hi)}
+                    for rowid, child_row in self._table_btree(tmeta).scan_rows():
+                        if rowid in wanted:
+                            matching.append((rowid, child_row))
+                else:
+                    child_btree = self._table_btree(tmeta)
+                    for _, rowid_raw in self._index_btree(idx_meta).scan_range(lo, hi):
+                        rowid = struct.unpack("q", rowid_raw)[0]
+                        raw = child_btree.lookup(rowid)
+                        if raw is not None:
+                            child_row = deserialize_row(
+                                child_schema, self._unpack_row_cell(raw))
+                            matching.append((rowid, child_row))
                 return matching
 
-        # Full scan fallback (no index on FK columns, or column-store child table)
+        # Full scan fallback (no index on FK columns)
         matching = []
         if tmeta.storage_type == "column":
             for rowid, child_row in self._table_btree(tmeta).scan_rows():
@@ -387,7 +396,10 @@ class ConstraintsMixin:
                         for _, child_row in matching:
                             self._check_fk_parent(tname, child_row, is_delete=True)
                         victim_ids = {r for r, _ in matching}
-                        self._table_btree(tmeta).delete(victim_ids)
+                        if tmeta.storage_type == "column":
+                            self._table_btree(tmeta).apply_deletes(victim_ids)
+                        else:
+                            self._table_btree(tmeta).delete(victim_ids)
                         for im in self._indexes_for(tname):
                             col_types = [next(c.type for c in child_schema.columns
                                              if c.name == n)
@@ -403,20 +415,40 @@ class ConstraintsMixin:
                         # ON UPDATE CASCADE: propagate new ref column values to children
                         if new_row is not None:
                             new_ref_vals = [new_row.get(c) for c in fk.ref_columns]
-                            upd: dict[int, bytes] = {}
-                            for rowid, child_row in matching:
-                                updated = dict(child_row)
-                                for cc, nv in zip(fk.columns, new_ref_vals):
-                                    updated[cc] = nv
-                                upd[rowid] = self._pack_row_cell(
-                                    serialize_row(child_schema, updated))
-                            self._table_btree(tmeta).update(upd)
+                            if tmeta.storage_type == "column":
+                                upd_col: dict[int, dict] = {}
+                                for rowid, child_row in matching:
+                                    updated = dict(child_row)
+                                    for cc, nv in zip(fk.columns, new_ref_vals):
+                                        updated[cc] = nv
+                                    upd_col[rowid] = updated
+                                self._table_btree(tmeta).apply_updates(
+                                    upd_col, set(fk.columns))
+                            else:
+                                upd: dict[int, bytes] = {}
+                                for rowid, child_row in matching:
+                                    updated = dict(child_row)
+                                    for cc, nv in zip(fk.columns, new_ref_vals):
+                                        updated[cc] = nv
+                                    upd[rowid] = self._pack_row_cell(
+                                        serialize_row(child_schema, updated))
+                                self._table_btree(tmeta).update(upd)
                 elif action == "SET NULL":
-                    upd_null: dict[int, bytes] = {}
-                    for rowid, child_row in matching:
-                        updated = dict(child_row)
-                        for cc in fk.columns:
-                            updated[cc] = None
-                        upd_null[rowid] = self._pack_row_cell(
-                            serialize_row(child_schema, updated))
-                    self._table_btree(tmeta).update(upd_null)
+                    if tmeta.storage_type == "column":
+                        upd_null_col: dict[int, dict] = {}
+                        for rowid, child_row in matching:
+                            updated = dict(child_row)
+                            for cc in fk.columns:
+                                updated[cc] = None
+                            upd_null_col[rowid] = updated
+                        self._table_btree(tmeta).apply_updates(
+                            upd_null_col, set(fk.columns))
+                    else:
+                        upd_null: dict[int, bytes] = {}
+                        for rowid, child_row in matching:
+                            updated = dict(child_row)
+                            for cc in fk.columns:
+                                updated[cc] = None
+                            upd_null[rowid] = self._pack_row_cell(
+                                serialize_row(child_schema, updated))
+                        self._table_btree(tmeta).update(upd_null)

@@ -771,6 +771,31 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
     def _free_page(self, pn: int) -> None:
         self._catalog.free_pages.append(pn)
 
+    def _collect_column_store_pages(self, root: int) -> list[int]:
+        """Return every page belonging to a column store table rooted at root."""
+        from .column_store import (PAGE_COLUMN_HDR, PAGE_COLUMN_CHUNK,
+                                   HDR_PREFIX_SZ, HDR_ENTRY_SZ)
+        pages: list[int] = [root]
+        hdr = self._pager.read_page(root)
+        if hdr[0] != PAGE_COLUMN_HDR:
+            return pages
+        num_cols = struct.unpack_from('<H', hdr, 5)[0]
+        visited: set[int] = set()
+        from .errors import CorruptPageError
+        for i in range(num_cols):
+            off = HDR_PREFIX_SZ + i * HDR_ENTRY_SZ
+            first_chunk = struct.unpack_from('<I', hdr, off)[0]
+            pn = first_chunk
+            while pn and pn not in visited:
+                visited.add(pn)
+                pages.append(pn)
+                try:
+                    chunk = self._pager.read_page(pn)
+                except CorruptPageError:
+                    break  # page already in list; checksum scan will report it
+                pn = struct.unpack_from('<I', chunk, 1)[0]
+        return pages
+
     def _collect_tree_pages(self, root: int, *, key_sz: int = 8) -> list[int]:
         int_cell = key_sz + BTree.CHILD_SZ
         pages: list[int] = []
@@ -969,9 +994,13 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for tname, tmeta in list(self._catalog.tables.items()):
             new_db.create_table(tmeta.schema,
                                 storage_type=tmeta.storage_type)
-            for _, raw in self._table_btree(tmeta).scan():
-                row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
-                new_db.insert(tname, row)
+            if tmeta.storage_type == "column":
+                for _, row in self._table_btree(tmeta).scan_rows():
+                    new_db.insert(tname, row)
+            else:
+                for _, raw in self._table_btree(tmeta).scan():
+                    row = deserialize_row(tmeta.schema, self._unpack_row_cell(raw))
+                    new_db.insert(tname, row)
         for idx_name, idx_meta in list(self._catalog.indexes.items()):
             if idx_name not in new_db._catalog.indexes:
                 new_db.create_index(idx_name, idx_meta.table_name, idx_meta.columns)

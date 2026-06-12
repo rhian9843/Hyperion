@@ -340,9 +340,10 @@ class QueryMixin:
 
     def _aggregate_select(self, meta, columns: list[str],
                           where: "WhereClause | None") -> list[dict[str, Any]]:
-        # Aggregate pushdown for column store without WHERE
-        if meta.storage_type == "column" and not where:
-            result = self._table_btree(meta).scan_aggregate(columns)
+        if meta.storage_type == "column":
+            row_filter = ((lambda row, _w=where, _db=self: _w.evaluate(row, _db))
+                          if where else None)
+            result = self._table_btree(meta).scan_aggregate(columns, row_filter)
             if result is not None:
                 return result
 
@@ -368,6 +369,17 @@ class QueryMixin:
                          limit: int | None,
                          offset: int | None = None) -> list[dict[str, Any]]:
         schema = meta.schema
+
+        # Columnar GROUP BY pushdown: reads only GROUP BY + aggregate columns.
+        if meta.storage_type == "column" and not where:
+            select_cols = columns if columns else group_by
+            pushed = self._table_btree(meta).scan_aggregate_grouped(
+                group_by, select_cols)
+            if pushed is not None:
+                if having:
+                    pushed = [r for r in pushed if having.evaluate(r, self)]
+                return _apply_order_limit(pushed, order_by, limit, offset)
+
         all_rows: list[dict] = []
         if meta.storage_type == "column":
             for _, row in self._table_btree(meta).scan_rows():
