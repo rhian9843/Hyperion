@@ -439,7 +439,7 @@
 
 ### Replication
 
-- [ ] Logical replication — `CREATE PUBLICATION pub FOR TABLE t1, t2` on the primary; `CREATE SUBSCRIPTION sub CONNECTION '...' PUBLICATION pub` on the replica; changes are streamed as an append-only change log and applied on the subscriber
+- [x] Logical replication — `CREATE PUBLICATION pub FOR TABLE t1, t2` on the primary; `CREATE SUBSCRIPTION sub CONNECTION '...' PUBLICATION pub` on the replica; changes are streamed as an append-only change log and applied on the subscriber
 - [ ] Physical replication — binary-level WAL streaming from primary to replica with auto-sync every 500ms; auto-reconnect on connection loss; replica runs in read-only mode (any write raises `ReadOnlyError`); `SHOW MASTER STATUS`, `SHOW SLAVE STATUS`, `SHOW BINLOG`, `START SLAVE`, `STOP SLAVE`; replica can be promoted to primary on failure
 
 ### Row-Level Security
