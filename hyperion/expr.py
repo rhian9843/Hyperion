@@ -179,6 +179,9 @@ class FuncCall:
     def evaluate(self, row: dict) -> Any:
         if self.name == "LAST_INSERT_ROWID":
             return getattr(_tls, "last_insert_rowid", None)
+        if self.name == "CURRENT_USER_ID":
+            db = _get_eval_db()
+            return db._current_user_id if db is not None else None
         evaluated = [a.evaluate(row) for a in self.args]
         return _eval_func_evaled(self.name, evaluated)
 
@@ -682,6 +685,9 @@ def _eval_func(fname: str, args_str: str, row: dict) -> Any:
     """
     if fname == "LAST_INSERT_ROWID":
         return getattr(_tls, "last_insert_rowid", None)
+    if fname == "CURRENT_USER_ID":
+        db = _get_eval_db()
+        return db._current_user_id if db is not None else None
     if fname == "CAST":
         m = re.match(r'(.+?)\s+AS\s+(\w+)\s*$', args_str, re.IGNORECASE)
         if not m:

@@ -1196,6 +1196,8 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_subscription(t, 2)
     if sub == "PHYSICAL" and len(t) > 2 and t[2].upper() == "SUBSCRIPTION":
         return _parse_create_physical_subscription(t, 3)
+    if sub == "POLICY":
+        return _parse_create_policy(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -1247,6 +1249,45 @@ def _parse_create_physical_subscription(t: list[str], i: int) -> dict:
     conn = t[i].strip("'\""); i += 1
     return {"op": "CREATE_PHYSICAL_SUBSCRIPTION", "name": name,
             "connection": conn, "if_not_exists": if_not_exists}
+
+
+def _parse_create_policy(t: list[str], i: int) -> dict:
+    # CREATE POLICY name ON table [AS PERMISSIVE] USING (expr)
+    if_not_exists = False
+    if i < len(t) and t[i].upper() == "IF":
+        if i + 2 < len(t) and t[i+1].upper() == "NOT" and t[i+2].upper() == "EXISTS":
+            if_not_exists = True; i += 3
+        else:
+            raise ParseError("Expected NOT EXISTS after IF in CREATE POLICY")
+    if i >= len(t):
+        raise ParseError("Expected policy name after CREATE POLICY")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "ON":
+        raise ParseError("Expected ON <table> after policy name")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected table name after ON in CREATE POLICY")
+    table = t[i]; i += 1
+    # Skip optional AS PERMISSIVE / AS RESTRICTIVE
+    if i < len(t) and t[i].upper() == "AS":
+        i += 2  # skip AS + PERMISSIVE/RESTRICTIVE
+    if i >= len(t) or t[i].upper() != "USING":
+        raise ParseError("Expected USING (expr) in CREATE POLICY")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected (expr) after USING in CREATE POLICY")
+    # Collect the expression — may be parenthesised or bare
+    if t[i].startswith("("):
+        # Re-join rest, strip outer parens
+        raw = " ".join(t[i:]).strip()
+        if raw.startswith("(") and raw.endswith(")"):
+            using_expr = raw[1:-1].strip()
+        else:
+            using_expr = raw
+    else:
+        using_expr = " ".join(t[i:]).strip()
+    return {"op": "CREATE_POLICY", "name": name, "table": table,
+            "using_expr": using_expr, "if_not_exists": if_not_exists}
 
 
 def _parse_create_subscription(t: list[str], i: int) -> dict:
@@ -1328,6 +1369,19 @@ def _parse_alter(t: list[str]) -> dict:
         new_type, new_size = _parse_col_type(t[7])
         return {"op": "ALTER_ALTER_COLUMN", "table": table,
                 "col_name": col_name, "new_type": new_type, "new_size": new_size}
+    if sub == "ENABLE":
+        # ENABLE ROW LEVEL SECURITY
+        if (len(t) >= 7 and t[4].upper() == "ROW"
+                and t[5].upper() == "LEVEL"
+                and t[6].upper() == "SECURITY"):
+            return {"op": "ALTER_ENABLE_RLS", "table": table}
+        raise ParseError("Expected: ALTER TABLE <name> ENABLE ROW LEVEL SECURITY")
+    if sub == "DISABLE":
+        if (len(t) >= 7 and t[4].upper() == "ROW"
+                and t[5].upper() == "LEVEL"
+                and t[6].upper() == "SECURITY"):
+            return {"op": "ALTER_DISABLE_RLS", "table": table}
+        raise ParseError("Expected: ALTER TABLE <name> DISABLE ROW LEVEL SECURITY")
     raise ParseError(f"Unknown ALTER TABLE operation: '{t[3]}'")
 
 
@@ -1380,6 +1434,25 @@ def _parse_drop(t: list[str]) -> dict:
         if i >= len(t):
             raise ParseError("Expected name after DROP PHYSICAL SUBSCRIPTION")
         return {"op": "DROP_PHYSICAL_SUBSCRIPTION", "name": t[i], "if_exists": if_exists}
+    if sub == "POLICY":
+        # DROP POLICY [IF EXISTS] name ON table
+        i = 2
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+            else:
+                raise ParseError("Expected EXISTS after IF in DROP POLICY")
+        if i >= len(t):
+            raise ParseError("Expected policy name after DROP POLICY")
+        name = t[i]; i += 1
+        if i >= len(t) or t[i].upper() != "ON":
+            raise ParseError("Expected ON <table> after policy name in DROP POLICY")
+        i += 1
+        if i >= len(t):
+            raise ParseError("Expected table name after ON in DROP POLICY")
+        table = t[i]
+        return {"op": "DROP_POLICY", "name": name, "table": table, "if_exists": if_exists}
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 

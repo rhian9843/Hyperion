@@ -116,6 +116,7 @@ class DMLMixin:
                      else ((rid, deserialize_row(schema, self._unpack_row_cell(raw)), raw)
                            for rid, raw in tree.scan()))
 
+        rls = meta.rls_enabled and not self._is_superuser
         for item in scan_iter:
             if is_col:
                 rowid, row = item
@@ -126,6 +127,8 @@ class DMLMixin:
             if limit is not None and count >= limit:
                 break
             if where and not where.evaluate(row, self):
+                continue
+            if rls and not self._rls_allowed(table, row):
                 continue
             new_row = dict(row)
             for col, val in assignments.items():
@@ -212,23 +215,30 @@ class DMLMixin:
         overflow_to_free: list[int] = []
         count = 0
 
+        rls = meta.rls_enabled and not self._is_superuser
         if is_col:
             for rowid, row in tree.scan_rows():
                 if limit is not None and count >= limit:
                     break
-                if not where or where.evaluate(row, self):
-                    victims.append((rowid, row))
-                    count += 1
+                if where and not where.evaluate(row, self):
+                    continue
+                if rls and not self._rls_allowed(table, row):
+                    continue
+                victims.append((rowid, row))
+                count += 1
         else:
             for rowid, raw in tree.scan():
                 if limit is not None and count >= limit:
                     break
                 row = deserialize_row(schema, self._unpack_row_cell(raw))
-                if not where or where.evaluate(row, self):
-                    victims.append((rowid, row))
-                    if self._cell_is_overflow(raw):
-                        overflow_to_free.append(struct.unpack_from("I", raw, 5)[0])
-                    count += 1
+                if where and not where.evaluate(row, self):
+                    continue
+                if rls and not self._rls_allowed(table, row):
+                    continue
+                victims.append((rowid, row))
+                if self._cell_is_overflow(raw):
+                    overflow_to_free.append(struct.unpack_from("I", raw, 5)[0])
+                count += 1
 
         if not victims:
             return []

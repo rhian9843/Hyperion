@@ -95,6 +95,8 @@ _WRITE_OPS = frozenset({
     "CREATE_TRIGGER", "DROP_TRIGGER",
     "ALTER_ADD_COLUMN", "ALTER_DROP_COLUMN",
     "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE", "ALTER_ALTER_COLUMN",
+    "ALTER_ENABLE_RLS", "ALTER_DISABLE_RLS",
+    "CREATE_POLICY", "DROP_POLICY",
     "ANALYZE", "VACUUM",
 })
 
@@ -975,6 +977,10 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
     memory.  All other query shapes fall back to the fully-materialised
     _rows_for_stmt path and then yield from that list.
     """
+    from .expr import _tls as _expr_tls
+    _expr_tls.user_funcs = db._user_funcs
+    _expr_tls.user_aggs  = db._user_aggs
+    _expr_tls.eval_db    = db
     _check_timeout(db)
     merged_ctes = {**(ctes or {}), **(stmt.get("ctes") or {})}
     if merged_ctes:
@@ -1014,9 +1020,12 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
             _row_iter = (_tbl_tree.scan_rows() if meta.storage_type == "column"
                          else ((rid, deserialize_row(schema, db._unpack_row_cell(raw)))
                                for rid, raw in _tbl_tree.scan()))
+            rls = meta.rls_enabled and not db._is_superuser
             for _, row in _row_iter:
                 _check_timeout(db)
                 if where and not where.evaluate(row, db):
+                    continue
+                if rls and not db._rls_allowed(tbl, row):
                     continue
                 if skipped < offset:
                     skipped += 1
@@ -1882,6 +1891,30 @@ def _exec_show_binlog(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+# ── Row-Level Security handlers ───────────────────────────────────────────────
+
+def _exec_alter_enable_rls(stmt: dict, db: Database) -> str:
+    db.enable_rls(stmt["table"])
+    return f"Row-level security enabled on '{stmt['table']}'."
+
+
+def _exec_alter_disable_rls(stmt: dict, db: Database) -> str:
+    db.disable_rls(stmt["table"])
+    return f"Row-level security disabled on '{stmt['table']}'."
+
+
+def _exec_create_policy(stmt: dict, db: Database) -> str:
+    db.create_policy(stmt["name"], stmt["table"], stmt["using_expr"],
+                     if_not_exists=stmt.get("if_not_exists", False))
+    return f"Policy '{stmt['name']}' created."
+
+
+def _exec_drop_policy(stmt: dict, db: Database) -> str:
+    db.drop_policy(stmt["name"], stmt["table"],
+                   if_exists=stmt.get("if_exists", False))
+    return f"Policy '{stmt['name']}' dropped."
+
+
 _DISPATCH: dict[str, Any] = {
     "ANALYZE":                  _execute_analyze,
     "CREATE_TABLE_AS_SELECT":   _exec_create_table_as_select,
@@ -1913,6 +1946,10 @@ _DISPATCH: dict[str, Any] = {
     "SHOW_MASTER_STATUS":             _exec_show_master_status,
     "SHOW_SLAVE_STATUS":              _exec_show_slave_status,
     "SHOW_BINLOG":                    _exec_show_binlog,
+    "ALTER_ENABLE_RLS":               _exec_alter_enable_rls,
+    "ALTER_DISABLE_RLS":              _exec_alter_disable_rls,
+    "CREATE_POLICY":                  _exec_create_policy,
+    "DROP_POLICY":                    _exec_drop_policy,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

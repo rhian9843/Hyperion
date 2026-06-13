@@ -444,9 +444,9 @@
 
 ### Row-Level Security
 
-- [ ] `ENABLE ROW LEVEL SECURITY` / `DISABLE ROW LEVEL SECURITY` per table — when enabled, all queries against the table are filtered by active policies; superuser-level connections bypass RLS
-- [ ] `CREATE POLICY name ON table USING (expr)` — defines a filter expression applied transparently to every `SELECT`, `UPDATE`, and `DELETE` on the table; multiple policies are OR-combined
-- [ ] `CURRENT_USER_ID()` scalar function — returns the active user identity set via `db.set_user(id)`; used inside policy expressions for per-tenant row filtering
+- [x] `ENABLE ROW LEVEL SECURITY` / `DISABLE ROW LEVEL SECURITY` per table — when enabled, all queries against the table are filtered by active policies; superuser-level connections bypass RLS
+- [x] `CREATE POLICY name ON table USING (expr)` — defines a filter expression applied transparently to every `SELECT`, `UPDATE`, and `DELETE` on the table; multiple policies are OR-combined
+- [x] `CURRENT_USER_ID()` scalar function — returns the active user identity set via `db.set_user(id)`; used inside policy expressions for per-tenant row filtering
 
 ### Event Scheduler
 

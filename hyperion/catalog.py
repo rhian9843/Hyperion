@@ -22,6 +22,13 @@ class SubscriptionMeta:
 
 
 @dataclass
+class PolicyMeta:
+    name:       str
+    table:      str
+    using_expr: str   # SQL expression evaluated per-row; row visible if True
+
+
+@dataclass
 class TriggerMeta:
     table:       str
     timing:      str        # "BEFORE" or "AFTER"
@@ -39,6 +46,7 @@ class TableMeta:
     next_key:     int
     temporary:    bool = False
     storage_type: str  = "row"   # "row" or "column"
+    rls_enabled:  bool = False
 
 
 @dataclass
@@ -69,6 +77,7 @@ class Catalog:
     meta:           dict[str, dict]           = field(default_factory=dict)
     publications:   dict[str, PublicationMeta]  = field(default_factory=dict)
     subscriptions:  dict[str, SubscriptionMeta] = field(default_factory=dict)
+    policies:       dict[str, PolicyMeta]       = field(default_factory=dict)
     lsn:            int                         = 0   # advances on each published DML commit
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
@@ -118,7 +127,8 @@ class Catalog:
         return json.dumps({
             "tables": {
                 n: {"schema": m.schema.to_dict(), "temporary": m.temporary,
-                    "storage_type": m.storage_type}
+                    "storage_type": m.storage_type,
+                    "rls_enabled": m.rls_enabled}
                 for n, m in self.tables.items() if not m.temporary
             },
             "indexes": {
@@ -137,6 +147,10 @@ class Catalog:
             "publications": {
                 n: {"tables": p.tables}
                 for n, p in self.publications.items()
+            },
+            "policies": {
+                n: {"table": p.table, "using_expr": p.using_expr}
+                for n, p in self.policies.items()
             },
         }).encode()
 
@@ -219,7 +233,8 @@ class Catalog:
             "nfp":  self.next_free_page,
             "fp":   list(self.free_pages),
             "tbls": {n: TableMeta(m.schema, m.root_page, m.next_page,
-                                  m.next_key, m.temporary, m.storage_type)
+                                  m.next_key, m.temporary, m.storage_type,
+                                  m.rls_enabled)
                      for n, m in self.tables.items()},
             "idxs": {n: IndexMeta(m.table_name, list(m.columns),
                                   m.root_page, m.next_page, m.unique)
@@ -231,6 +246,8 @@ class Catalog:
                      for n, p in self.publications.items()},
             "subs": {n: SubscriptionMeta(n, s.connection, s.publication, s.last_lsn)
                      for n, s in self.subscriptions.items()},
+            "pols": {n: PolicyMeta(n, p.table, p.using_expr)
+                     for n, p in self.policies.items()},
             "lsn":  self.lsn,
         }
 
@@ -245,6 +262,7 @@ class Catalog:
         self.meta.clear();          self.meta.update(snap["meta"])
         self.publications.clear();  self.publications.update(snap.get("pubs", {}))
         self.subscriptions.clear(); self.subscriptions.update(snap.get("subs", {}))
+        self.policies.clear();      self.policies.update(snap.get("pols", {}))
         self.lsn = snap.get("lsn", self.lsn)
         # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
         self._t_snippets.clear()
@@ -308,6 +326,7 @@ class Catalog:
                 next_key=ops.get("next_key",  1),
                 temporary=t.get("temporary", False),
                 storage_type=t.get("storage_type", "row"),
+                rls_enabled=t.get("rls_enabled", False),
             )
 
         indexes: dict[str, IndexMeta] = {}
@@ -350,6 +369,10 @@ class Catalog:
                                 s.get("last_lsn", 0))
             for n, s in d_o.get("subscriptions", {}).items()
         }
+        policies = {
+            n: PolicyMeta(n, p["table"], p["using_expr"])
+            for n, p in d_s.get("policies", {}).items()
+        }
 
         cat = cls(
             tables=tables,
@@ -362,6 +385,7 @@ class Catalog:
             meta=d_s.get("meta", {}),
             publications=publications,
             subscriptions=subscriptions,
+            policies=policies,
             lsn=d_o.get("lsn", 0),
         )
         # Initialise snippet cache and mark stats clean so the first ops flush

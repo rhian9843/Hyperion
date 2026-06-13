@@ -14,7 +14,7 @@ from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
-from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta
+from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta, PolicyMeta
 from .pager import Pager, MemoryPager
 from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
@@ -173,6 +173,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._phys_subs: dict = {}     # name → PhysicalSubscriptionMeta
         self._phys_workers: dict = {}  # name → PhysicalReplicationWorker
         self._load_phys_subs()
+        self._current_user_id: int | None = None
+        self._is_superuser: bool = False
         # Crash recovery: re-stage any logical entries recovered from the WAL back
         # into a fresh WAL transaction.  This preserves retention (entries with
         # lsn > min_consumed_lsn survive subsequent checkpoints) without needing
@@ -1309,3 +1311,58 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._txn_depth = 0
         self._savepoints.clear()
         return "Database vacuumed."
+
+    # ── Row-Level Security ────────────────────────────────────────────────────
+
+    def set_user(self, user_id: int | None) -> None:
+        self._current_user_id = user_id
+
+    def set_superuser(self, flag: bool) -> None:
+        self._is_superuser = flag
+
+    def enable_rls(self, table: str) -> None:
+        meta = self._meta(table)
+        meta.rls_enabled = True
+        self._catalog.mark_global_ops_dirty()
+        self._schema_flushed_bytes = b""
+
+    def disable_rls(self, table: str) -> None:
+        meta = self._meta(table)
+        meta.rls_enabled = False
+        self._catalog.mark_global_ops_dirty()
+        self._schema_flushed_bytes = b""
+
+    def create_policy(self, name: str, table: str, using_expr: str,
+                      if_not_exists: bool = False) -> None:
+        self._meta(table)   # raises NoSuchTableError if table unknown
+        if name in self._catalog.policies:
+            if if_not_exists:
+                return
+            raise SchemaError(f"Policy '{name}' already exists")
+        self._catalog.policies[name] = PolicyMeta(name, table, using_expr)
+        self._schema_flushed_bytes = b""
+
+    def drop_policy(self, name: str, table: str, if_exists: bool = False) -> None:
+        if name not in self._catalog.policies:
+            if if_exists:
+                return
+            raise SchemaError(f"No such policy: '{name}'")
+        del self._catalog.policies[name]
+        self._schema_flushed_bytes = b""
+
+    def _rls_allowed(self, table: str, row: dict) -> bool:
+        """Return True if row is visible under RLS for the current user."""
+        meta = self._catalog.tables.get(table)
+        if meta is None or not meta.rls_enabled or self._is_superuser:
+            return True
+        policies = [p for p in self._catalog.policies.values() if p.table == table]
+        if not policies:
+            return False
+        from .expr import eval_expr
+        for policy in policies:
+            try:
+                if eval_expr(policy.using_expr, row):
+                    return True
+            except Exception:
+                pass
+        return False

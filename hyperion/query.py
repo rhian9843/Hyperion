@@ -170,15 +170,20 @@ class QueryMixin:
         # Collect full rows first so ORDER BY can reference columns not in SELECT list.
         # Projection and DISTINCT dedup happen after sorting/limiting.
         _need_full = bool(order_by and columns)
+        rls = meta.rls_enabled and not self._is_superuser
         if meta.storage_type == "column":
             for _, row in self._table_btree(meta).scan_rows():
                 if where and not where.evaluate(row, self):
+                    continue
+                if rls and not self._rls_allowed(table, row):
                     continue
                 results.append(row)
         else:
             for _, raw in self._table_btree(meta).scan():
                 row = deserialize_row(schema, self._unpack_row_cell(raw))
                 if where and not where.evaluate(row, self):
+                    continue
+                if rls and not self._rls_allowed(table, row):
                     continue
                 results.append(row)
         results = _apply_order_limit(results, order_by, limit, offset)
