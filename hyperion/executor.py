@@ -97,6 +97,7 @@ _WRITE_OPS = frozenset({
     "ALTER_RENAME_COLUMN", "ALTER_RENAME_TABLE", "ALTER_ALTER_COLUMN",
     "ALTER_ENABLE_RLS", "ALTER_DISABLE_RLS",
     "CREATE_POLICY", "DROP_POLICY",
+    "CREATE_EVENT", "DROP_EVENT", "ALTER_EVENT",
     "ANALYZE", "VACUUM",
 })
 
@@ -1891,6 +1892,39 @@ def _exec_show_binlog(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+# ── Event Scheduler handlers ─────────────────────────────────────────────────
+
+def _exec_create_event(stmt: dict, db: Database) -> str:
+    db.create_event(
+        name=stmt["name"],
+        schedule_type=stmt["schedule_type"],
+        interval_seconds=stmt["interval_seconds"],
+        at_time=stmt["at_time"],
+        sql=stmt["sql"],
+        if_not_exists=stmt.get("if_not_exists", False),
+    )
+    return f"Event '{stmt['name']}' created."
+
+
+def _exec_drop_event(stmt: dict, db: Database) -> str:
+    db.drop_event(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"Event '{stmt['name']}' dropped."
+
+
+def _exec_alter_event(stmt: dict, db: Database) -> str:
+    if stmt["action"] == "ENABLE":
+        db.enable_event(stmt["name"])
+    else:
+        db.disable_event(stmt["name"])
+    return f"Event '{stmt['name']}' {stmt['action'].lower()}d."
+
+
+def _exec_show_events(stmt: dict, db: Database) -> RowResult:
+    rows = db.show_events()
+    cols = ["name", "schedule", "sql", "enabled", "last_run"]
+    return RowResult(rows, cols)
+
+
 # ── Row-Level Security handlers ───────────────────────────────────────────────
 
 def _exec_alter_enable_rls(stmt: dict, db: Database) -> str:
@@ -1950,6 +1984,10 @@ _DISPATCH: dict[str, Any] = {
     "ALTER_DISABLE_RLS":              _exec_alter_disable_rls,
     "CREATE_POLICY":                  _exec_create_policy,
     "DROP_POLICY":                    _exec_drop_policy,
+    "CREATE_EVENT":                   _exec_create_event,
+    "DROP_EVENT":                     _exec_drop_event,
+    "ALTER_EVENT":                    _exec_alter_event,
+    "SHOW_EVENTS":                    _exec_show_events,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

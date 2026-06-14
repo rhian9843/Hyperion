@@ -1198,6 +1198,8 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_physical_subscription(t, 3)
     if sub == "POLICY":
         return _parse_create_policy(t, 2)
+    if sub == "EVENT":
+        return _parse_create_event(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -1249,6 +1251,71 @@ def _parse_create_physical_subscription(t: list[str], i: int) -> dict:
     conn = t[i].strip("'\""); i += 1
     return {"op": "CREATE_PHYSICAL_SUBSCRIPTION", "name": name,
             "connection": conn, "if_not_exists": if_not_exists}
+
+
+_INTERVAL_UNITS = {
+    "SECOND": 1, "SECONDS": 1,
+    "MINUTE": 60, "MINUTES": 60,
+    "HOUR": 3600, "HOURS": 3600,
+    "DAY": 86400, "DAYS": 86400,
+}
+
+
+def _parse_create_event(t: list[str], i: int) -> dict:
+    # CREATE EVENT [IF NOT EXISTS] name ON SCHEDULE
+    #     EVERY n SECOND|MINUTE|HOUR|DAY DO sql
+    #   | AT 'timestamp' DO sql
+    if_not_exists = False
+    if i < len(t) and t[i].upper() == "IF":
+        if i + 2 < len(t) and t[i+1].upper() == "NOT" and t[i+2].upper() == "EXISTS":
+            if_not_exists = True; i += 3
+        else:
+            raise ParseError("Expected NOT EXISTS after IF in CREATE EVENT")
+    if i >= len(t):
+        raise ParseError("Expected event name after CREATE EVENT")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "ON":
+        raise ParseError("Expected ON SCHEDULE after event name")
+    i += 1
+    if i >= len(t) or t[i].upper() != "SCHEDULE":
+        raise ParseError("Expected SCHEDULE after ON")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected EVERY or AT after ON SCHEDULE")
+    schedule_kw = t[i].upper(); i += 1
+
+    interval_seconds = 0
+    at_time = ""
+
+    if schedule_kw == "EVERY":
+        if i >= len(t):
+            raise ParseError("Expected interval value after EVERY")
+        try:
+            n = int(t[i]); i += 1
+        except ValueError:
+            raise ParseError(f"Expected integer after EVERY, got '{t[i]}'")
+        if i >= len(t) or t[i].upper() not in _INTERVAL_UNITS:
+            raise ParseError(
+                f"Expected time unit (SECOND/MINUTE/HOUR/DAY) after EVERY {n}")
+        interval_seconds = n * _INTERVAL_UNITS[t[i].upper()]; i += 1
+        schedule_type = "INTERVAL"
+    elif schedule_kw == "AT":
+        if i >= len(t):
+            raise ParseError("Expected timestamp after AT")
+        at_time = t[i].strip("'\""); i += 1
+        schedule_type = "AT"
+    else:
+        raise ParseError(f"Expected EVERY or AT, got '{schedule_kw}'")
+
+    if i >= len(t) or t[i].upper() != "DO":
+        raise ParseError("Expected DO after schedule specification")
+    i += 1
+    if i >= len(t):
+        raise ParseError("Expected SQL after DO")
+    sql_body = " ".join(t[i:])
+    return {"op": "CREATE_EVENT", "name": name, "schedule_type": schedule_type,
+            "interval_seconds": interval_seconds, "at_time": at_time,
+            "sql": sql_body, "if_not_exists": if_not_exists}
 
 
 def _parse_create_policy(t: list[str], i: int) -> dict:
@@ -1312,6 +1379,15 @@ def _parse_create_subscription(t: list[str], i: int) -> dict:
 
 
 def _parse_alter(t: list[str]) -> dict:
+    if len(t) >= 2 and t[1].upper() == "EVENT":
+        # ALTER EVENT name ENABLE | DISABLE
+        if len(t) < 4:
+            raise ParseError("Expected: ALTER EVENT <name> ENABLE|DISABLE")
+        name = t[2]
+        action = t[3].upper()
+        if action not in ("ENABLE", "DISABLE"):
+            raise ParseError(f"Expected ENABLE or DISABLE, got '{t[3]}'")
+        return {"op": "ALTER_EVENT", "name": name, "action": action}
     if len(t) < 4 or t[1].upper() != "TABLE":
         raise ParseError("Expected: ALTER TABLE <name> ...")
     table = t[2]
@@ -1434,6 +1510,17 @@ def _parse_drop(t: list[str]) -> dict:
         if i >= len(t):
             raise ParseError("Expected name after DROP PHYSICAL SUBSCRIPTION")
         return {"op": "DROP_PHYSICAL_SUBSCRIPTION", "name": t[i], "if_exists": if_exists}
+    if sub == "EVENT":
+        i = 2
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+            else:
+                raise ParseError("Expected EXISTS after IF in DROP EVENT")
+        if i >= len(t):
+            raise ParseError("Expected event name after DROP EVENT")
+        return {"op": "DROP_EVENT", "name": t[i], "if_exists": if_exists}
     if sub == "POLICY":
         # DROP POLICY [IF EXISTS] name ON table
         i = 2
@@ -2152,6 +2239,8 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "SHOW_SLAVE_STATUS"}
         if len(t) > 1 and t[1].upper() == "BINLOG":
             return {"op": "SHOW_BINLOG"}
+        if len(t) > 1 and t[1].upper() == "EVENTS":
+            return {"op": "SHOW_EVENTS"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     if kw == "START":
         if len(t) > 1 and t[1].upper() == "SLAVE":

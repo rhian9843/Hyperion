@@ -450,11 +450,11 @@
 
 ### Event Scheduler
 
-- [ ] `CREATE EVENT name ON SCHEDULE EVERY n SECOND|MINUTE|HOUR|DAY DO sql` — registers a background job that fires on the given interval; event definitions persist in the catalog
-- [ ] `CREATE EVENT name ON SCHEDULE AT timestamp DO sql` — one-shot event fires once at the given datetime then auto-drops
-- [ ] `SHOW EVENTS` / `DROP EVENT` — list and remove scheduled events
-- [ ] `ALTER EVENT name ENABLE|DISABLE` — pause or resume a scheduled event without dropping it
-- [ ] Background event loop — a daemon thread in `Database` checks due events and executes them; honors the readers-writer lock so events never corrupt concurrent queries
+- [x] `CREATE EVENT name ON SCHEDULE EVERY n SECOND|MINUTE|HOUR|DAY DO sql` — registers a background job that fires on the given interval; event definitions persist in the catalog
+- [x] `CREATE EVENT name ON SCHEDULE AT timestamp DO sql` — one-shot event fires once at the given datetime then auto-drops
+- [x] `SHOW EVENTS` / `DROP EVENT` — list and remove scheduled events
+- [x] `ALTER EVENT name ENABLE|DISABLE` — pause or resume a scheduled event without dropping it
+- [x] Background event loop — a daemon thread in `Database` checks due events and executes them; honors the readers-writer lock so events never corrupt concurrent queries
 
 ### Functions — Missing
 

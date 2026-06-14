@@ -29,6 +29,17 @@ class PolicyMeta:
 
 
 @dataclass
+class EventMeta:
+    name:             str
+    schedule_type:    str   # "INTERVAL" or "AT"
+    interval_seconds: int   # seconds between fires (INTERVAL only)
+    at_time:          str   # ISO datetime to fire once (AT only)
+    sql:              str
+    enabled:          bool = True
+    last_run:         str  = ""   # ISO datetime of last execution (empty = never)
+
+
+@dataclass
 class TriggerMeta:
     table:       str
     timing:      str        # "BEFORE" or "AFTER"
@@ -78,6 +89,7 @@ class Catalog:
     publications:   dict[str, PublicationMeta]  = field(default_factory=dict)
     subscriptions:  dict[str, SubscriptionMeta] = field(default_factory=dict)
     policies:       dict[str, PolicyMeta]       = field(default_factory=dict)
+    events:         dict[str, EventMeta]        = field(default_factory=dict)
     lsn:            int                         = 0   # advances on each published DML commit
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
@@ -151,6 +163,13 @@ class Catalog:
             "policies": {
                 n: {"table": p.table, "using_expr": p.using_expr}
                 for n, p in self.policies.items()
+            },
+            "events": {
+                n: {"schedule_type": e.schedule_type,
+                    "interval_seconds": e.interval_seconds,
+                    "at_time": e.at_time, "sql": e.sql,
+                    "enabled": e.enabled, "last_run": e.last_run}
+                for n, e in self.events.items()
             },
         }).encode()
 
@@ -248,6 +267,9 @@ class Catalog:
                      for n, s in self.subscriptions.items()},
             "pols": {n: PolicyMeta(n, p.table, p.using_expr)
                      for n, p in self.policies.items()},
+            "evts": {n: EventMeta(n, e.schedule_type, e.interval_seconds,
+                                  e.at_time, e.sql, e.enabled, e.last_run)
+                     for n, e in self.events.items()},
             "lsn":  self.lsn,
         }
 
@@ -263,6 +285,7 @@ class Catalog:
         self.publications.clear();  self.publications.update(snap.get("pubs", {}))
         self.subscriptions.clear(); self.subscriptions.update(snap.get("subs", {}))
         self.policies.clear();      self.policies.update(snap.get("pols", {}))
+        self.events.clear();        self.events.update(snap.get("evts", {}))
         self.lsn = snap.get("lsn", self.lsn)
         # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
         self._t_snippets.clear()
@@ -373,6 +396,12 @@ class Catalog:
             n: PolicyMeta(n, p["table"], p["using_expr"])
             for n, p in d_s.get("policies", {}).items()
         }
+        events = {
+            n: EventMeta(n, e["schedule_type"], e["interval_seconds"],
+                         e["at_time"], e["sql"],
+                         e.get("enabled", True), e.get("last_run", ""))
+            for n, e in d_s.get("events", {}).items()
+        }
 
         cat = cls(
             tables=tables,
@@ -386,6 +415,7 @@ class Catalog:
             publications=publications,
             subscriptions=subscriptions,
             policies=policies,
+            events=events,
             lsn=d_o.get("lsn", 0),
         )
         # Initialise snippet cache and mark stats clean so the first ops flush

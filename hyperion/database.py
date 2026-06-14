@@ -14,7 +14,7 @@ from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
-from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta, PolicyMeta
+from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta, PolicyMeta, EventMeta
 from .pager import Pager, MemoryPager
 from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
@@ -175,6 +175,7 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._load_phys_subs()
         self._current_user_id: int | None = None
         self._is_superuser: bool = False
+        self._event_scheduler = None
         # Crash recovery: re-stage any logical entries recovered from the WAL back
         # into a fresh WAL transaction.  This preserves retention (entries with
         # lsn > min_consumed_lsn survive subsequent checkpoints) without needing
@@ -188,6 +189,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         for sub_name, sub in list(self._phys_subs.items()):
             if sub.auto_start:
                 self._start_phys_worker(sub_name)
+        # Start event scheduler if any events are defined
+        self._start_event_scheduler()
 
     def _exec_stmt_with_ctes(self, stmt: dict, ctes: dict) -> list[dict]:
         from .executor import _rows_for_stmt
@@ -1239,6 +1242,9 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         ]
 
     def close(self) -> None:
+        if self._event_scheduler is not None:
+            self._event_scheduler.stop()
+            self._event_scheduler = None
         for name in list(self._phys_workers):
             self._stop_phys_worker(name)
         for name in list(self._sub_workers):
@@ -1366,3 +1372,62 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
             except Exception:
                 pass
         return False
+
+    # ── Event Scheduler ──────────────────────────────────────────────────────
+
+    def _start_event_scheduler(self) -> None:
+        if self._event_scheduler is not None:
+            return
+        from .event_scheduler import EventScheduler
+        sched = EventScheduler(self)
+        self._event_scheduler = sched
+        sched.start()
+
+    def create_event(self, name: str, schedule_type: str,
+                     interval_seconds: int, at_time: str, sql: str,
+                     if_not_exists: bool = False) -> None:
+        if name in self._catalog.events:
+            if if_not_exists:
+                return
+            raise SchemaError(f"Event '{name}' already exists")
+        self._catalog.events[name] = EventMeta(
+            name=name, schedule_type=schedule_type,
+            interval_seconds=interval_seconds, at_time=at_time, sql=sql)
+        self._schema_flushed_bytes = b""
+        self._start_event_scheduler()
+
+    def drop_event(self, name: str, if_exists: bool = False) -> None:
+        if name not in self._catalog.events:
+            if if_exists:
+                return
+            raise SchemaError(f"No such event: '{name}'")
+        del self._catalog.events[name]
+        self._schema_flushed_bytes = b""
+
+    def enable_event(self, name: str) -> None:
+        if name not in self._catalog.events:
+            raise SchemaError(f"No such event: '{name}'")
+        self._catalog.events[name].enabled = True
+        self._schema_flushed_bytes = b""
+
+    def disable_event(self, name: str) -> None:
+        if name not in self._catalog.events:
+            raise SchemaError(f"No such event: '{name}'")
+        self._catalog.events[name].enabled = False
+        self._schema_flushed_bytes = b""
+
+    def show_events(self) -> list[dict]:
+        rows = []
+        for evt in self._catalog.events.values():
+            if evt.schedule_type == "INTERVAL":
+                schedule = f"EVERY {evt.interval_seconds} SECOND"
+            else:
+                schedule = f"AT {evt.at_time!r}"
+            rows.append({
+                "name":     evt.name,
+                "schedule": schedule,
+                "sql":      evt.sql,
+                "enabled":  evt.enabled,
+                "last_run": evt.last_run or None,
+            })
+        return rows
