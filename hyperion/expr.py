@@ -364,6 +364,10 @@ def _parse_primary(toks: list[str], pos: int, row: dict) -> tuple[Any, int]:
     if tok.upper() == "CASE":
         return _eval_case_tokens(toks, pos, row)
 
+    # INTERVAL n UNIT → plain string for DATE_ADD / DATE_SUB
+    if tok.upper() == "INTERVAL" and pos + 2 < len(toks):
+        return f"{toks[pos + 1]} {toks[pos + 2]}", pos + 3
+
     # Function call: identifier immediately followed by (
     if pos + 1 < len(toks) and toks[pos + 1] == "(":
         fname = tok.upper()
@@ -605,11 +609,15 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
 
     # ── Date / time functions ──────────────────────────────────────────────────
 
-    if fname in ("DATE", "DATETIME", "TIME", "JULIANDAY", "STRFTIME"):
+    if fname in ("DATE", "DATETIME", "TIME", "JULIANDAY", "STRFTIME",
+                 "NOW", "DATEDIFF", "DATE_ADD", "DATE_SUB", "DATE_FORMAT"):
         from datetime import datetime as _dt, timedelta as _td
         import re as _re
 
-        def _parse_dt(s: str) -> "_dt | None":
+        if fname == "NOW":
+            return _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _parse_dt(s) -> "_dt | None":
             if s is None:
                 return None
             s = str(s).strip()
@@ -627,10 +635,10 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
             if not m:
                 return d
             n, unit = int(m.group(1)), m.group(2).lower()
-            if unit in ("second",): return d + _td(seconds=n)
-            if unit in ("minute",): return d + _td(minutes=n)
-            if unit in ("hour",):   return d + _td(hours=n)
-            if unit in ("day",):    return d + _td(days=n)
+            if unit == "second": return d + _td(seconds=n)
+            if unit == "minute": return d + _td(minutes=n)
+            if unit == "hour":   return d + _td(hours=n)
+            if unit == "day":    return d + _td(days=n)
             if unit == "month":
                 month = d.month + n
                 year  = d.year + (month - 1) // 12
@@ -660,6 +668,57 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
                 if mod is not None:
                     d2 = _apply_modifier(d2, str(mod))
             return d2.strftime(fmt_str)
+
+        if fname == "DATEDIFF":
+            if len(args) < 2 or args[0] is None or args[1] is None:
+                return None
+            d1 = _parse_dt(str(args[0]))
+            d2 = _parse_dt(str(args[1]))
+            if d1 is None or d2 is None:
+                return None
+            return (d1.date() - d2.date()).days
+
+        if fname in ("DATE_ADD", "DATE_SUB"):
+            if len(args) < 2 or args[0] is None or args[1] is None:
+                return None
+            base = args[0]
+            if isinstance(base, str) and base.upper() in ("NOW", "CURRENT_TIMESTAMP"):
+                base = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            d = _parse_dt(str(base))
+            if d is None:
+                return None
+            interval_str = str(args[1])
+            if fname == "DATE_SUB":
+                mi = _re.match(r'^([+-]?\d+)\s+(\w+)$', interval_str.strip())
+                if mi:
+                    interval_str = f"{-int(mi.group(1))} {mi.group(2)}"
+            d = _apply_modifier(d, interval_str)
+            return d.strftime("%Y-%m-%d %H:%M:%S")
+
+        if fname == "DATE_FORMAT":
+            if len(args) < 2 or args[0] is None or args[1] is None:
+                return None
+            base = args[0]
+            if isinstance(base, str) and base.upper() in ("NOW", "CURRENT_TIMESTAMP"):
+                base = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            d = _parse_dt(str(base))
+            if d is None:
+                return None
+            fmt = str(args[1])
+            # Translate MySQL-specific format codes to Python strftime equivalents.
+            # Order matters: %M before %m to avoid double-substitution.
+            _mysql_map = [
+                ("%M", "%B"),           # month name (full)
+                ("%W", "%A"),           # weekday name (full)
+                ("%r", "%I:%M:%S %p"),  # 12-hour clock with AM/PM
+                ("%T", "%H:%M:%S"),     # 24-hour clock
+                ("%i", "%M"),           # minutes (MySQL %i → Python %M after %M is replaced)
+                ("%s", "%S"),           # seconds
+            ]
+            result = fmt
+            for mysql_spec, py_spec in _mysql_map:
+                result = result.replace(mysql_spec, py_spec)
+            return d.strftime(result)
 
         base = args[0]
         if isinstance(base, str) and base.upper() in ("NOW", "CURRENT_TIMESTAMP"):
@@ -947,6 +1006,10 @@ def _parse_expr_primary(toks: list[str], pos: int) -> tuple[Any, int]:
         else:
             raise ParseError("Unmatched '(' in expression")
         return val, pos
+
+    # INTERVAL n UNIT → Literal string consumed by DATE_ADD / DATE_SUB
+    if upper == "INTERVAL" and pos + 2 < len(toks):
+        return Literal(f"{toks[pos + 1]} {toks[pos + 2]}"), pos + 3
 
     # CASE WHEN ... END
     if upper == "CASE":

@@ -36,7 +36,8 @@ _AGG_RE = re.compile(
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
     "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW",
-    "AND", "OR", "NOT", "IN", "IS", "LIKE", "REGEXP", "RLIKE", "SET", "FROM", "FOR",
+    "AND", "OR", "NOT", "IN", "IS", "LIKE", "REGEXP", "RLIKE", "INTERVAL",
+    "SET", "FROM", "FOR",
 })
 
 _JSON_EACH_RE_PARSER = re.compile(r'^(json_each|json_tree)\s*\(', re.IGNORECASE)
