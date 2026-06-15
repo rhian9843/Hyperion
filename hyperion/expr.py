@@ -505,6 +505,28 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
             return None
         return _printf(str(args[0]), args[1:])
 
+    # ── Regex functions ────────────────────────────────────────────────────────
+
+    if fname == "REGEXP_REPLACE":
+        if len(args) < 3 or any(a is None for a in args[:3]):
+            return None
+        try:
+            return re.sub(str(args[1]), str(args[2]), str(args[0]))
+        except re.error:
+            return None
+
+    if fname in ("REGEXP_EXTRACT", "REGEXP_SUBSTR"):
+        if len(args) < 2 or any(a is None for a in args[:2]):
+            return None
+        try:
+            m = re.search(str(args[1]), str(args[0]))
+            if m is None:
+                return None
+            # Return first capture group if present, else full match
+            return m.group(1) if m.lastindex and m.lastindex >= 1 else m.group(0)
+        except re.error:
+            return None
+
     # ── Math functions ─────────────────────────────────────────────────────────
 
     if fname == "ABS":

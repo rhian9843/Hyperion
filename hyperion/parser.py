@@ -36,7 +36,7 @@ _AGG_RE = re.compile(
 _ALIAS_BLOCKLIST = frozenset({
     "INNER", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "JOIN", "ON", "AS",
     "WHERE", "GROUP", "ORDER", "LIMIT", "OFFSET", "HAVING", "WINDOW",
-    "AND", "OR", "NOT", "IN", "IS", "LIKE", "SET", "FROM", "FOR",
+    "AND", "OR", "NOT", "IN", "IS", "LIKE", "REGEXP", "RLIKE", "SET", "FROM", "FOR",
 })
 
 _JSON_EACH_RE_PARSER = re.compile(r'^(json_each|json_tree)\s*\(', re.IGNORECASE)
@@ -337,7 +337,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
         if j >= len(tokens):
             raise ParseError("Incomplete WHERE clause after CASE expression")
         op = tokens[j].upper()
-        if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+        if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB", "REGEXP", "RLIKE"}:
             raise ParseError(f"Unexpected operator after CASE: '{op}'")
         if j + 1 >= len(tokens):
             raise ParseError("Incomplete WHERE clause")
@@ -356,7 +356,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
         if j >= len(tokens):
             raise ParseError("Incomplete WHERE expression")
         op = tokens[j].upper()
-        if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+        if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB", "REGEXP", "RLIKE"}:
             raise ParseError(f"Unknown operator: '{op}'")
         if j + 1 >= len(tokens):
             raise ParseError("Incomplete WHERE clause")
@@ -366,7 +366,8 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
     # Function call or complex expression as LHS: UPPER(name) = val, TRIM(col) LIKE '%x%'
     # Collect tokens until a comparison op at depth 0
     _CMP_OPS_SET = frozenset({"=", "!=", "<", ">", "<=", ">=",
-                               "LIKE", "GLOB", "IS", "IN", "NOT", "BETWEEN"})
+                               "LIKE", "GLOB", "REGEXP", "RLIKE",
+                               "IS", "IN", "NOT", "BETWEEN"})
     if pos + 1 < len(tokens) and tokens[pos + 1] == "(":
         j = pos; pd = 0
         while j < len(tokens):
@@ -385,7 +386,8 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
                     if (j + 2 < len(tokens) and tokens[j + 1].upper() == "NOT"
                             and tokens[j + 2].upper() == "NULL"):
                         return WhereClause(col=expr_col, op="IS NOT NULL", val=""), j + 3
-                if cmp_op in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+                if cmp_op in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB",
+                               "REGEXP", "RLIKE"}:
                     rhs = _unquote_token(tokens[j + 1]) if j + 1 < len(tokens) else ""
                     return WhereClause(col=expr_col, op=cmp_op, val=rhs), j + 2
                 if cmp_op == "IN":
@@ -404,7 +406,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
     if col.upper() in ("TRUE", "FALSE"):
         _next = tokens[pos + 1].upper() if pos + 1 < len(tokens) else ""
         _is_op = _next in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB",
-                            "IN", "NOT", "IS", "BETWEEN"}
+                            "REGEXP", "RLIKE", "IN", "NOT", "IS", "BETWEEN"}
         if not _is_op:
             return WhereClause(col=col, op="=", val="1" if col.upper() == "TRUE" else "0"), pos + 1
 
@@ -441,7 +443,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             inner.or_clause = WhereClause(col=col, op=">", val=hi_val)
             return WhereClause(col="", op="GROUP", val="",
                                group_clause=inner), pos + 6
-        if pos + 2 < len(tokens) and tokens[pos + 2].upper() in ("LIKE", "GLOB"):
+        if pos + 2 < len(tokens) and tokens[pos + 2].upper() in ("LIKE", "GLOB", "REGEXP", "RLIKE"):
             if pos + 3 >= len(tokens):
                 raise ParseError(f"Expected pattern after NOT {tokens[pos + 2].upper()}")
             op2 = tokens[pos + 2].upper()
@@ -455,7 +457,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
             inner2 = WhereClause(col=col, op=op2, val=val2)
             return WhereClause(col="", op="NOT", val="", group_clause=inner2), pos + advance
         _got = tokens[pos + 2] if pos + 2 < len(tokens) else ""
-        raise ParseError(f"Expected IN, BETWEEN, LIKE, or GLOB after NOT, got '{_got}'")
+        raise ParseError(f"Expected IN, BETWEEN, LIKE, GLOB, REGEXP, or RLIKE after NOT, got '{_got}'")
 
     if op == "IN":
         if pos + 2 >= len(tokens) or tokens[pos + 2] != "(":
@@ -490,7 +492,7 @@ def _parse_one_condition(tokens: list[str], pos: int) -> tuple["WhereClause", in
                            subquery_ast=_parse_tokens(inner)), new_pos
 
     val = _unquote_token(tokens[pos + 2])
-    if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB"}:
+    if op not in {"=", "!=", "<", ">", "<=", ">=", "LIKE", "GLOB", "REGEXP", "RLIKE"}:
         raise ParseError(f"Unknown operator: '{op}'")
     if op == "LIKE" and pos + 3 < len(tokens) and tokens[pos + 3].upper() == "ESCAPE":
         if pos + 4 >= len(tokens):

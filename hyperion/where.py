@@ -136,12 +136,12 @@ class WhereClause:
             fk = next(iter(sub_rows[0]))
             val = sub_rows[0][fk]
         elif (isinstance(val, str) and "." in val
-              and self.op not in ("LIKE", "GLOB", "IN", "NOT IN")
+              and self.op not in ("LIKE", "GLOB", "REGEXP", "RLIKE", "IN", "NOT IN")
               and val in row):
             # Qualified column reference (e.g. b.id) in a merged join row — resolve it
             val = row[val]
         elif (isinstance(val, str) and val not in ("", "__subquery__")
-              and self.op not in ("LIKE", "GLOB", "IN", "NOT IN") and is_expr(val)):
+              and self.op not in ("LIKE", "GLOB", "REGEXP", "RLIKE", "IN", "NOT IN") and is_expr(val)):
             val = eval_expr(val, row)
 
         if not isinstance(val, (int, float)) and isinstance(cell, (int, float)):
@@ -188,6 +188,11 @@ class WhereClause:
                     for ch in str(val)
                 )
                 return bool(re.fullmatch(regex, str(cell)))  # case-sensitive
+            case "REGEXP" | "RLIKE":
+                try:
+                    return bool(re.search(str(val), str(cell)))
+                except re.error:
+                    return False
         return False
 
     def _resolve_col_val(self, col: str, row: dict) -> Any:
