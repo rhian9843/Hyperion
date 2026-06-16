@@ -460,7 +460,7 @@
 
 - [x] Regex functions — `REGEXP_REPLACE(str, pattern, replacement)`, `REGEXP_EXTRACT(str, pattern)`, `REGEXP` / `RLIKE` infix operators for pattern matching in `WHERE` clauses; backed by Python `re` module; no external dependency
 - [x] Date manipulation functions — `NOW()` (alias for `CURRENT_TIMESTAMP`), `DATEDIFF(date1, date2)` returns days between two dates, `DATE_ADD(date, INTERVAL n UNIT)` / `DATE_SUB(date, INTERVAL n UNIT)` for date arithmetic, `DATE_FORMAT(date, format)` for strftime-style formatting; MySQL-compatible signatures
-- [ ] `TIME` standalone data type — `HH:MM:SS` storage separate from `DATE` and `DATETIME`; already have `CURRENT_TIME` scalar but no `TIME` column type
+- [x] `TIME` standalone data type — `HH:MM:SS` storage separate from `DATE` and `DATETIME`; already have `CURRENT_TIME` scalar but no `TIME` column type; also added `TIMEDIFF`, `ADDTIME`, `SUBTIME`, `HOUR`, `MINUTE`, `SECOND`, `TIME_TO_SEC`, `SEC_TO_TIME`, `DAY`/`DAYOFMONTH`, `MONTH`, `YEAR` extraction/arithmetic functions
 
 ### Introspection — Missing
 

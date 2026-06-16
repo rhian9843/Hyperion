@@ -737,6 +737,100 @@ def _eval_func_evaled(fname: str, args: list) -> Any:
             return (d - epoch).days + 0.5
         return d.strftime("%Y-%m-%d %H:%M:%S")
 
+    # ── Time-specific functions ────────────────────────────────────────────────
+
+    if fname in ("TIMEDIFF", "ADDTIME", "SUBTIME",
+                 "HOUR", "MINUTE", "SECOND",
+                 "TIME_TO_SEC", "SEC_TO_TIME",
+                 "DAY", "DAYOFMONTH", "MONTH", "YEAR"):
+        from datetime import datetime as _dt2
+
+        def _time_to_secs(s) -> "int | None":
+            if s is None:
+                return None
+            s = str(s).strip()
+            neg = s.startswith("-")
+            s2 = s.lstrip("-").strip()
+            # Try full datetime first, then time-only
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                        "%H:%M:%S", "%H:%M"):
+                try:
+                    d2 = _dt2.strptime(s2, fmt)
+                    total = d2.hour * 3600 + d2.minute * 60 + d2.second
+                    return -total if neg else total
+                except ValueError:
+                    pass
+            return None
+
+        def _secs_to_hms(total: int) -> str:
+            neg = total < 0
+            total = abs(total)
+            h, rem = divmod(total, 3600)
+            m, s = divmod(rem, 60)
+            r = f"{h:02d}:{m:02d}:{s:02d}"
+            return f"-{r}" if neg else r
+
+        def _parse_dt2(s) -> "_dt2 | None":
+            if s is None:
+                return None
+            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M",
+                        "%Y-%m-%d", "%H:%M:%S", "%H:%M"):
+                try:
+                    return _dt2.strptime(str(s).strip(), fmt)
+                except ValueError:
+                    pass
+            return None
+
+        if fname == "TIMEDIFF":
+            if len(args) < 2 or args[0] is None or args[1] is None:
+                return None
+            s1 = _time_to_secs(args[0])
+            s2 = _time_to_secs(args[1])
+            if s1 is None or s2 is None:
+                return None
+            return _secs_to_hms(s1 - s2)
+
+        if fname in ("ADDTIME", "SUBTIME"):
+            if len(args) < 2 or args[0] is None or args[1] is None:
+                return None
+            s1 = _time_to_secs(args[0])
+            s2 = _time_to_secs(args[1])
+            if s1 is None or s2 is None:
+                return None
+            total = s1 - s2 if fname == "SUBTIME" else s1 + s2
+            return _secs_to_hms(total)
+
+        if fname == "HOUR":
+            secs = _time_to_secs(args[0]) if args else None
+            return abs(secs) // 3600 if secs is not None else None
+
+        if fname == "MINUTE":
+            secs = _time_to_secs(args[0]) if args else None
+            return (abs(secs) % 3600) // 60 if secs is not None else None
+
+        if fname == "SECOND":
+            secs = _time_to_secs(args[0]) if args else None
+            return abs(secs) % 60 if secs is not None else None
+
+        if fname == "TIME_TO_SEC":
+            return _time_to_secs(args[0]) if args else None
+
+        if fname == "SEC_TO_TIME":
+            if not args or args[0] is None:
+                return None
+            try:
+                return _secs_to_hms(int(args[0]))
+            except (ValueError, TypeError):
+                return None
+
+        d3 = _parse_dt2(args[0]) if args else None
+        if fname in ("DAY", "DAYOFMONTH"):
+            return d3.day if d3 else None
+        if fname == "MONTH":
+            return d3.month if d3 else None
+        if fname == "YEAR":
+            return d3.year if d3 else None
+
     # ── JSON functions ─────────────────────────────────────────────────────────
 
     if fname.upper().startswith("JSON"):
