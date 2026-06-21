@@ -2230,23 +2230,34 @@ def _parse_tokens(t: list[str]) -> dict:
         query_plan = (not analyze and len(t) >= 3
                       and t[1].upper() == "QUERY"
                       and t[2].upper() == "PLAN")
+        rewritten  = (not analyze and not query_plan and len(t) >= 2
+                      and t[1].upper() == "REWRITTEN")
         if analyze:
             inner_tokens = t[2:]
         elif query_plan:
             inner_tokens = t[3:]
+        elif rewritten:
+            inner_tokens = t[2:]
         else:
             inner_tokens = t[1:]
         if not inner_tokens:
             raise ParseError("EXPLAIN requires a statement")
         inner_ast = _parse_tokens(inner_tokens)
         return {"op": "EXPLAIN", "query_plan": query_plan,
-                "analyze": analyze, "stmt": inner_ast}
+                "analyze": analyze, "rewritten": rewritten,
+                "stmt": inner_ast}
     if kw == "VACUUM":
         return {"op": "VACUUM"}
     if kw == "ANALYZE":
         table = t[1] if len(t) > 1 and t[1] != ";" else None
         return {"op": "ANALYZE", "table": table}
     if kw == "SET":
+        # SET REWRITER ON|OFF
+        if len(t) >= 3 and t[1].upper() == "REWRITER":
+            val = t[2].upper()
+            if val not in ("ON", "OFF"):
+                raise ParseError("Expected ON or OFF after SET REWRITER")
+            return {"op": "SET_REWRITER", "enabled": val == "ON"}
         # SET TRANSACTION ISOLATION LEVEL <level>
         # SET SESSION TRANSACTION ISOLATION LEVEL <level>  (MySQL compat)
         i = 1

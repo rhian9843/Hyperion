@@ -7,6 +7,30 @@ from .constants import PAGE_SIZE
 from .checksum import stamp_page, verify_page
 from .wal import WAL
 
+# Per-file-path write-serialization lock.
+#
+# macOS (and some other platforms) implement flock() at process granularity:
+# two threads in the same process holding separate open-file-descriptions on
+# the same path do NOT block each other on flock(LOCK_EX).  This means the
+# file-lock upgrade in pager.begin() provides no intra-process writer
+# serialization, allowing two connections to the same file to run concurrent
+# write transactions and race on next_key allocation.
+#
+# _FILE_WRITE_LOCKS maps canonical path string → threading.Lock.  Pager.begin()
+# acquires the lock for the file; Pager.commit() / rollback() release it.
+# This guarantees that at most one write transaction is active per file within
+# a single Python process, regardless of OS flock semantics.
+_FILE_WRITE_LOCKS: dict[str, threading.Lock] = {}
+_FILE_WRITE_LOCKS_GUARD = threading.Lock()
+
+
+def _file_write_lock(path: Path) -> threading.Lock:
+    key = str(path.resolve())
+    with _FILE_WRITE_LOCKS_GUARD:
+        if key not in _FILE_WRITE_LOCKS:
+            _FILE_WRITE_LOCKS[key] = threading.Lock()
+        return _FILE_WRITE_LOCKS[key]
+
 try:
     import errno as _errno
     import fcntl as _fcntl
@@ -62,6 +86,11 @@ class Pager:
         self._wal:            WAL | None = None   # opened lazily on first begin()
         self._in_txn:         bool = False
         self._write_tid:      int | None = None   # thread-id that owns the write txn
+        # Per-file write-serialization lock (see module-level comment above).
+        # None for read-only connections — they never call begin().
+        self._write_lock: threading.Lock | None = (
+            None if readonly else _file_write_lock(path)
+        )
         self._wal_txn_offset: int = 0             # WAL offset at transaction start
         self._wal_applied_offset: int = WAL.HDR_SIZE  # WAL tail already in _cache
         # Logical entries recovered from the WAL on startup — drained by Database.__init__
@@ -149,6 +178,12 @@ class Pager:
     def begin(self) -> None:
         if self._in_txn:
             raise TransactionError("Transaction already active")
+        # Acquire the intra-process per-file write lock BEFORE the flock upgrade.
+        # This serializes concurrent write transactions from different Database
+        # instances in the same process on macOS (where flock is process-granular
+        # and does not block same-process file descriptions from each other).
+        if self._write_lock is not None:
+            self._write_lock.acquire()
         _flock(self._file.fileno(), 2)   # LOCK_EX — upgrade from shared
         self._working.clear()
         self._dirty.clear()
@@ -203,6 +238,8 @@ class Pager:
         # compacted WAL (HDR_SIZE + retained logical frames).
         self._wal_applied_offset = self._wal.begin_offset()
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after write
+        if self._write_lock is not None:
+            self._write_lock.release()
 
     def rollback(self) -> None:
         if not self._in_txn:
@@ -214,6 +251,8 @@ class Pager:
         self._in_txn    = False
         self._write_tid = None
         _flock(self._file.fileno(), 1)   # LOCK_SH — downgrade after abort
+        if self._write_lock is not None:
+            self._write_lock.release()
 
     def close(self, min_consumed_lsn: int = 0) -> None:
         """Flush and close the database file.
@@ -227,6 +266,9 @@ class Pager:
         if self._in_txn and self._wal is not None:
             self._wal.rollback_txn(self._wal_txn_offset)
             self._in_txn = False
+            self._write_tid = None
+            if self._write_lock is not None and self._write_lock.locked():
+                self._write_lock.release()
         if self._wal is not None:
             _flock(self._file.fileno(), 2)   # LOCK_EX briefly for checkpoint
             self._wal.checkpoint(self._file, min_consumed_lsn)
@@ -239,6 +281,17 @@ class Pager:
         self._file.flush()
         _flock(self._file.fileno(), 8)   # LOCK_UN
         self._file.close()
+
+    def __del__(self) -> None:
+        # Safety net: release the write lock if the pager is garbage-collected
+        # while holding it (e.g. crash simulations that close file handles
+        # directly without calling commit/rollback/close).
+        if self._in_txn and self._write_lock is not None:
+            try:
+                if self._write_lock.locked():
+                    self._write_lock.release()
+            except Exception:
+                pass
 
 
 class MemoryPager:

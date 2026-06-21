@@ -1220,6 +1220,8 @@ def execute(stmt: dict, db: Database) -> str:
     if op == "EXPLAIN":
         if stmt.get("analyze"):
             return _exec_explain_analyze(stmt["stmt"], db)
+        if stmt.get("rewritten"):
+            return _exec_explain_rewritten(stmt["stmt"], db)
         plan_rows = _explain_plan(stmt["stmt"], db)
         cols = ["id", "parent", "notused", "detail"]
         return RowResult(plan_rows, cols)
@@ -1927,6 +1929,37 @@ def _exec_show_events(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _exec_set_rewriter(stmt: dict, db: Database) -> str:
+    from .query_rewriter import QueryRewriter
+    if not hasattr(db, "_rewriter"):
+        db._rewriter = QueryRewriter()
+    db._rewriter.set_enabled(stmt["enabled"])
+    state = "ON" if stmt["enabled"] else "OFF"
+    return f"Query rewriter {state}."
+
+
+def _exec_explain_rewritten(inner_stmt: dict, db: Database) -> RowResult:
+    from .query_rewriter import QueryRewriter, _where_to_str
+    rw = getattr(db, "_rewriter", None) or QueryRewriter()
+    import copy
+    stmt_copy = copy.deepcopy(inner_stmt)
+    original_where = _where_to_str(stmt_copy.get("where"))
+    rw.rewrite(stmt_copy)
+    rewritten_where = _where_to_str(stmt_copy.get("where"))
+    rows = [{"step": "original_where",  "detail": original_where}]
+    if rw.notes:
+        for note in rw.notes:
+            rows.append({"step": "transformation", "detail": note})
+    else:
+        rows.append({"step": "transformation", "detail": "(no rewrites applied)"})
+    rows.append({"step": "rewritten_where", "detail": rewritten_where})
+    if stmt_copy.get("where_always_false"):
+        rows.append({"step": "result", "detail": "query returns 0 rows (always-false WHERE)"})
+    else:
+        rows.append({"step": "result", "detail": "query proceeds with rewritten WHERE"})
+    return RowResult(rows, ["step", "detail"])
+
+
 def _exec_create_mat_view(stmt: dict, db: Database) -> str:
     db.create_mat_view(stmt["name"], stmt["sql"],
                        if_not_exists=stmt.get("if_not_exists", False))
@@ -2077,6 +2110,7 @@ _DISPATCH: dict[str, Any] = {
     "SHOW_EVENTS":                    _exec_show_events,
     "SHOW_RECOVERY_STATUS":           _exec_show_recovery_status,
     "SHOW_LOGICAL_LOG":               _exec_show_logical_log,
+    "SET_REWRITER":                   _exec_set_rewriter,
     "CREATE_MAT_VIEW":                _exec_create_mat_view,
     "REFRESH_MAT_VIEW":               _exec_refresh_mat_view,
     "DROP_MAT_VIEW":                  _exec_drop_mat_view,
@@ -2137,6 +2171,25 @@ def _exec_explain_analyze(inner_stmt: dict, db: "Database") -> RowResult:
 
 
 def _execute_inner(stmt: dict, db: Database) -> str:
+    # Run query rewriter on SELECT statements
+    if stmt.get("op") in ("SELECT", "JOIN", "SELECT_NOFROM"):
+        from .query_rewriter import QueryRewriter
+        rw = getattr(db, "_rewriter", None)
+        if rw is None:
+            rw = QueryRewriter()
+            db._rewriter = rw
+        rw.rewrite(stmt)
+        if stmt.get("where_always_false"):
+            # Short-circuit: WHERE is always false, return empty result
+            cols = stmt.get("columns", ["*"])
+            if cols == ["*"]:
+                tbl = stmt.get("table")
+                if tbl and tbl in db._catalog.tables:
+                    cols = [c.name for c in db._catalog.tables[tbl].schema.columns]
+                else:
+                    cols = []
+            return RowResult([], cols if cols != ["*"] else [])
+
     handler = _DISPATCH.get(stmt["op"])
     if handler is None:
         raise InternalError(f"Unknown op: {stmt['op']}")

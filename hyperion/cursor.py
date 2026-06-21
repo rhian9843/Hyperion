@@ -374,6 +374,10 @@ class Cursor:
                     from .executor import _exec_explain_analyze as _ea
                     result = _ea(stmt["stmt"], self._db)
                     self._set_select_result(iter(result.rows))
+                elif stmt.get("rewritten"):
+                    from .executor import _exec_explain_rewritten as _er
+                    result = _er(stmt["stmt"], self._db)
+                    self._set_select_result(iter(result.rows))
                 else:
                     rows = explain_plan(stmt["stmt"], self._db)
                     self._set_select_result(iter(rows))

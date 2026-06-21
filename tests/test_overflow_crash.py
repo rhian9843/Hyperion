@@ -11,9 +11,7 @@ On the next open, replay_if_exists must:
   (c) leave the database in a usable state with no dangling overflow refs.
 """
 
-import os
 import struct
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -29,6 +27,34 @@ _PAYLOAD = "y" * (ROW_INLINE_CAP + 1 + 2 * OVERFLOW_DATA_SZ + 100)
 
 def _open_db(path: str) -> Database:
     return Database(path)
+
+
+def _force_crash_close(db) -> None:
+    """Simulate an OS crash: close raw file handles and release the pager's
+    intra-process write lock without going through commit/rollback.
+
+    The WAL file is intentionally left dirty on disk so that the next open
+    can exercise the crash-recovery path.
+    """
+    if db is None:
+        return
+    try:
+        pager = db._pager
+        if pager._wal is not None:
+            pager._wal._file.flush()
+            pager._wal._file.close()
+            pager._wal = None
+        pager._file.flush()
+        pager._file.close()
+        # Release the write lock that pager.begin() acquired.
+        # Normally released by commit/rollback; must be done explicitly
+        # when simulating a crash that skips those paths.
+        wl = getattr(pager, '_write_lock', None)
+        if wl is not None and wl.locked():
+            wl.release()
+        pager._in_txn = False
+    except Exception:
+        pass
 
 
 class TestOverflowCrashRecovery:
@@ -77,19 +103,7 @@ class TestOverflowCrashRecovery:
                 db2.execute("INSERT INTO t VALUES (?, ?)", (9, _PAYLOAD))
         finally:
             WAL.commit_txn = original_commit
-            # Force-close file handles without the normal clean-close path
-            # (mirrors what the OS does on process death).
-            if db2 is not None:
-                try:
-                    pager = db2._pager
-                    if pager._wal is not None:
-                        pager._wal._file.flush()
-                        pager._wal._file.close()
-                        pager._wal = None
-                    pager._file.flush()
-                    pager._file.close()
-                except Exception:
-                    pass
+            _force_crash_close(db2)
 
         assert wal_path.exists(), "WAL file must survive the simulated crash"
 
@@ -145,17 +159,7 @@ class TestOverflowCrashRecovery:
                 db2.execute("INSERT INTO t VALUES (?, ?)", (9, _PAYLOAD))
         finally:
             WAL.commit_txn = original_commit
-            if db2 is not None:
-                try:
-                    pager = db2._pager
-                    if pager._wal is not None:
-                        pager._wal._file.flush()
-                        pager._wal._file.close()
-                        pager._wal = None
-                    pager._file.flush()
-                    pager._file.close()
-                except Exception:
-                    pass
+            _force_crash_close(db2)
 
         db3 = _open_db(db_path)
         rows = db3.execute("SELECT id FROM t ORDER BY id").fetchall()
