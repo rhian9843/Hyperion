@@ -1927,6 +1927,36 @@ def _exec_show_events(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
+    from .pager import Pager, MemoryPager
+    pager = db._pager
+    if isinstance(pager, MemoryPager):
+        row = {
+            "wal_file":            "memory",
+            "wal_exists":          False,
+            "wal_size_bytes":      0,
+            "recovery_applied":    False,
+            "current_lsn":         0,
+            "checkpoint_lsn":      0,
+            "pages_since_checkpoint": 0,
+        }
+    else:
+        wal_path = pager._path.with_suffix(".wal")
+        wal_exists = wal_path.exists()
+        wal_size = wal_path.stat().st_size if wal_exists else 0
+        row = {
+            "wal_file":            str(wal_path),
+            "wal_exists":          wal_exists,
+            "wal_size_bytes":      wal_size,
+            "recovery_applied":    getattr(pager, "_recovery_applied", False),
+            "current_lsn":         pager._phys_current_lsn,
+            "checkpoint_lsn":      pager._phys_checkpoint_lsn,
+            "pages_since_checkpoint": getattr(pager, "_pages_since_ckpt", 0),
+        }
+    cols = list(row.keys())
+    return RowResult([row], cols)
+
+
 # ── Row-Level Security handlers ───────────────────────────────────────────────
 
 def _exec_alter_enable_rls(stmt: dict, db: Database) -> str:
@@ -1990,6 +2020,7 @@ _DISPATCH: dict[str, Any] = {
     "DROP_EVENT":                     _exec_drop_event,
     "ALTER_EVENT":                    _exec_alter_event,
     "SHOW_EVENTS":                    _exec_show_events,
+    "SHOW_RECOVERY_STATUS":           _exec_show_recovery_status,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

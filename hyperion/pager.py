@@ -38,6 +38,7 @@ except ImportError:
 class Pager:
     def __init__(self, path: Path, *, readonly: bool = False):
         wal_path = path.with_suffix(".wal")
+        _recovery_applied = False
         if readonly:
             self._file = open(path, "rb")
             _flock(self._file.fileno(), 1)   # LOCK_SH — read-only, no WAL replay
@@ -46,7 +47,9 @@ class Pager:
             # Try non-blocking LOCK_EX for WAL crash recovery.  If another connection
             # is already open (holding LOCK_SH) we skip recovery — the live connection
             # will handle it on its own close/checkpoint.
-            _ex_acquired = _flock_try_ex(self._file.fileno())
+            _wal_existed  = wal_path.exists()
+            _ex_acquired  = _flock_try_ex(self._file.fileno())
+            _recovery_applied = _ex_acquired and _wal_existed
             if _ex_acquired:
                 self._recovery_logical = WAL.replay_if_exists(wal_path, self._file)
             # _flock(LOCK_SH) is blocking: we wait here until any active writer
@@ -63,6 +66,8 @@ class Pager:
         self._wal_applied_offset: int = WAL.HDR_SIZE  # WAL tail already in _cache
         # Logical entries recovered from the WAL on startup — drained by Database.__init__
         self._recovery_logical: list[dict] = []
+        # True if a crash-recovery WAL replay was performed on this open
+        self._recovery_applied: bool = _recovery_applied
         # Physical replication: track which pages changed since last checkpoint
         self._phys_dirty: dict[int, tuple[int, bytes]] = {}  # pn → (catalog_lsn, page_bytes)
         self._phys_current_lsn:    int = 0  # catalog_lsn of most recent commit

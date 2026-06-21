@@ -2251,6 +2251,9 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "SHOW_BINLOG"}
         if len(t) > 1 and t[1].upper() == "EVENTS":
             return {"op": "SHOW_EVENTS"}
+        if (len(t) > 2 and t[1].upper() == "RECOVERY"
+                and t[2].upper() == "STATUS"):
+            return {"op": "SHOW_RECOVERY_STATUS"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     if kw == "START":
         if len(t) > 1 and t[1].upper() == "SLAVE":
