@@ -467,7 +467,7 @@
 - [x] `EXPLAIN ANALYZE` — runs the query and annotates the execution plan with actual row counts, loop iterations, and elapsed time per node; complements `EXPLAIN` (estimated plan) and `EXPLAIN QUERY PLAN` (textual plan) with real execution statistics
 - [x] `SHOW RECOVERY STATUS` — reports the current WAL state: last committed LSN, whether a recovery replay occurred on startup, WAL file size, and checkpoint timestamp; useful for diagnosing crash recovery
 - [ ] `SHOW MATERIALIZED VIEWS` — lists all materialized views with their name, defining query, last refresh timestamp, and row count; complements `SHOW TABLES` and `INFORMATION_SCHEMA`
-- [ ] `SHOW LOGICAL LOG` — display the last N entries from the logical replication change log; shows table name, operation (INSERT/UPDATE/DELETE), and column values; useful for debugging replication lag
+- [x] `SHOW LOGICAL LOG` — display the last N entries from the logical replication change log; shows table name, operation (INSERT/UPDATE/DELETE), and column values; useful for debugging replication lag
 
 ### Adaptive Query Optimizer
 
