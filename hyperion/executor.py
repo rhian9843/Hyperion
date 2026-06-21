@@ -1218,6 +1218,8 @@ def execute(stmt: dict, db: Database) -> str:
         return _handle_pragma(stmt, db)
 
     if op == "EXPLAIN":
+        if stmt.get("analyze"):
+            return _exec_explain_analyze(stmt["stmt"], db)
         plan_rows = _explain_plan(stmt["stmt"], db)
         cols = ["id", "parent", "notused", "detail"]
         return RowResult(plan_rows, cols)
@@ -1998,6 +2000,49 @@ _DISPATCH: dict[str, Any] = {
     "UPDATE":                   _exec_update,
     "DELETE":                   _exec_delete,
 }
+
+
+def _exec_explain_analyze(inner_stmt: dict, db: "Database") -> RowResult:
+    """Run EXPLAIN ANALYZE: execute the statement, annotate plan nodes with
+    actual row counts and elapsed time."""
+    import time as _time
+    import re as _re
+
+    # Static plan first
+    plan_rows = _explain_plan(inner_stmt, db)
+
+    # Execute and time
+    t0 = _time.perf_counter()
+    actual_rows = 0
+    try:
+        result = _execute_inner(inner_stmt, db)
+        if isinstance(result, RowResult):
+            actual_rows = len(result.rows)
+        elif isinstance(result, str):
+            m = _re.search(r'\b(\d+)\b', result)
+            if m:
+                actual_rows = int(m.group(1))
+    except Exception:
+        pass
+    elapsed_ms = round((_time.perf_counter() - t0) * 1000, 3)
+
+    # Annotate: root node gets total rows + total time; sub-nodes get per-node 0
+    # (deep per-node instrumentation would require executor refactor)
+    for i, row in enumerate(plan_rows):
+        if i == 0:
+            row["actual_rows"]    = actual_rows
+            row["actual_time_ms"] = elapsed_ms
+        else:
+            row["actual_rows"]    = 0
+            row["actual_time_ms"] = 0.0
+        row["detail"] = (
+            f"{row['detail']} "
+            f"(actual rows={row['actual_rows']}, "
+            f"time={row['actual_time_ms']}ms)"
+        )
+
+    cols = ["id", "parent", "notused", "detail", "actual_rows", "actual_time_ms"]
+    return RowResult(plan_rows, cols)
 
 
 def _execute_inner(stmt: dict, db: Database) -> str:

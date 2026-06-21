@@ -2187,14 +2187,21 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "PRAGMA", "name": name, "value": t[3]}
         return {"op": "PRAGMA", "name": name, "arg": None}
     if kw == "EXPLAIN":
-        query_plan = (len(t) >= 3
+        analyze    = len(t) >= 2 and t[1].upper() == "ANALYZE"
+        query_plan = (not analyze and len(t) >= 3
                       and t[1].upper() == "QUERY"
                       and t[2].upper() == "PLAN")
-        inner_tokens = t[3:] if query_plan else t[1:]
+        if analyze:
+            inner_tokens = t[2:]
+        elif query_plan:
+            inner_tokens = t[3:]
+        else:
+            inner_tokens = t[1:]
         if not inner_tokens:
             raise ParseError("EXPLAIN requires a statement")
         inner_ast = _parse_tokens(inner_tokens)
-        return {"op": "EXPLAIN", "query_plan": query_plan, "stmt": inner_ast}
+        return {"op": "EXPLAIN", "query_plan": query_plan,
+                "analyze": analyze, "stmt": inner_ast}
     if kw == "VACUUM":
         return {"op": "VACUUM"}
     if kw == "ANALYZE":

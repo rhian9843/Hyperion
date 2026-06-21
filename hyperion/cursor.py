@@ -313,8 +313,12 @@ class Cursor:
             with self._db._lock.write():
                 return self._execute_stmt(stmt, op, timeout_ms, max_rows)
 
+        _explain_analyze = (op == "EXPLAIN" and stmt.get("analyze"))
+        _inner_op = stmt.get("stmt", {}).get("op", "") if _explain_analyze else ""
         lock = (self._db._lock.read()
-                if op in _SELECT_OPS or op == "EXPLAIN"
+                if (op in _SELECT_OPS
+                    or (op == "EXPLAIN" and not _explain_analyze)
+                    or (_explain_analyze and _inner_op in _SELECT_OPS))
                 else self._db._lock.write())
         with lock:
             return self._execute_stmt(stmt, op, timeout_ms, max_rows)
@@ -366,8 +370,13 @@ class Cursor:
                     _iter_rows_for_stmt(stmt, self._db), stmt, effective_max_rows
                 )
             elif op == "EXPLAIN":
-                rows = explain_plan(stmt["stmt"], self._db)
-                self._set_select_result(iter(rows))
+                if stmt.get("analyze"):
+                    from .executor import _exec_explain_analyze as _ea
+                    result = _ea(stmt["stmt"], self._db)
+                    self._set_select_result(iter(result.rows))
+                else:
+                    rows = explain_plan(stmt["stmt"], self._db)
+                    self._set_select_result(iter(rows))
             else:
                 from .executor import RowResult as _RowResult
                 result = _exec(stmt, self._db)
