@@ -1034,6 +1034,24 @@ def _parse_create_view(t: list[str], i: int, or_replace: bool) -> dict:
             "if_not_exists": if_not_exists, "or_replace": or_replace}
 
 
+def _parse_create_mat_view(t: list[str], i: int) -> dict:
+    if_not_exists = False
+    if i < len(t) and t[i].upper() == "IF":
+        if i + 2 < len(t) and t[i + 1].upper() == "NOT" and t[i + 2].upper() == "EXISTS":
+            if_not_exists = True; i += 3
+        else:
+            raise ParseError("Expected NOT EXISTS after IF in CREATE MATERIALIZED VIEW")
+    if i >= len(t):
+        raise ParseError("Expected view name after CREATE MATERIALIZED VIEW")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "AS":
+        raise ParseError("Expected AS after view name in CREATE MATERIALIZED VIEW")
+    i += 1
+    select_sql = " ".join(t[i:])
+    return {"op": "CREATE_MAT_VIEW", "name": name, "sql": select_sql,
+            "if_not_exists": if_not_exists}
+
+
 def _parse_create_index(t: list[str], i: int, unique: bool = False) -> dict:
     if_not_exists = False
     if i < len(t) and t[i].upper() == "IF":
@@ -1187,6 +1205,8 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_table(t, 2, temporary_table)
     if sub == "VIEW":
         return _parse_create_view(t, 2, False)
+    if sub == "MATERIALIZED" and len(t) > 2 and t[2].upper() == "VIEW":
+        return _parse_create_mat_view(t, 3)
     if sub == "INDEX":
         return _parse_create_index(t, 2)
     if sub == "UNIQUE" and len(t) > 2 and t[2].upper() == "INDEX":
@@ -1468,6 +1488,17 @@ def _parse_drop(t: list[str]) -> dict:
     if len(t) < 3:
         raise ParseError("Expected TABLE or INDEX after DROP")
     sub = t[1].upper()
+    if sub == "MATERIALIZED" and len(t) > 2 and t[2].upper() == "VIEW":
+        i = 3
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+            else:
+                raise ParseError("Expected EXISTS after IF in DROP MATERIALIZED VIEW")
+        if i >= len(t):
+            raise ParseError("Expected name after DROP MATERIALIZED VIEW")
+        return {"op": "DROP_MAT_VIEW", "name": t[i], "if_exists": if_exists}
     if sub in ("TABLE", "INDEX", "VIEW", "TRIGGER"):
         i = 2
         if_exists = False
@@ -2164,6 +2195,14 @@ def _parse_tokens(t: list[str]) -> dict:
         return _parse_alter(t)
     if kw == "DROP":
         return _parse_drop(t)
+    if kw == "REFRESH":
+        if (len(t) >= 3 and t[1].upper() == "MATERIALIZED"
+                and t[2].upper() == "VIEW"):
+            if len(t) < 4:
+                raise ParseError("Expected view name after REFRESH MATERIALIZED VIEW")
+            return {"op": "REFRESH_MAT_VIEW", "name": t[3]}
+        raise ParseError(f"Unknown REFRESH variant: '{' '.join(t[1:])}'")
+
     if kw == "INSERT":
         return _parse_insert(t)
     if kw == "SELECT":
@@ -2254,6 +2293,24 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "RECOVERY"
                 and t[2].upper() == "STATUS"):
             return {"op": "SHOW_RECOVERY_STATUS"}
+        if (len(t) > 2 and t[1].upper() == "MATERIALIZED"
+                and t[2].upper() == "VIEWS"):
+            return {"op": "SHOW_MAT_VIEWS"}
+        if (len(t) > 2 and t[1].upper() == "LOGICAL"
+                and t[2].upper() == "LOG"):
+            # SHOW LOGICAL LOG [LIMIT n]
+            limit = 100
+            if len(t) > 3 and t[3].upper() == "LIMIT" and len(t) > 4:
+                try:
+                    limit = int(t[4])
+                except ValueError:
+                    pass
+            elif len(t) > 3:
+                try:
+                    limit = int(t[3])
+                except ValueError:
+                    pass
+            return {"op": "SHOW_LOGICAL_LOG", "limit": limit}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     if kw == "START":
         if len(t) > 1 and t[1].upper() == "SLAVE":

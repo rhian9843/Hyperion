@@ -29,6 +29,14 @@ class PolicyMeta:
 
 
 @dataclass
+class MatViewMeta:
+    name:         str
+    sql:          str    # defining SELECT query
+    last_refresh: str    # ISO datetime of last REFRESH (empty = never refreshed)
+    row_count:    int    # row count after last REFRESH (-1 = not yet refreshed)
+
+
+@dataclass
 class EventMeta:
     name:             str
     schedule_type:    str   # "INTERVAL" or "AT"
@@ -90,6 +98,7 @@ class Catalog:
     subscriptions:  dict[str, SubscriptionMeta] = field(default_factory=dict)
     policies:       dict[str, PolicyMeta]       = field(default_factory=dict)
     events:         dict[str, EventMeta]        = field(default_factory=dict)
+    mat_views:      dict[str, MatViewMeta]      = field(default_factory=dict)
     lsn:            int                         = 0   # advances on each published DML commit
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
@@ -170,6 +179,11 @@ class Catalog:
                     "at_time": e.at_time, "sql": e.sql,
                     "enabled": e.enabled, "last_run": e.last_run}
                 for n, e in self.events.items()
+            },
+            "mat_views": {
+                n: {"sql": v.sql, "last_refresh": v.last_refresh,
+                    "row_count": v.row_count}
+                for n, v in self.mat_views.items()
             },
         }).encode()
 
@@ -270,6 +284,8 @@ class Catalog:
             "evts": {n: EventMeta(n, e.schedule_type, e.interval_seconds,
                                   e.at_time, e.sql, e.enabled, e.last_run)
                      for n, e in self.events.items()},
+            "mvws": {n: MatViewMeta(n, v.sql, v.last_refresh, v.row_count)
+                     for n, v in self.mat_views.items()},
             "lsn":  self.lsn,
         }
 
@@ -286,6 +302,7 @@ class Catalog:
         self.subscriptions.clear(); self.subscriptions.update(snap.get("subs", {}))
         self.policies.clear();      self.policies.update(snap.get("pols", {}))
         self.events.clear();        self.events.update(snap.get("evts", {}))
+        self.mat_views.clear();     self.mat_views.update(snap.get("mvws", {}))
         self.lsn = snap.get("lsn", self.lsn)
         # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
         self._t_snippets.clear()
@@ -402,6 +419,11 @@ class Catalog:
                          e.get("enabled", True), e.get("last_run", ""))
             for n, e in d_s.get("events", {}).items()
         }
+        mat_views = {
+            n: MatViewMeta(n, v["sql"], v.get("last_refresh", ""),
+                           v.get("row_count", -1))
+            for n, v in d_s.get("mat_views", {}).items()
+        }
 
         cat = cls(
             tables=tables,
@@ -416,6 +438,7 @@ class Catalog:
             subscriptions=subscriptions,
             policies=policies,
             events=events,
+            mat_views=mat_views,
             lsn=d_o.get("lsn", 0),
         )
         # Initialise snippet cache and mark stats clean so the first ops flush

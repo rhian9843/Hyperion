@@ -1927,6 +1927,36 @@ def _exec_show_events(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _exec_create_mat_view(stmt: dict, db: Database) -> str:
+    db.create_mat_view(stmt["name"], stmt["sql"],
+                       if_not_exists=stmt.get("if_not_exists", False))
+    return f"Materialized view '{stmt['name']}' created."
+
+
+def _exec_refresh_mat_view(stmt: dict, db: Database) -> str:
+    n = db.refresh_mat_view(stmt["name"])
+    return f"Materialized view '{stmt['name']}' refreshed ({n} rows)."
+
+
+def _exec_drop_mat_view(stmt: dict, db: Database) -> str:
+    db.drop_mat_view(stmt["name"], if_exists=stmt.get("if_exists", False))
+    return f"Materialized view '{stmt['name']}' dropped."
+
+
+def _exec_show_mat_views(stmt: dict, db: Database) -> RowResult:
+    rows = []
+    for name, mv in db._catalog.mat_views.items():
+        rows.append({
+            "name": name,
+            "definition": mv.sql,
+            "last_refresh": mv.last_refresh if mv.last_refresh else None,
+            "row_count": mv.row_count if mv.row_count >= 0 else None,
+        })
+    rows.sort(key=lambda r: r["name"])
+    cols = ["name", "definition", "last_refresh", "row_count"]
+    return RowResult(rows, cols)
+
+
 def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
     from .pager import Pager, MemoryPager
     pager = db._pager
@@ -1955,6 +1985,31 @@ def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
         }
     cols = list(row.keys())
     return RowResult([row], cols)
+
+
+def _exec_show_logical_log(stmt: dict, db: Database) -> RowResult:
+    import json as _json
+    from datetime import datetime as _dt
+    limit = stmt.get("limit", 100)
+    try:
+        all_entries = db.changelog._all_entries()
+    except Exception:
+        all_entries = []
+    entries = all_entries[-limit:] if limit > 0 else all_entries
+    rows = []
+    for e in entries:
+        ts_str = (_dt.fromtimestamp(e.ts).strftime("%Y-%m-%d %H:%M:%S")
+                  if e.ts else "")
+        rows.append({
+            "lsn":        e.lsn,
+            "timestamp":  ts_str,
+            "table":      e.table,
+            "op":         e.op,
+            "row":        _json.dumps(e.row, default=str) if e.row is not None else None,
+            "row_before": _json.dumps(e.row_before, default=str) if e.row_before is not None else None,
+        })
+    cols = ["lsn", "timestamp", "table", "op", "row", "row_before"]
+    return RowResult(rows, cols)
 
 
 # ── Row-Level Security handlers ───────────────────────────────────────────────
@@ -2021,6 +2076,11 @@ _DISPATCH: dict[str, Any] = {
     "ALTER_EVENT":                    _exec_alter_event,
     "SHOW_EVENTS":                    _exec_show_events,
     "SHOW_RECOVERY_STATUS":           _exec_show_recovery_status,
+    "SHOW_LOGICAL_LOG":               _exec_show_logical_log,
+    "CREATE_MAT_VIEW":                _exec_create_mat_view,
+    "REFRESH_MAT_VIEW":               _exec_refresh_mat_view,
+    "DROP_MAT_VIEW":                  _exec_drop_mat_view,
+    "SHOW_MAT_VIEWS":                 _exec_show_mat_views,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

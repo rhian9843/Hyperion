@@ -466,7 +466,7 @@
 
 - [x] `EXPLAIN ANALYZE` — runs the query and annotates the execution plan with actual row counts, loop iterations, and elapsed time per node; complements `EXPLAIN` (estimated plan) and `EXPLAIN QUERY PLAN` (textual plan) with real execution statistics
 - [x] `SHOW RECOVERY STATUS` — reports the current WAL state: last committed LSN, whether a recovery replay occurred on startup, WAL file size, and checkpoint timestamp; useful for diagnosing crash recovery
-- [ ] `SHOW MATERIALIZED VIEWS` — lists all materialized views with their name, defining query, last refresh timestamp, and row count; complements `SHOW TABLES` and `INFORMATION_SCHEMA`
+- [x] `SHOW MATERIALIZED VIEWS` — lists all materialized views with their name, defining query, last refresh timestamp, and row count; complements `SHOW TABLES` and `INFORMATION_SCHEMA`
 - [x] `SHOW LOGICAL LOG` — display the last N entries from the logical replication change log; shows table name, operation (INSERT/UPDATE/DELETE), and column values; useful for debugging replication lag
 
 ### Adaptive Query Optimizer
@@ -484,7 +484,7 @@
 ### DDL — Advanced Schema
 
 - [ ] Schemas / namespaces — `CREATE SCHEMA s`, `DROP SCHEMA s`, `USE s`; tables qualified as `schema.table`; default schema is `public`; required for multi-tenant isolation at the schema level
-- [ ] Materialized views — `CREATE MATERIALIZED VIEW name AS SELECT ...`; result is physically stored and queryable like a table; `REFRESH MATERIALIZED VIEW name` re-executes the query and replaces stored rows; `DROP MATERIALIZED VIEW`
+- [x] Materialized views — `CREATE MATERIALIZED VIEW name AS SELECT ...`; result is physically stored and queryable like a table; `REFRESH MATERIALIZED VIEW name` re-executes the query and replaces stored rows; `DROP MATERIALIZED VIEW`
 - [ ] Stored procedures — `CREATE PROCEDURE name(params) BEGIN ... END`; `CALL name(args)`; `DROP PROCEDURE`; body supports local variables, `IF/ELSE`, `LOOP/LEAVE`, and `CURSOR` declarations for row-by-row processing; `SHOW PROCEDURES`
 - [ ] Named prepared statements — SQL-level `PREPARE stmt FROM 'SELECT ... WHERE id = ?'`; `EXECUTE stmt USING val`; `DEALLOCATE PREPARE stmt`; complements the existing Python-level `?` binding with a session-scoped statement handle
 - [ ] Table partitioning — `CREATE TABLE t (...) PARTITION BY RANGE|LIST|HASH (col)`; rows routed to the correct partition on insert; queries with matching predicates scan only relevant partitions; `SHOW PARTITIONS`; `DROP PARTITION`

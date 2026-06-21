@@ -14,7 +14,7 @@ from .constants import (PAGE_SIZE, PAGE_CKSUM_SZ, ROW_CELL_SIZE, ROW_INLINE_CAP,
                         PAGE_OVERFLOW, OVERFLOW_HDR, OVERFLOW_DATA_SZ)
 from .errors import (NoSuchTableError, SchemaError, TransactionError)
 from .btree import BTree
-from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta, PolicyMeta, EventMeta
+from .catalog import Catalog, TableMeta, IndexMeta, PublicationMeta, SubscriptionMeta, PolicyMeta, EventMeta, MatViewMeta
 from .pager import Pager, MemoryPager
 from .encoding import _idx_key_sz
 from .constraints import ConstraintsMixin
@@ -987,6 +987,68 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                     return
                 raise NoSuchTableError(f"No such view: '{name}'")
             del self._catalog.views[name]
+
+    # ── Materialized views ────────────────────────────────────────────────────
+
+    def create_mat_view(self, name: str, sql: str,
+                        if_not_exists: bool = False) -> None:
+        with self._lock.write():
+            if name in self._catalog.mat_views:
+                if if_not_exists:
+                    return
+                raise SchemaError(f"Materialized view '{name}' already exists")
+            if name in self._catalog.tables:
+                raise SchemaError(f"Table '{name}' already exists")
+            self._catalog.mat_views[name] = MatViewMeta(
+                name=name, sql=sql, last_refresh="", row_count=-1
+            )
+
+    def refresh_mat_view(self, name: str) -> int:
+        """Re-execute the defining query and store results. Returns row count."""
+        from datetime import datetime as _dt
+        from .parser import _parse_tokens, _tokenize
+        from .executor import _execute_inner, RowResult
+
+        # Phase 1: read mv metadata and execute SELECT (reentrant write lock)
+        with self._lock.write():
+            if name not in self._catalog.mat_views:
+                raise NoSuchTableError(f"No such materialized view: '{name}'")
+            mv = self._catalog.mat_views[name]
+            sql = mv.sql
+
+        # Execute SELECT outside the write lock so nested reads work cleanly
+        ast = _parse_tokens(_tokenize(sql))
+        result = _execute_inner(ast, self)
+        rows = result.rows if isinstance(result, RowResult) else []
+        cols = result.columns if isinstance(result, RowResult) else []
+
+        # Phase 2: rebuild backing table under write lock
+        with self._lock.write():
+            if name not in self._catalog.mat_views:
+                raise NoSuchTableError(f"Materialized view '{name}' was dropped during refresh")
+            mv = self._catalog.mat_views[name]
+            if name in self._catalog.tables:
+                self.drop_table(name)
+            if cols:
+                from .schema import Schema, Column
+                col_objs = [Column(c, "TEXT", 255) for c in cols]
+                self.create_table(Schema(name, col_objs))
+                for row in rows:
+                    self.insert(name, {c: row.get(c) for c in cols})
+            mv.last_refresh = _dt.now().strftime("%Y-%m-%d %H:%M:%S")
+            mv.row_count = len(rows)
+            return mv.row_count
+
+    def drop_mat_view(self, name: str, if_exists: bool = False) -> None:
+        with self._lock.write():
+            if name not in self._catalog.mat_views:
+                if if_exists:
+                    return
+                raise NoSuchTableError(f"No such materialized view: '{name}'")
+            # Drop the backing table if it was materialized
+            if name in self._catalog.tables:
+                self.drop_table(name)
+            del self._catalog.mat_views[name]
 
     # ── Logical replication ───────────────────────────────────────────────────
 
