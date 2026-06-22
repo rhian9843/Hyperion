@@ -2270,6 +2270,18 @@ def _parse_tokens(t: list[str]) -> dict:
             if val not in ("ON", "OFF"):
                 raise ParseError("Expected ON or OFF after SET CACHE")
             return {"op": "SET_CACHE", "enabled": val == "ON"}
+        # SET MAX_PARALLEL_WORKERS n
+        if (len(t) >= 3 and t[1].upper() == "MAX_PARALLEL_WORKERS"):
+            try:
+                return {"op": "SET_PARALLEL_WORKERS", "n": int(t[2])}
+            except ValueError:
+                raise ParseError("Expected integer after SET MAX_PARALLEL_WORKERS")
+        # SET PARALLEL_THRESHOLD n
+        if (len(t) >= 3 and t[1].upper() == "PARALLEL_THRESHOLD"):
+            try:
+                return {"op": "SET_PARALLEL_THRESHOLD", "n": int(t[2])}
+            except ValueError:
+                raise ParseError("Expected integer after SET PARALLEL_THRESHOLD")
         # SET TRANSACTION ISOLATION LEVEL <level>
         # SET SESSION TRANSACTION ISOLATION LEVEL <level>  (MySQL compat)
         i = 1
@@ -2346,6 +2358,10 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "CACHE"
                 and t[2].upper() == "STATUS"):
             return {"op": "SHOW_CACHE_STATUS"}
+        # SHOW PARALLEL STATUS
+        if (len(t) > 2 and t[1].upper() == "PARALLEL"
+                and t[2].upper() == "STATUS"):
+            return {"op": "SHOW_PARALLEL_STATUS"}
         # SHOW PROFILE FOR QUERY n
         if (len(t) > 4 and t[1].upper() == "PROFILE"
                 and t[2].upper() == "FOR" and t[3].upper() == "QUERY"):

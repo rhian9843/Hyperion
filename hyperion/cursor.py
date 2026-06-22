@@ -277,20 +277,27 @@ class Cursor:
         # the check-then-act sequence is atomic and LRU ordering is maintained
         # correctly under concurrent access.
         from .parser import parse
+        from .parallel_executor import extract_parallel_hint
+
+        # Strip /*+ PARALLEL(N) */ hint before parsing so the plan cache key
+        # remains stable regardless of the hint value.
+        clean_sql, _par_hint = extract_parallel_hint(sql)
 
         cache = self._db._plan_cache
         with self._db._plan_cache_lock:
-            if sql not in cache:
-                cache[sql] = parse(sql)
+            if clean_sql not in cache:
+                cache[clean_sql] = parse(clean_sql)
                 if len(cache) > 512:
                     cache.popitem(last=False)  # evict least-recently-used
             else:
-                cache.move_to_end(sql)         # promote to most-recently-used
-            stmt_ast = cache[sql]
+                cache.move_to_end(clean_sql)   # promote to most-recently-used
+            stmt_ast = cache[clean_sql]
         stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
         extras: dict = {"_raw_sql": sql}
         if params is not None:
             extras["_params"] = params
+        if _par_hint is not None:
+            extras["_parallel_workers"] = _par_hint
         stmt = dict(stmt, **extras)
         op   = stmt.get("op", "")
 

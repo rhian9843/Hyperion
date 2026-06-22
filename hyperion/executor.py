@@ -516,16 +516,40 @@ def _normalize_row(row: dict) -> dict:
     return result
 
 
+def _parallel_where_filter(rows: list[dict], where: Any,
+                           db: "Database",
+                           workers: int | None = None) -> list[dict]:
+    """Apply WHERE predicate, using parallel threads for large row sets."""
+    if not rows or where is None:
+        return rows
+    par = db._parallel
+    w   = workers if workers is not None else par.max_workers
+    if w > 1 and len(rows) >= par.threshold:
+        from .parallel_executor import parallel_filter
+        return parallel_filter(rows, where, db, w)
+    return [r for r in rows if where.evaluate(r, db)]
+
+
 def _apply_groupby_agg(rows: list[dict], columns: list[str] | None,
                        group_by: list[str] | None,
                        having: Any,
-                       db: "Database") -> list[dict]:
+                       db: "Database",
+                       parallel_workers: int | None = None) -> list[dict]:
     """Apply GROUP BY + aggregation to an already-materialized row list."""
     # Normalize rows so aggregation sees both qualified and bare keys
     rows = [_normalize_row(r) for r in rows]
     select_cols = columns or (group_by or [])
 
     if not group_by:
+        # Attempt parallel aggregate for simple COUNT/SUM/AVG/MIN/MAX queries
+        _par = db._parallel
+        _workers = parallel_workers if parallel_workers is not None else _par.max_workers
+        if (select_cols and len(rows) >= _par.threshold
+                and _workers > 1):
+            from .parallel_executor import parallel_compute_simple_aggs
+            par_result = parallel_compute_simple_aggs(rows, select_cols, _workers)
+            if par_result is not None:
+                return [par_result]
         result: dict = db._compute_aggregates(rows, select_cols)
         return [result]
 
@@ -949,12 +973,13 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
                             for c in stmt_cols if c != "*")
         has_scalar_sq = any(_is_scalar_subquery_col(c) for c in stmt_cols)
         tbl = s.get("table") or ""
+        _par_workers = stmt.get("_parallel_workers")
         if s.get("subquery_from"):
             if s.get("group_by") or any(_q_parse_agg(c) for c in stmt_cols if c != "*"):
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
                 raw_rows = _exec_derived_table(raw_stmt, db, ctes)
                 rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
-                                          s.get("having"), db)
+                                          s.get("having"), db, _par_workers)
                 rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
             else:
                 rows = _exec_derived_table(s, db, ctes)
@@ -969,7 +994,7 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
                 raw_rows = _exec_cte_select(raw_stmt, ctes[tbl], db, ctes)
                 rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
-                                          s.get("having"), db)
+                                          s.get("having"), db, _par_workers)
                 rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
             else:
                 rows = _exec_cte_select(s, ctes[tbl], db, ctes)
@@ -979,7 +1004,7 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
                 raw_stmt = {**s, "columns": None, "order_by": [], "limit": None, "offset": None}
                 raw_rows = _exec_cte_select(raw_stmt, view_ast, db, ctes)
                 rows = _apply_groupby_agg(raw_rows, s.get("columns"), s.get("group_by"),
-                                          s.get("having"), db)
+                                          s.get("having"), db, _par_workers)
                 rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
             else:
                 rows = _exec_cte_select(s, view_ast, db, ctes)
@@ -1036,7 +1061,8 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
                 raw_rows = _exec_extra_join(raw_rows, ej, db, ctes)
             if has_agg:
                 raw_rows = _apply_groupby_agg(raw_rows, s.get("columns"),
-                                              group_by, s.get("having"), db)
+                                              group_by, s.get("having"), db,
+                                              stmt.get("_parallel_workers"))
             elif has_window_j:
                 nw_j = stmt.get("named_windows") or {}
                 raw_rows = [_normalize_row(r) for r in raw_rows]
@@ -1059,7 +1085,8 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
             for ej in extra:
                 rows = _exec_extra_join(rows, ej, db, ctes)
             if s.get("where"):
-                rows = [r for r in rows if s["where"].evaluate(r, db)]
+                rows = _parallel_where_filter(rows, s["where"], db,
+                                              stmt.get("_parallel_workers"))
             if s.get("columns"):
                 rows = [_project_row(r, s["columns"]) for r in rows]
             rows = _apply_order_limit(rows, s.get("order_by"), s.get("limit"), s.get("offset"))
@@ -2215,6 +2242,30 @@ def _exec_show_profile(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, ["status", "duration_ms"])
 
 
+def _exec_set_parallel_workers(stmt: dict, db: Database) -> str:
+    import os
+    n = max(1, min(stmt["n"], os.cpu_count() or 1))
+    db._parallel.max_workers = n
+    return f"Max parallel workers set to {n}."
+
+
+def _exec_set_parallel_threshold(stmt: dict, db: Database) -> str:
+    n = max(1, stmt["n"])
+    db._parallel.threshold = n
+    return f"Parallel threshold set to {n} rows."
+
+
+def _exec_show_parallel_status(stmt: dict, db: Database) -> RowResult:
+    import os
+    par = db._parallel
+    rows = [
+        {"setting": "max_workers",    "value": str(par.max_workers)},
+        {"setting": "threshold",       "value": str(par.threshold)},
+        {"setting": "cpu_count",       "value": str(os.cpu_count() or 1)},
+    ]
+    return RowResult(rows, ["setting", "value"])
+
+
 def _exec_set_cache(stmt: dict, db: Database) -> str:
     if stmt["enabled"]:
         db._query_cache.enable()
@@ -2362,6 +2413,9 @@ _DISPATCH: dict[str, Any] = {
     "SHOW_PROFILE":                   _exec_show_profile,
     "SET_CACHE":                      _exec_set_cache,
     "SHOW_CACHE_STATUS":              _exec_show_cache_status,
+    "SET_PARALLEL_WORKERS":           _exec_set_parallel_workers,
+    "SET_PARALLEL_THRESHOLD":         _exec_set_parallel_threshold,
+    "SHOW_PARALLEL_STATUS":           _exec_show_parallel_status,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,
