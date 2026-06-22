@@ -1320,6 +1320,7 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
                 "min_val":    min_vals.get(c),
                 "max_val":    max_vals.get(c),
                 "mcv":        [[v, cnt] for v, cnt in top10],
+                "histogram":  _build_equidepth_histogram(value_counts[c]),
             }
 
         db._catalog.stats[tname] = {
@@ -1340,6 +1341,47 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
 
 
 _ANALYZE_NULL_SENTINEL = object()
+
+
+def _build_equidepth_histogram(vc: Counter, n_buckets: int = 10) -> list:
+    """Build an equi-depth histogram from a value Counter.
+
+    Returns a list of [lo, hi, freq] triples (at most n_buckets entries).
+    Each bucket covers a contiguous range of distinct values with
+    approximately equal total row counts.  Returns [] when fewer than 2
+    distinct sortable values exist.
+    """
+    if not vc:
+        return []
+    try:
+        sorted_entries: list[tuple] = sorted(vc.items())
+    except TypeError:
+        return []  # mixed incomparable types — skip
+
+    if len(sorted_entries) == 1:
+        v, cnt = sorted_entries[0]
+        return [[v, v, cnt]]
+
+    total = sum(cnt for _, cnt in sorted_entries)
+    target = total / n_buckets
+
+    buckets: list = []
+    bucket_lo = None
+    bucket_hi = None
+    bucket_freq = 0
+
+    for i, (val, cnt) in enumerate(sorted_entries):
+        if bucket_lo is None:
+            bucket_lo = val
+        bucket_hi = val
+        bucket_freq += cnt
+        last = (i == len(sorted_entries) - 1)
+        if (bucket_freq >= target and len(buckets) < n_buckets - 1) or last:
+            buckets.append([bucket_lo, bucket_hi, bucket_freq])
+            bucket_lo = None
+            bucket_freq = 0
+
+    return buckets
 
 
 def execute(stmt: dict, db: Database) -> str:

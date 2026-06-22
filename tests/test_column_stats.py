@@ -165,24 +165,25 @@ class TestEstimateSelectivity:
 
     def test_gt_interpolation(self, tmp_path):
         db = self._db_with_data(tmp_path)
-        # val > 8 → (10 - 8) / (10 - 1) ≈ 0.22
+        # val > 8 → 2 out of 10 rows (9, 10); boundary bucket [8,8] excluded by strict >
         sel = estimate_selectivity(db, "t", "val", ">", 8)
         assert 0.15 < sel < 0.30
         db.close()
 
-    def test_lte_interpolation(self, tmp_path):
+    def test_lte_ge_than_lt(self, tmp_path):
         db = self._db_with_data(tmp_path)
         sel_lt  = estimate_selectivity(db, "t", "val", "<",  5.0)
         sel_lte = estimate_selectivity(db, "t", "val", "<=", 5.0)
-        # <= should return same fraction as < for continuous interpolation
-        assert abs(sel_lt - sel_lte) < 0.01
+        # <= must be at least as large as < (includes the boundary value)
+        assert sel_lte >= sel_lt
         db.close()
 
-    def test_gte_interpolation(self, tmp_path):
+    def test_gte_ge_than_gt(self, tmp_path):
         db = self._db_with_data(tmp_path)
         sel_gt  = estimate_selectivity(db, "t", "val", ">",  5.0)
         sel_gte = estimate_selectivity(db, "t", "val", ">=", 5.0)
-        assert abs(sel_gt - sel_gte) < 0.01
+        # >= must be at least as large as > (includes the boundary value)
+        assert sel_gte >= sel_gt
         db.close()
 
     def test_no_stats_returns_default(self, tmp_path):

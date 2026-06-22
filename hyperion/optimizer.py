@@ -72,7 +72,7 @@ def get_ndv(db, table: str, col: str) -> int | None:
 
 
 def _col_stats(db, table: str, col: str) -> dict:
-    """Return the per-column stats dict from catalog (ndv, null_count, min_val, max_val, mcv)."""
+    """Return the per-column stats dict from catalog (ndv, null_count, min_val, max_val, mcv, histogram)."""
     col = col.split(".")[-1]
     return (getattr(db._catalog, "stats", {})
             .get(table, {})
@@ -80,11 +80,68 @@ def _col_stats(db, table: str, col: str) -> dict:
             .get(col, {}))
 
 
+# ── Histogram-based selectivity ───────────────────────────────────────────────
+
+def _histogram_range_sel(histogram: list, op: str, val) -> float:
+    """Estimate selectivity for a single-sided range using an equi-depth histogram.
+
+    histogram: list of [lo, hi, freq] triples from ANALYZE.
+    Returns a fraction in [0.0, 1.0], or -1.0 if the histogram cannot be used.
+
+    Boundary semantics:
+      <  : strict — bucket [v, v] contributes nothing
+      <= : inclusive — bucket [v, v] contributes fully
+      >  : strict — bucket [v, v] contributes nothing
+      >= : inclusive — bucket [v, v] contributes fully
+    """
+    try:
+        v = float(val)
+    except (TypeError, ValueError):
+        return -1.0
+
+    total = sum(freq for _, _, freq in histogram)
+    if not total:
+        return -1.0
+
+    covered = 0.0
+    for (blo, bhi, freq) in histogram:
+        try:
+            lo_f = float(blo)
+            hi_f = float(bhi)
+        except (TypeError, ValueError):
+            return -1.0
+
+        span = hi_f - lo_f
+
+        if op == "<":
+            if hi_f < v:
+                covered += freq                              # bucket entirely below v
+            elif lo_f < v:                                   # partial: [lo, v)
+                covered += freq * (v - lo_f) / span if span > 0 else 0.0
+        elif op == "<=":
+            if hi_f <= v:
+                covered += freq                              # bucket at or below v
+            elif lo_f <= v:                                  # partial: [lo, v]
+                covered += freq * (v - lo_f) / span if span > 0 else freq
+        elif op == ">":
+            if lo_f > v:
+                covered += freq                              # bucket entirely above v
+            elif hi_f > v:                                   # partial: (v, hi]
+                covered += freq * (hi_f - v) / span if span > 0 else 0.0
+        elif op == ">=":
+            if lo_f >= v:
+                covered += freq                              # bucket at or above v
+            elif hi_f >= v:                                  # partial: [v, hi]
+                covered += freq * (hi_f - v) / span if span > 0 else freq
+
+    return covered / total
+
+
 def estimate_selectivity(db, table: str, col: str, op: str, val) -> float:
     """Estimate fraction of rows in table satisfying col OP val in [0.0, 1.0].
 
-    For equality: checks MCVs first, falls back to 1/ndv.
-    For range ops: linear interpolation between min_val and max_val.
+    Priority for equality:   MCVs → 1/ndv.
+    Priority for range ops:  equi-depth histogram → min/max linear interpolation.
     Returns 0.33 when no stats are available.
     """
     stats = _col_stats(db, table, col)
@@ -102,39 +159,107 @@ def estimate_selectivity(db, table: str, col: str, op: str, val) -> float:
                 return mcv_count / row_count
         return 1.0 / ndv
 
+    if op in ("<", "<=", ">", ">="):
+        histogram = stats.get("histogram", [])
+        if histogram:
+            sel = _histogram_range_sel(histogram, op, val)
+            if sel >= 0.0:
+                return max(0.0, min(1.0, sel))
+        # Fallback: linear interpolation using min/max
+        min_v = stats.get("min_val")
+        max_v = stats.get("max_val")
+        if min_v is None or max_v is None:
+            return 0.33
+        try:
+            v  = float(val)
+            lo = float(min_v)
+            hi = float(max_v)
+        except (TypeError, ValueError):
+            return 0.33
+        if hi == lo:
+            return 0.0 if op in ("<", ">") else 1.0
+        span = hi - lo
+        if op in (">", ">="):
+            return max(0.0, min(1.0, (hi - v) / span))
+        return max(0.0, min(1.0, (v - lo) / span))
+
+    return 0.33
+
+
+def estimate_range_selectivity(db, table: str, col: str, low, high) -> float:
+    """Estimate fraction of rows satisfying low <= col <= high (BETWEEN).
+
+    Uses equi-depth histogram when available; falls back to min/max linear
+    interpolation.  Returns 0.33 when no stats exist.
+    """
+    stats = _col_stats(db, table, col)
+    if not stats:
+        return 0.33
+
+    histogram = stats.get("histogram", [])
+    if histogram:
+        try:
+            lo_f = float(low)
+            hi_f = float(high)
+        except (TypeError, ValueError):
+            return 0.33
+        if lo_f > hi_f:
+            return 0.0
+
+        total = sum(freq for _, _, freq in histogram)
+        if not total:
+            return 0.33
+
+        covered = 0.0
+        for (blo, bhi, freq) in histogram:
+            try:
+                blo_f = float(blo)
+                bhi_f = float(bhi)
+            except (TypeError, ValueError):
+                return 0.33
+            if bhi_f < lo_f or blo_f > hi_f:
+                continue  # no overlap
+            overlap_lo = max(blo_f, lo_f)
+            overlap_hi = min(bhi_f, hi_f)
+            span = bhi_f - blo_f
+            frac = (overlap_hi - overlap_lo) / span if span > 0 else 1.0
+            covered += freq * max(0.0, frac)
+
+        return max(0.0, min(1.0, covered / total))
+
+    # Fallback: linear min/max interpolation
     min_v = stats.get("min_val")
     max_v = stats.get("max_val")
     if min_v is None or max_v is None:
         return 0.33
-
     try:
-        v  = float(val)
-        lo = float(min_v)
-        hi = float(max_v)
+        lo_f  = float(low)
+        hi_f  = float(high)
+        min_f = float(min_v)
+        max_f = float(max_v)
     except (TypeError, ValueError):
         return 0.33
-
-    if hi == lo:
-        return 0.0 if op in ("<", ">") else 1.0
-
-    span = hi - lo
-    if op in (">", ">="):
-        return max(0.0, min(1.0, (hi - v) / span))
-    if op in ("<", "<="):
-        return max(0.0, min(1.0, (v - lo) / span))
-    return 0.33
+    span = max_f - min_f
+    if span == 0:
+        return 1.0 if min_f == lo_f else 0.0
+    return max(0.0, min(1.0, (hi_f - lo_f) / span))
 
 
 def estimate_row_count_with_where(db, table: str,
                                   conditions: list[tuple]) -> int:
     """Estimate rows satisfying all conditions via multiplicative selectivity.
 
-    conditions: list of (col, op, val) tuples.
+    conditions: list of (col, op, val) tuples or (col, 'BETWEEN', (lo, hi)) tuples.
     """
     row_count = estimate_rows(db, table)
     sel = 1.0
-    for col, op, val in conditions:
-        sel *= estimate_selectivity(db, table, col, op, val)
+    for item in conditions:
+        col, op, val = item
+        if op == "BETWEEN":
+            lo, hi = val
+            sel *= estimate_range_selectivity(db, table, col, lo, hi)
+        else:
+            sel *= estimate_selectivity(db, table, col, op, val)
     return max(1, int(row_count * sel))
 
 
