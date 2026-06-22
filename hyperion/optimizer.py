@@ -350,6 +350,151 @@ def _output_estimate(db, left_count: int, right_table: str,
     return max(1, int(math.sqrt(left_count * right_count)))
 
 
+# ── DP Join Order Planner ─────────────────────────────────────────────────────
+# Cost constants (aligned with MilanSQL dp_planner.hpp)
+_DP_SEQ_PAGE  = 1.0   # cost per page in a sequential scan
+_DP_HASH_BUILD = 1.5  # cost per row to build a hash table
+_DP_HASH_PROBE = 1.0  # cost per row to probe a hash table
+_DP_CPU        = 0.01 # per-row CPU overhead
+
+# Fall back to greedy above this table count (2^n subsets would be infeasible)
+_DP_MAX_N = 12
+
+# Session-scoped plan cache: tuple(sorted table names) → name list in optimal order
+_dp_plan_cache: dict[tuple, list[str]] = {}
+_dp_stats: dict[str, int] = {
+    "queries_planned":   0,
+    "plan_cache_hits":   0,
+    "plan_cache_misses": 0,
+    "subsets_evaluated": 0,
+}
+
+
+def get_dp_stats() -> dict:
+    """Return a copy of the global DP planner statistics."""
+    return dict(_dp_stats)
+
+
+def invalidate_dp_cache(table_name: str) -> None:
+    """Remove all plan cache entries that reference table_name."""
+    to_remove = [k for k in _dp_plan_cache if table_name in k]
+    for k in to_remove:
+        del _dp_plan_cache[k]
+
+
+def _dp_join_cost(left_rows: int, right_rows: int, has_index: bool) -> float:
+    if has_index:
+        # INLJ: probe index once per left row
+        return left_rows * (math.log2(max(right_rows, 2)) * _DP_SEQ_PAGE + _DP_CPU)
+    # Hash join: build right-side hash table then probe with left rows
+    return (right_rows * _DP_HASH_BUILD
+            + left_rows * _DP_HASH_PROBE
+            + left_rows * right_rows * _DP_CPU)
+
+
+def _dp_plan_inner(
+    tables: list[tuple[str, str | None]],
+    adj: dict[tuple[int, int], tuple[str, str]],
+    db,
+) -> list[int] | None:
+    """Bitmask DP over all 2^n subsets to find the globally optimal join order.
+
+    tables : (name, alias) pairs
+    adj    : {(from_idx, to_idx): (on_left_qualified, on_right_bare)} — symmetric
+    Returns a list of table indices in optimal join order, or None if infeasible.
+    """
+    n = len(tables)
+    if n > _DP_MAX_N:
+        return None  # too many tables — caller falls back to greedy
+
+    _dp_stats["subsets_evaluated"] += (1 << n) - 1
+
+    INF = float("inf")
+    dp_cost = [INF] * (1 << n)
+    dp_rows = [1]   * (1 << n)
+    best_j  = [-1]  * (1 << n)  # best_j[mask] = index of last table joined to reach mask
+
+    # Base: single-table sequential scan
+    for i in range(n):
+        mask = 1 << i
+        r = estimate_rows(db, tables[i][0])
+        dp_cost[mask] = r * _DP_SEQ_PAGE
+        dp_rows[mask] = r
+
+    # Fill by increasing subset size
+    for size in range(2, n + 1):
+        for mask in range(1, 1 << n):
+            if bin(mask).count("1") != size:
+                continue
+            for j in range(n):
+                if not (mask >> j & 1):
+                    continue
+                left_mask = mask ^ (1 << j)
+                if dp_cost[left_mask] == INF:
+                    continue
+                # Find any edge from a left-mask table to j
+                join_col: str | None = None
+                for fi in range(n):
+                    if (left_mask >> fi & 1) and (fi, j) in adj:
+                        join_col = adj[(fi, j)][1]  # bare right-side column
+                        break
+                right_rows = estimate_rows(db, tables[j][0])
+                has_idx = bool(join_col and find_eq_index(db, tables[j][0], join_col))
+                step_c = _dp_join_cost(dp_rows[left_mask], right_rows, has_idx)
+                total_c = dp_cost[left_mask] + step_c
+                if total_c < dp_cost[mask]:
+                    dp_cost[mask] = total_c
+                    best_j[mask]  = j
+                    dp_rows[mask] = _output_estimate(
+                        db, dp_rows[left_mask], tables[j][0], join_col
+                    )
+
+    # Reconstruct ordering via backtracking
+    full = (1 << n) - 1
+    if dp_cost[full] == INF:
+        return None
+
+    ordering: list[int] = []
+    mask = full
+    while mask:
+        if bin(mask).count("1") == 1:
+            # Reached the starting (base) table
+            start = next(i for i in range(n) if mask >> i & 1)
+            ordering.append(start)
+            break
+        j = best_j[mask]
+        if j < 0:
+            return None
+        ordering.append(j)
+        mask ^= (1 << j)
+    ordering.reverse()
+    return ordering
+
+
+def _find_plan_conds(
+    tables:   list[tuple[str, str | None]],
+    adj:      dict[tuple[int, int], tuple[str, str]],
+    ordering: list[int],
+) -> list[tuple[str | None, str | None]]:
+    """Given an ordering, return the join condition for each step.
+
+    Returns [(None, None), (on_left, on_right), ...] aligned with ordering.
+    """
+    conds: list[tuple[str | None, str | None]] = [(None, None)]
+    placed = {ordering[0]}
+    for k in range(1, len(ordering)):
+        j = ordering[k]
+        ol: str | None = None
+        or_: str | None = None
+        for fi in placed:
+            if (fi, j) in adj:
+                ol, or_ = adj[(fi, j)]
+                break
+        conds.append((ol, or_))
+        placed.add(j)
+    return conds
+
+
 # ── Join order optimiser ──────────────────────────────────────────────────────
 
 def _talias(name: str, alias: str | None) -> str:
@@ -540,60 +685,39 @@ def optimize_join(stmt: dict, db) -> dict:
         rev_on_right = (on_left or "").split(".")[-1]
         edges.append((right_idx, left_idx, rev_on_left, rev_on_right))
 
-    # Greedy planner: try every possible starting table, keep cheapest complete plan
-    best_order:  list[int]                       | None = None
-    best_conds:  list[tuple[str | None, str | None]] | None = None
-    best_cost = float("inf")
+    # Build adjacency dict for DP planner: {(from_idx, to_idx): (on_left, on_right_bare)}
+    adj: dict[tuple[int, int], tuple[str, str]] = {
+        (fi, ti): (ol, or_) for fi, ti, ol, or_ in edges
+    }
 
-    for start in range(n):
-        placed     = {start}
-        ordering   = [start]
-        plan_conds: list[tuple[str | None, str | None]] = [(None, None)]
-        accum      = {_talias(*tables[start])}
-        left_count = estimate_rows(db, tables[start][0])
-        total_cost = 0.0
-        ok         = True
+    # ── DP planner with plan cache ────────────────────────────────────────────
+    _dp_stats["queries_planned"] += 1
+    cache_key = tuple(sorted(t[0] for t in tables))
 
-        for _ in range(n - 1):
-            candidates: list[tuple[float, int, str, str]] = []
-            for a_idx, b_idx, ol, or_ in edges:
-                if a_idx not in placed or b_idx in placed:
-                    continue
-                la = _left_alias_of(ol)
-                if la and la not in accum:
-                    continue
-                cost = _step_cost(db, left_count, tables[b_idx][0], or_)
-                candidates.append((cost, b_idx, ol, or_))
+    best_order: list[int] | None = None
 
-            if not candidates:
-                ok = False
-                break
+    if cache_key in _dp_plan_cache:
+        _dp_stats["plan_cache_hits"] += 1
+        name_order = _dp_plan_cache[cache_key]
+        name_to_idx = {t[0]: i for i, t in enumerate(tables)}
+        cached = [name_to_idx[nm] for nm in name_order if nm in name_to_idx]
+        if len(cached) == n:
+            best_order = cached
+    else:
+        _dp_stats["plan_cache_misses"] += 1
+        best_order = _dp_plan_inner(tables, adj, db)
+        if best_order is not None:
+            _dp_plan_cache[cache_key] = [tables[i][0] for i in best_order]
 
-            candidates.sort(key=lambda x: x[0])
-            step_cost, nxt, ol, or_ = candidates[0]
-            total_cost += step_cost
-            placed.add(nxt)
-            ordering.append(nxt)
-            plan_conds.append((ol, or_))
-            accum.add(_talias(*tables[nxt]))
-            # Use NDV-aware output estimate for accurate intermediate row counts
-            left_count = _output_estimate(db, left_count, tables[nxt][0], or_ or None)
-
-        if not ok:
-            continue
-        if total_cost < best_cost:
-            best_cost  = total_cost
-            best_order = list(ordering)
-            best_conds = list(plan_conds)
-
-    # If the greedy result is the original order, no change needed
     if best_order is None or best_order == list(range(n)):
         return stmt
+
+    best_conds = _find_plan_conds(tables, adj, best_order)
 
     # Reconstruct stmt with reordered tables
     first_idx  = best_order[0]
     second_idx = best_order[1]
-    ol1, or1   = best_conds[1]  # type: ignore[index]
+    ol1, or1   = best_conds[1]
 
     new_stmt = dict(stmt)
     new_stmt["left_table"]  = tables[first_idx][0]
@@ -605,8 +729,8 @@ def optimize_join(stmt: dict, db) -> dict:
 
     new_extra: list[dict] = []
     for k in range(2, n):
-        tidx   = best_order[k]
-        ol_k, or_k = best_conds[k]  # type: ignore[index]
+        tidx       = best_order[k]
+        ol_k, or_k = best_conds[k]
         new_extra.append({
             "right_table": tables[tidx][0],
             "right_alias": tables[tidx][1],

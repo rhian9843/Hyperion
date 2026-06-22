@@ -2362,6 +2362,10 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "PARALLEL"
                 and t[2].upper() == "STATUS"):
             return {"op": "SHOW_PARALLEL_STATUS"}
+        # SHOW DP STATS
+        if (len(t) > 2 and t[1].upper() == "DP"
+                and t[2].upper() == "STATS"):
+            return {"op": "SHOW_DP_STATS"}
         # SHOW PROFILE FOR QUERY n
         if (len(t) > 4 and t[1].upper() == "PROFILE"
                 and t[2].upper() == "FOR" and t[3].upper() == "QUERY"):

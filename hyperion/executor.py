@@ -116,7 +116,9 @@ from .introspect import (hyperion_master_rows as _hyperion_master_rows,
                          integrity_check as _integrity_check,
                          explain_plan as _explain_plan)
 from .optimizer import (find_eq_index as _find_eq_index, probe_index as _probe_index,
-                        optimize_join, invalidate_row_count as _invalidate_rc)
+                        optimize_join, invalidate_row_count as _invalidate_rc,
+                        get_dp_stats as _get_dp_stats,
+                        invalidate_dp_cache as _invalidate_dp)
 from .parser import _parse_tokens, _tokenize
 from .schema import deserialize_row, serialize_row
 from .constants import INTEGER, REAL, TEXT, DEFAULT_TEXT_SIZE
@@ -1639,7 +1641,7 @@ def _exec_create_table_as_select(stmt: dict, db: Database) -> str:
     for row in rows:
         db.insert(stmt["name"], row)
     n = len(rows)
-    _invalidate_rc(db, stmt["name"])
+    _invalidate_rc(db, stmt["name"]); _invalidate_dp(stmt["name"])
     return f"Table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
 
 
@@ -1702,7 +1704,7 @@ def _exec_create_column_table(stmt: dict, db: Database) -> str:
         for row in rows:
             db.insert(stmt["name"], row)
         n = len(rows)
-        _invalidate_rc(db, stmt["name"])
+        _invalidate_rc(db, stmt["name"]); _invalidate_dp(stmt["name"])
         return f"Column table '{stmt['name']}' created with {n} row{'s' if n != 1 else ''}."
 
     pk_cols = stmt.get("primary_key_columns") or []
@@ -1749,7 +1751,7 @@ def _exec_drop_table(stmt: dict, db: Database) -> str:
     if stmt.get("if_exists") and stmt["name"] not in db.tables:
         return f"Table '{stmt['name']}' does not exist."
     db.drop_table(stmt["name"])
-    _invalidate_rc(db, stmt["name"])
+    _invalidate_rc(db, stmt["name"]); _invalidate_dp(stmt["name"])
     return f"Table '{stmt['name']}' dropped."
 
 
@@ -1909,7 +1911,7 @@ def _exec_insert(stmt: dict, db: Database) -> str:
             if returning_cols:
                 returned_rows.append(row_out)
     n = len(stmt["rows"])
-    _invalidate_rc(db, stmt["table"])
+    _invalidate_rc(db, stmt["table"]); _invalidate_dp(stmt["table"])
     if returning_cols:
         projected = [{c: r.get(c) for c in returning_cols} for r in returned_rows]
         return RowResult(projected, returning_cols, rowcount=n)
@@ -1944,7 +1946,7 @@ def _exec_insert_select(stmt: dict, db: Database) -> str:
         if _has_ins_trig:
             fire_triggers(db, stmt["table"], "AFTER", "INSERT", row_out, None)
     n = len(src_rows)
-    _invalidate_rc(db, stmt["table"])
+    _invalidate_rc(db, stmt["table"]); _invalidate_dp(stmt["table"])
     return f"{n} row{'s' if n != 1 else ''} inserted."
 
 
@@ -1957,7 +1959,7 @@ def _exec_select(stmt: dict, db: Database) -> RowResult:
 def _exec_truncate(stmt: dict, db: Database) -> str:
     rows = db.delete(stmt["table"], None)
     n = len(rows)
-    _invalidate_rc(db, stmt["table"])
+    _invalidate_rc(db, stmt["table"]); _invalidate_dp(stmt["table"])
     db._meta(stmt["table"]).next_key = 1
     return f"Table '{stmt['table']}' truncated ({n} rows deleted)."
 
@@ -1992,7 +1994,7 @@ def _exec_update(stmt: dict, db: Database) -> str:
             raise
         rows = []
     n = len(rows)
-    _invalidate_rc(db, tname)
+    _invalidate_rc(db, tname); _invalidate_dp(tname)
     if stmt.get("returning"):
         ret_cols = stmt["returning"]
         return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
@@ -2020,7 +2022,7 @@ def _exec_delete(stmt: dict, db: Database) -> str:
     else:
         rows = db.delete(tname, stmt["where"], stmt.get("limit"))
     n = len(rows)
-    _invalidate_rc(db, tname)
+    _invalidate_rc(db, tname); _invalidate_dp(tname)
     if stmt.get("returning"):
         ret_cols = stmt["returning"]
         return RowResult([{c: r.get(c) for c in ret_cols} for r in rows],
@@ -2335,6 +2337,12 @@ def _exec_show_parallel_status(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, ["setting", "value"])
 
 
+def _exec_show_dp_stats(stmt: dict, db: Database) -> RowResult:
+    s = _get_dp_stats()
+    rows = [{"stat": k, "value": str(v)} for k, v in s.items()]
+    return RowResult(rows, ["stat", "value"])
+
+
 def _exec_set_cache(stmt: dict, db: Database) -> str:
     if stmt["enabled"]:
         db._query_cache.enable()
@@ -2485,6 +2493,7 @@ _DISPATCH: dict[str, Any] = {
     "SET_PARALLEL_WORKERS":           _exec_set_parallel_workers,
     "SET_PARALLEL_THRESHOLD":         _exec_set_parallel_threshold,
     "SHOW_PARALLEL_STATUS":           _exec_show_parallel_status,
+    "SHOW_DP_STATS":                  _exec_show_dp_stats,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,
