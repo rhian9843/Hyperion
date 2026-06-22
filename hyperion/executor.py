@@ -1,7 +1,7 @@
 import re
 import struct
 import time
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import Any
 
 from .errors import (HyperionError, NoSuchTableError, NoSuchIndexError, SchemaError,
@@ -1278,26 +1278,53 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
         schema = meta.schema
         col_names = [c.name for c in schema.columns]
 
-        row_count = 0
-        distinct: dict[str, set] = {c: set() for c in col_names}
+        row_count    = 0
+        distinct:     dict[str, set]     = {c: set()     for c in col_names}
+        null_counts:  dict[str, int]     = {c: 0         for c in col_names}
+        value_counts: dict[str, Counter] = {c: Counter() for c in col_names}
+        min_vals:     dict[str, Any]     = {}
+        max_vals:     dict[str, Any]     = {}
+
+        def _scan_row(row: dict) -> None:
+            nonlocal row_count
+            row_count += 1
+            for c in col_names:
+                val = row.get(c)
+                if val is None:
+                    null_counts[c] += 1
+                    distinct[c].add(_ANALYZE_NULL_SENTINEL)
+                    continue
+                distinct[c].add(val)
+                value_counts[c][val] += 1
+                try:
+                    if c not in min_vals or val < min_vals[c]:
+                        min_vals[c] = val
+                    if c not in max_vals or val > max_vals[c]:
+                        max_vals[c] = val
+                except TypeError:
+                    pass  # mixed-type column — skip min/max
 
         if meta.storage_type == "column":
             for _, row in db._table_btree(meta).scan_rows():
-                row_count += 1
-                for c in col_names:
-                    val = row.get(c)
-                    distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
+                _scan_row(row)
         else:
             for _, raw in db._table_btree(meta).scan():
-                row = deserialize_row(schema, db._unpack_row_cell(raw))
-                row_count += 1
-                for c in col_names:
-                    val = row.get(c)
-                    distinct[c].add(val if val is not None else _ANALYZE_NULL_SENTINEL)
+                _scan_row(deserialize_row(schema, db._unpack_row_cell(raw)))
+
+        col_stats: dict[str, dict] = {}
+        for c in col_names:
+            top10 = value_counts[c].most_common(10)
+            col_stats[c] = {
+                "ndv":        len(distinct[c]),
+                "null_count": null_counts[c],
+                "min_val":    min_vals.get(c),
+                "max_val":    max_vals.get(c),
+                "mcv":        [[v, cnt] for v, cnt in top10],
+            }
 
         db._catalog.stats[tname] = {
             "row_count": row_count,
-            "columns": {c: {"ndv": len(distinct[c])} for c in col_names},
+            "columns":   col_stats,
         }
         db._catalog.mark_stats_dirty()
 

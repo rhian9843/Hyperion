@@ -71,6 +71,73 @@ def get_ndv(db, table: str, col: str) -> int | None:
     return col_stats.get("ndv")
 
 
+def _col_stats(db, table: str, col: str) -> dict:
+    """Return the per-column stats dict from catalog (ndv, null_count, min_val, max_val, mcv)."""
+    col = col.split(".")[-1]
+    return (getattr(db._catalog, "stats", {})
+            .get(table, {})
+            .get("columns", {})
+            .get(col, {}))
+
+
+def estimate_selectivity(db, table: str, col: str, op: str, val) -> float:
+    """Estimate fraction of rows in table satisfying col OP val in [0.0, 1.0].
+
+    For equality: checks MCVs first, falls back to 1/ndv.
+    For range ops: linear interpolation between min_val and max_val.
+    Returns 0.33 when no stats are available.
+    """
+    stats = _col_stats(db, table, col)
+    if not stats:
+        return 0.33
+
+    row_count = (getattr(db._catalog, "stats", {})
+                 .get(table, {})
+                 .get("row_count", 1)) or 1
+    ndv = stats.get("ndv") or 1
+
+    if op == "=":
+        for mcv_val, mcv_count in stats.get("mcv", []):
+            if mcv_val == val:
+                return mcv_count / row_count
+        return 1.0 / ndv
+
+    min_v = stats.get("min_val")
+    max_v = stats.get("max_val")
+    if min_v is None or max_v is None:
+        return 0.33
+
+    try:
+        v  = float(val)
+        lo = float(min_v)
+        hi = float(max_v)
+    except (TypeError, ValueError):
+        return 0.33
+
+    if hi == lo:
+        return 0.0 if op in ("<", ">") else 1.0
+
+    span = hi - lo
+    if op in (">", ">="):
+        return max(0.0, min(1.0, (hi - v) / span))
+    if op in ("<", "<="):
+        return max(0.0, min(1.0, (v - lo) / span))
+    return 0.33
+
+
+def estimate_row_count_with_where(db, table: str,
+                                  conditions: list[tuple]) -> int:
+    """Estimate rows satisfying all conditions via multiplicative selectivity.
+
+    conditions: list of (col, op, val) tuples.
+    """
+    row_count = estimate_rows(db, table)
+    sel = 1.0
+    for col, op, val in conditions:
+        sel *= estimate_selectivity(db, table, col, op, val)
+    return max(1, int(row_count * sel))
+
+
 # ── Index discovery ───────────────────────────────────────────────────────────
 
 def find_eq_index(db, table: str, col: str):
@@ -139,17 +206,21 @@ def _step_cost(db, left_count: int, right_table: str, right_col: str | None) -> 
 
 def _output_estimate(db, left_count: int, right_table: str,
                      right_col: str | None) -> int:
-    """Estimate join output row count using NDV selectivity when available.
+    """Estimate join output row count using selectivity when available.
 
-    For an equijoin on a column with NDV distinct values in a table of M rows,
-    expected matches per probe = M / NDV.  Without stats we fall back to the
-    geometric mean sqrt(N * M).
+    Uses estimate_selectivity (MCV-aware) for equality joins when ANALYZE stats
+    exist; falls back to 1/ndv, then geometric mean when there are no stats.
     """
     right_count = estimate_rows(db, right_table)
     if right_col:
-        ndv = get_ndv(db, right_table, right_col)
+        col = right_col.split(".")[-1]
+        stats = _col_stats(db, right_table, col)
+        if stats:
+            sel = estimate_selectivity(db, right_table, col, "=", None)
+            # estimate_selectivity returns 1/ndv for = with unknown val (no MCV hit on None)
+            return max(1, int(left_count * right_count * sel))
+        ndv = get_ndv(db, right_table, col)
         if ndv and ndv > 0:
-            # equijoin selectivity: each left row matches ~right_count/ndv right rows
             return max(1, int(left_count * right_count / ndv))
     return max(1, int(math.sqrt(left_count * right_count)))
 
