@@ -823,6 +823,13 @@ def _rows_for_stmt_inner(stmt: dict, db: "Database", ctes: dict, op: str) -> lis
         return stmt["rows"]
     if op == "RECURSIVE_CTE":
         return _exec_recursive_cte(stmt, db, ctes)
+    # Record access stats for top-level SELECT on a real (committed) table.
+    if op == "SELECT" and not stmt.get("subquery_from"):
+        _tbl = stmt.get("table", "")
+        if (_tbl and _tbl in db._catalog.tables
+                and not _tbl.startswith("_")
+                and _tbl not in ctes):
+            db.record_query_stat(_tbl, _extract_where_cols(stmt.get("where")))
     if op == "SELECT_NOFROM":
         col_aliases = stmt.get("col_aliases") or {}
         outer = stmt.get("_outer_row") or {}
@@ -1008,6 +1015,7 @@ def _iter_rows_for_stmt(stmt: dict, db: "Database",
                             for c in stmt_cols if c != "*")
                 and not any(_is_scalar_subquery_col(c) for c in stmt_cols)):
             s = _resolve_alias_refs(stmt, stmt.get("col_aliases"))
+            db.record_query_stat(tbl, _extract_where_cols(s.get("where")))
             col_aliases = stmt.get("col_aliases") or {}
             meta = db._meta(tbl)
             schema = meta.schema
@@ -1626,6 +1634,7 @@ def _exec_insert(stmt: dict, db: Database) -> str:
             raise SchemaError(
                 f"Cannot insert into view '{stmt['table']}' without an INSTEAD OF trigger")
         return _exec_instead_of_insert(stmt, db)
+    db.record_query_stat(stmt["table"], [])
     meta            = db._meta(stmt["table"])
     col_names       = stmt["col_names"] or [c.name for c in meta.schema.columns]
     for _cn in (stmt["col_names"] or []):
@@ -1760,6 +1769,7 @@ def _exec_update(stmt: dict, db: Database) -> str:
             raise SchemaError(
                 f"Cannot update view '{tname}' without an INSTEAD OF trigger")
         return _exec_instead_of_update(stmt, db)
+    db.record_query_stat(tname, _extract_where_cols(stmt.get("where")))
     _update_conflict = (stmt.get("conflict_action") or "").upper()
     try:
         if has_triggers(db, tname, "UPDATE"):
@@ -1797,6 +1807,7 @@ def _exec_delete(stmt: dict, db: Database) -> str:
             raise SchemaError(
                 f"Cannot delete from view '{tname}' without an INSTEAD OF trigger")
         return _exec_instead_of_delete(stmt, db)
+    db.record_query_stat(tname, _extract_where_cols(stmt.get("where")))
     if has_triggers(db, tname, "DELETE"):
         old_rows = scan_matching_rows(db, tname, stmt["where"])
         for old_row in old_rows:
@@ -1990,6 +2001,82 @@ def _exec_show_mat_views(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _extract_where_cols(where) -> list[str]:
+    """Return column names referenced in a WHERE clause (AND chain + OR branches)."""
+    if where is None:
+        return []
+    cols: list[str] = []
+    node = where
+    while node is not None:
+        c = node.col or ""
+        if c:
+            try:
+                float(c)
+            except (ValueError, TypeError):
+                if c.upper() not in ("TRUE", "FALSE", "NULL"):
+                    cols.append(c)
+        if node.or_clause:
+            cols.extend(_extract_where_cols(node.or_clause))
+        node = node.and_clause
+    return cols
+
+
+def _exec_show_query_stats(stmt: dict, db: Database) -> RowResult:
+    ast = db._catalog.access_stats
+    tables_map  = ast.get("tables",  {})
+    columns_map = ast.get("columns", {})
+    rows = []
+    for tbl, count in sorted(tables_map.items()):
+        col_counts = columns_map.get(tbl, {})
+        top_col, top_cnt = None, 0
+        for col, cnt in col_counts.items():
+            if cnt > top_cnt:
+                top_col, top_cnt = col, cnt
+        rows.append({
+            "table":             tbl,
+            "query_count":       count,
+            "top_filter_column": top_col,
+            "top_filter_count":  top_cnt if top_col else None,
+        })
+    cols = ["table", "query_count", "top_filter_column", "top_filter_count"]
+    return RowResult(rows, cols)
+
+
+def _exec_show_index_suggestions(stmt: dict, db: Database) -> RowResult:
+    ast = db._catalog.access_stats
+    tables_map  = ast.get("tables",  {})
+    columns_map = ast.get("columns", {})
+
+    # Build set of already-indexed columns: {(table, col)}
+    indexed: set[tuple[str, str]] = set()
+    for idx_meta in db._catalog.indexes.values():
+        if idx_meta.columns:
+            indexed.add((idx_meta.table_name, idx_meta.columns[0]))
+
+    rows = []
+    for tbl, col_counts in sorted(columns_map.items()):
+        total = tables_map.get(tbl, 0)
+        if total == 0:
+            continue
+        for col, cnt in sorted(col_counts.items(), key=lambda kv: -kv[1]):
+            pct = (cnt * 100) // total
+            if pct < 20:
+                continue
+            if (tbl, col) in indexed:
+                continue
+            rows.append({
+                "table":       tbl,
+                "column":      col,
+                "filter_count": cnt,
+                "query_count":  total,
+                "filter_pct":   pct,
+                "suggestion":   f"CREATE INDEX idx_{tbl}_{col} ON {tbl}({col})",
+            })
+    cols = ["table", "column", "filter_count", "query_count",
+            "filter_pct", "suggestion"]
+    return RowResult(rows, cols)
+
+
 def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
     from .pager import Pager, MemoryPager
     pager = db._pager
@@ -2115,6 +2202,8 @@ _DISPATCH: dict[str, Any] = {
     "REFRESH_MAT_VIEW":               _exec_refresh_mat_view,
     "DROP_MAT_VIEW":                  _exec_drop_mat_view,
     "SHOW_MAT_VIEWS":                 _exec_show_mat_views,
+    "SHOW_QUERY_STATS":               _exec_show_query_stats,
+    "SHOW_INDEX_SUGGESTIONS":         _exec_show_index_suggestions,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

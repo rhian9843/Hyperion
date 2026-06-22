@@ -100,6 +100,11 @@ class Catalog:
     events:         dict[str, EventMeta]        = field(default_factory=dict)
     mat_views:      dict[str, MatViewMeta]      = field(default_factory=dict)
     lsn:            int                         = 0   # advances on each published DML commit
+    # Per-table/column query access counts (from adaptive_stats).
+    # Structure: {"tables": {tbl: count}, "columns": {tbl: {col: count}}}
+    # Updated on every SELECT/INSERT/UPDATE/DELETE; persisted in the ops blob.
+    access_stats:   dict                        = field(
+        default_factory=lambda: {"tables": {}, "columns": {}})
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
     # Pre-computed JSON fragments per table/index so ops_to_bytes() only
@@ -120,6 +125,9 @@ class Catalog:
     # not trigger a schema page rewrite on every subsequent commit.
     _stats_dirty:   bool = field(default=True, repr=False, compare=False)
     _stats_snippet: str  = field(default="{}",  repr=False, compare=False)
+    _access_stats_dirty:   bool = field(default=True, repr=False, compare=False)
+    _access_stats_snippet: str  = field(default='{"tables":{},"columns":{}}',
+                                        repr=False, compare=False)
 
     CATALOG_PAGE = 0
 
@@ -134,6 +142,9 @@ class Catalog:
 
     def mark_stats_dirty(self) -> None:
         self._stats_dirty = True
+
+    def mark_access_stats_dirty(self) -> None:
+        self._access_stats_dirty = True
 
     # ── Serialisation ─────────────────────────────────────────────────────────
 
@@ -236,6 +247,10 @@ class Catalog:
             self._stats_snippet = json.dumps(self.stats)
             self._stats_dirty = False
 
+        if self._access_stats_dirty:
+            self._access_stats_snippet = json.dumps(self.access_stats)
+            self._access_stats_dirty = False
+
         table_part = ",".join(self._t_snippets.values())
         index_part = ",".join(self._i_snippets.values())
         subs_json = json.dumps({
@@ -246,6 +261,7 @@ class Catalog:
         return (
             f'{{{self._ops_global_snippet},'
             f'"stats":{self._stats_snippet},'
+            f'"access_stats":{self._access_stats_snippet},'
             f'"subscriptions":{subs_json},'
             f'"table_ops":{{{table_part}}},'
             f'"index_ops":{{{index_part}}}}}'
@@ -390,6 +406,11 @@ class Catalog:
         # Stats live in the ops blob (new format).  Fall back to the schema blob
         # for databases written by older versions that stored stats in the schema.
         stats = d_o.get("stats") or d_s.get("stats", {})
+        _raw_as = d_o.get("access_stats") or {}
+        access_stats = {
+            "tables":  _raw_as.get("tables",  {}),
+            "columns": _raw_as.get("columns", {}),
+        }
 
         # Decode free-page list: new format uses compact binary (base64-encoded
         # packed uint32s); fall back to JSON array for older databases.
@@ -440,11 +461,14 @@ class Catalog:
             events=events,
             mat_views=mat_views,
             lsn=d_o.get("lsn", 0),
+            access_stats=access_stats,
         )
         # Initialise snippet cache and mark stats clean so the first ops flush
         # doesn't re-serialise unchanged stats.
         cat._stats_snippet = json.dumps(stats)
         cat._stats_dirty = False
+        cat._access_stats_snippet = json.dumps(access_stats)
+        cat._access_stats_dirty = False
         return cat
 
     @classmethod

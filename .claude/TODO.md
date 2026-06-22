@@ -474,9 +474,9 @@
 
 - [x] Automatic query rewriting — simplify trivially true/false conditions before planning (`WHERE 1=1` → strip, `WHERE 1=0` → empty scan); normalize redundant `AND`/`OR` combinations; rewrite `WHERE col IN (SELECT ...)` to an equivalent JOIN when the subquery is non-correlated and the planner estimates the join path is cheaper
 - [x] `EXPLAIN REWRITTEN` — show the query as it looks after the rewriter has transformed it, before the planner runs; lets developers see exactly what optimizations were applied and verify the rewriter is not changing query semantics
-- [ ] Access statistics tracking — record per-table and per-index scan counts, hit rates, and last-used timestamps in the catalog; updated on every query execution
-- [ ] `SHOW INDEX SUGGESTIONS` — analyse access statistics and current schema to recommend missing indexes; output lists candidate columns, estimated selectivity, and projected query speedup
-- [ ] `SHOW QUERY STATS` — per-table query frequency and column filter counts
+- [x] Access statistics tracking — record per-table and per-index scan counts, hit rates, and last-used timestamps in the catalog; updated on every query execution
+- [x] `SHOW INDEX SUGGESTIONS` — analyse access statistics and current schema to recommend missing indexes; output lists candidate columns, estimated selectivity, and projected query speedup
+- [x] `SHOW QUERY STATS` — per-table query frequency and column filter counts
 - [ ] `SHOW PROFILES` / `PROFILE ON|OFF` — per-query execution timing; `SHOW PROFILE FOR QUERY n` shows breakdown for a specific query
 - [ ] Hash JOIN and Merge JOIN strategies — planner selects `NESTED_LOOP` for small tables, `HASH_JOIN` for large unsorted inputs, `MERGE_JOIN` when both sides are index-ordered; current engine only does nested loop
 - [ ] Query result cache — LRU cache of recent `SELECT` results with a configurable TTL; cache key is the normalised SQL + params; invalidated on any write to a referenced table; `SHOW CACHE STATUS`, `SET CACHE ON|OFF`

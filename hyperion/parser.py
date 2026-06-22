@@ -2322,6 +2322,12 @@ def _parse_tokens(t: list[str]) -> dict:
                 except ValueError:
                     pass
             return {"op": "SHOW_LOGICAL_LOG", "limit": limit}
+        if (len(t) > 2 and t[1].upper() == "QUERY"
+                and t[2].upper() == "STATS"):
+            return {"op": "SHOW_QUERY_STATS"}
+        if (len(t) > 2 and t[1].upper() == "INDEX"
+                and t[2].upper() == "SUGGESTIONS"):
+            return {"op": "SHOW_INDEX_SUGGESTIONS"}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     if kw == "START":
         if len(t) > 1 and t[1].upper() == "SLAVE":

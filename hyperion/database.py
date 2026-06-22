@@ -1050,6 +1050,21 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
                 self.drop_table(name)
             del self._catalog.mat_views[name]
 
+    # ── Query access statistics ───────────────────────────────────────────────
+
+    def record_query_stat(self, table_name: str,
+                          where_cols: "list[str]") -> None:
+        """Bump per-table and per-column access counters (adaptive stats)."""
+        ast = self._catalog.access_stats
+        tables_map  = ast.setdefault("tables",  {})
+        columns_map = ast.setdefault("columns", {})
+        tables_map[table_name] = tables_map.get(table_name, 0) + 1
+        if where_cols:
+            col_tbl = columns_map.setdefault(table_name, {})
+            for col in where_cols:
+                col_tbl[col] = col_tbl.get(col, 0) + 1
+        self._catalog.mark_access_stats_dirty()
+
     # ── Logical replication ───────────────────────────────────────────────────
 
     @property
