@@ -1223,6 +1223,8 @@ def _parse_create(t: list[str]) -> dict:
         return _parse_create_policy(t, 2)
     if sub == "EVENT":
         return _parse_create_event(t, 2)
+    if sub == "STATISTICS":
+        return _parse_create_statistics(t, 2)
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -1339,6 +1341,34 @@ def _parse_create_event(t: list[str], i: int) -> dict:
     return {"op": "CREATE_EVENT", "name": name, "schedule_type": schedule_type,
             "interval_seconds": interval_seconds, "at_time": at_time,
             "sql": sql_body, "if_not_exists": if_not_exists}
+
+
+def _parse_create_statistics(t: list[str], i: int) -> dict:
+    # Syntax: CREATE STATISTICS name ON table(col1, col2[, ...])
+    if i >= len(t):
+        raise ParseError("Expected statistics name after CREATE STATISTICS")
+    name = t[i]; i += 1
+    if i >= len(t) or t[i].upper() != "ON":
+        raise ParseError("Expected ON after statistics name in CREATE STATISTICS")
+    i += 1
+    # Next token is either "table(col1,col2)" (single token) or "table" followed by "(" ...
+    if i >= len(t):
+        raise ParseError("Expected table(col1, col2) after ON in CREATE STATISTICS")
+    # Collect everything from here: may be "tname ( col1 , col2 )" as separate tokens
+    rest = t[i:]
+    raw = " ".join(rest)
+    import re as _re
+    m = _re.match(r'(\w+)\s*\(([^)]+)\)', raw)
+    if not m:
+        raise ParseError(
+            "Expected table(col1, col2) after ON in CREATE STATISTICS; "
+            f"got '{raw}'"
+        )
+    table = m.group(1)
+    cols  = [c.strip() for c in m.group(2).split(",") if c.strip()]
+    if len(cols) < 2:
+        raise ParseError("CREATE STATISTICS requires at least 2 columns")
+    return {"op": "CREATE_STATISTICS", "name": name, "table": table, "columns": cols}
 
 
 def _parse_create_policy(t: list[str], i: int) -> dict:
@@ -1574,6 +1604,17 @@ def _parse_drop(t: list[str]) -> dict:
             raise ParseError("Expected table name after ON in DROP POLICY")
         table = t[i]
         return {"op": "DROP_POLICY", "name": name, "table": table, "if_exists": if_exists}
+    if sub == "STATISTICS":
+        i = 2
+        if_exists = False
+        if i < len(t) and t[i].upper() == "IF":
+            if i + 1 < len(t) and t[i + 1].upper() == "EXISTS":
+                if_exists = True; i += 2
+            else:
+                raise ParseError("Expected EXISTS after IF in DROP STATISTICS")
+        if i >= len(t):
+            raise ParseError("Expected statistics name after DROP STATISTICS")
+        return {"op": "DROP_STATISTICS", "name": t[i], "if_exists": if_exists}
     raise ParseError(f"Expected TABLE, INDEX, VIEW, or TRIGGER, got '{t[1]}'")
 
 
@@ -2366,6 +2407,12 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "DP"
                 and t[2].upper() == "STATS"):
             return {"op": "SHOW_DP_STATS"}
+        # SHOW STATISTICS [FOR table]
+        if len(t) > 1 and t[1].upper() == "STATISTICS":
+            table_filter = None
+            if len(t) > 3 and t[2].upper() == "FOR":
+                table_filter = t[3]
+            return {"op": "SHOW_STATISTICS", "table": table_filter}
         # SHOW PROFILE FOR QUERY n
         if (len(t) > 4 and t[1].upper() == "PROFILE"
                 and t[2].upper() == "FOR" and t[3].upper() == "QUERY"):

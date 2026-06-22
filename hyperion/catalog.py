@@ -105,6 +105,10 @@ class Catalog:
     # Updated on every SELECT/INSERT/UPDATE/DELETE; persisted in the ops blob.
     access_stats:   dict                        = field(
         default_factory=lambda: {"tables": {}, "columns": {}})
+    # Named multi-column statistics objects (CREATE STATISTICS).
+    # Structure: {name: {"table": str, "columns": [str, ...], "created_at": str,
+    #                    "joint_ndv": int, "joint_mcv": [[[v1, v2, ...], count], ...]}}
+    named_stats:    dict[str, dict]             = field(default_factory=dict)
 
     # ── Ops-serialization snippet cache ───────────────────────────────────────
     # Pre-computed JSON fragments per table/index so ops_to_bytes() only
@@ -196,6 +200,7 @@ class Catalog:
                     "row_count": v.row_count}
                 for n, v in self.mat_views.items()
             },
+            "named_stats": self.named_stats,
         }).encode()
 
     def ops_to_bytes(self) -> bytes:
@@ -303,6 +308,7 @@ class Catalog:
             "mvws": {n: MatViewMeta(n, v.sql, v.last_refresh, v.row_count)
                      for n, v in self.mat_views.items()},
             "lsn":  self.lsn,
+            "nstats": {n: dict(v) for n, v in self.named_stats.items()},
         }
 
     def restore_snap(self, snap: dict) -> None:
@@ -319,6 +325,7 @@ class Catalog:
         self.policies.clear();      self.policies.update(snap.get("pols", {}))
         self.events.clear();        self.events.update(snap.get("evts", {}))
         self.mat_views.clear();     self.mat_views.update(snap.get("mvws", {}))
+        self.named_stats.clear();   self.named_stats.update(snap.get("nstats", {}))
         self.lsn = snap.get("lsn", self.lsn)
         # Invalidate snippet/dirty caches so ops_to_bytes rebuilds cleanly
         self._t_snippets.clear()
@@ -462,6 +469,7 @@ class Catalog:
             mat_views=mat_views,
             lsn=d_o.get("lsn", 0),
             access_stats=access_stats,
+            named_stats=d_s.get("named_stats", {}),
         )
         # Initialise snippet cache and mark stats clean so the first ops flush
         # doesn't re-serialise unchanged stats.

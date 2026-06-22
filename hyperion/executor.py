@@ -98,6 +98,7 @@ _WRITE_OPS = frozenset({
     "ALTER_ENABLE_RLS", "ALTER_DISABLE_RLS",
     "CREATE_POLICY", "DROP_POLICY",
     "CREATE_EVENT", "DROP_EVENT", "ALTER_EVENT",
+    "CREATE_STATISTICS", "DROP_STATISTICS",
     "ANALYZE", "VACUUM",
 })
 
@@ -1335,6 +1336,12 @@ def _execute_analyze(stmt: dict, db: Database) -> str:
         if hasattr(db, "_opt_row_counts"):
             db._opt_row_counts[tname] = row_count
 
+        # Recompute joint stats for any named statistics on this table
+        for ns_name, ns in db._catalog.named_stats.items():
+            if ns.get("table") == tname:
+                joint = _compute_joint_stats(db, tname, ns["columns"])
+                ns.update(joint)
+
     db._flush_catalog()
 
     n = len(tables_to_analyze)
@@ -2144,6 +2151,86 @@ def _exec_show_events(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _compute_joint_stats(db: "Database", table: str, columns: list[str]) -> dict:
+    """Scan table and compute joint NDV and top-10 joint MCVs for given columns."""
+    from collections import Counter as _Counter
+    meta = db._meta(table)
+    schema = meta.schema
+    col_names = [c.name for c in schema.columns]
+
+    joint_counts: _Counter = _Counter()
+
+    def _scan(row: dict) -> None:
+        key = tuple(row.get(c) for c in columns)
+        joint_counts[key] += 1
+
+    if meta.storage_type == "column":
+        for _, row in db._table_btree(meta).scan_rows():
+            _scan(row)
+    else:
+        from .schema import deserialize_row as _deser
+        for _, raw in db._table_btree(meta).scan():
+            _scan(_deser(schema, db._unpack_row_cell(raw)))
+
+    joint_ndv  = len(joint_counts)
+    joint_mcv  = [[list(vals), cnt] for vals, cnt in joint_counts.most_common(10)]
+    return {"joint_ndv": joint_ndv, "joint_mcv": joint_mcv}
+
+
+def _exec_create_statistics(stmt: dict, db: "Database") -> str:
+    name    = stmt["name"]
+    table   = stmt["table"]
+    columns = stmt["columns"]
+
+    if table not in db.tables:
+        from .errors import NoSuchTableError
+        raise NoSuchTableError(f"No such table: '{table}'")
+    schema_cols = {c.name for c in db._meta(table).schema.columns}
+    for col in columns:
+        if col not in schema_cols:
+            from .errors import NoSuchColumnError
+            raise NoSuchColumnError(f"No such column '{col}' in table '{table}'")
+
+    import datetime
+    joint = _compute_joint_stats(db, table, columns)
+    db._catalog.named_stats[name] = {
+        "table":     table,
+        "columns":   columns,
+        "created_at": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        **joint,
+    }
+    db._flush_catalog()
+    return f"Statistics '{name}' created."
+
+
+def _exec_drop_statistics(stmt: dict, db: "Database") -> str:
+    name = stmt["name"]
+    if name not in db._catalog.named_stats:
+        if stmt.get("if_exists"):
+            return f"Statistics '{name}' does not exist."
+        from .errors import NoSuchTableError
+        raise NoSuchTableError(f"No such statistics: '{name}'")
+    del db._catalog.named_stats[name]
+    db._flush_catalog()
+    return f"Statistics '{name}' dropped."
+
+
+def _exec_show_statistics(stmt: dict, db: "Database") -> "RowResult":
+    table_filter = stmt.get("table")
+    rows = []
+    for name, ns in sorted(db._catalog.named_stats.items()):
+        if table_filter and ns["table"] != table_filter:
+            continue
+        rows.append({
+            "name":       name,
+            "table":      ns["table"],
+            "columns":    ", ".join(ns["columns"]),
+            "joint_ndv":  str(ns.get("joint_ndv", 0)),
+            "created_at": ns.get("created_at", ""),
+        })
+    return RowResult(rows, ["name", "table", "columns", "joint_ndv", "created_at"])
+
+
 def _exec_set_rewriter(stmt: dict, db: Database) -> str:
     from .query_rewriter import QueryRewriter
     if not hasattr(db, "_rewriter"):
@@ -2474,6 +2561,9 @@ _DISPATCH: dict[str, Any] = {
     "DROP_POLICY":                    _exec_drop_policy,
     "CREATE_EVENT":                   _exec_create_event,
     "DROP_EVENT":                     _exec_drop_event,
+    "CREATE_STATISTICS":              _exec_create_statistics,
+    "DROP_STATISTICS":                _exec_drop_statistics,
+    "SHOW_STATISTICS":                _exec_show_statistics,
     "ALTER_EVENT":                    _exec_alter_event,
     "SHOW_EVENTS":                    _exec_show_events,
     "SHOW_RECOVERY_STATUS":           _exec_show_recovery_status,

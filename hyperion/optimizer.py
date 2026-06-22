@@ -265,11 +265,51 @@ def estimate_row_count_with_where(db, table: str,
     """Estimate rows satisfying all conditions via multiplicative selectivity.
 
     conditions: list of (col, op, val) tuples or (col, 'BETWEEN', (lo, hi)) tuples.
+
+    When named multi-column statistics cover a subset of the equality conditions,
+    joint MCV frequencies replace the product of individual selectivities for
+    those columns, correcting for correlation between them.
     """
     row_count = estimate_rows(db, table)
-    sel = 1.0
+
+    # Build a map of eq conditions: bare col name → val (for joint MCV lookup)
+    eq_conds: dict[str, object] = {}
     for item in conditions:
         col, op, val = item
+        if op == "=":
+            eq_conds[col.split(".")[-1]] = val
+
+    # Find named statistics covering this table; collect which cols are absorbed
+    absorbed_cols: set[str] = set()
+    joint_sel = 1.0
+    named_stats = getattr(getattr(db, "_catalog", None), "named_stats", {})
+    for ns in named_stats.values():
+        if ns.get("table") != table:
+            continue
+        ns_cols = [c.split(".")[-1] for c in ns.get("columns", [])]
+        # Only apply when all covered columns appear as equality conditions
+        if not all(c in eq_conds for c in ns_cols):
+            continue
+        # Look up joint MCV for this combination
+        query_vals = [eq_conds[c] for c in ns_cols]
+        found = False
+        for mcv_vals, mcv_count in ns.get("joint_mcv", []):
+            if mcv_vals == query_vals:
+                joint_sel *= mcv_count / max(row_count, 1)
+                found = True
+                break
+        if not found:
+            joint_ndv = ns.get("joint_ndv", 1) or 1
+            joint_sel *= 1.0 / joint_ndv
+        absorbed_cols.update(ns_cols)
+
+    # Multiply remaining (non-absorbed) per-column selectivities
+    sel = joint_sel
+    for item in conditions:
+        col, op, val = item
+        bare_col = col.split(".")[-1]
+        if op == "=" and bare_col in absorbed_cols:
+            continue  # already covered by joint stats
         if op == "BETWEEN":
             lo, hi = val
             sel *= estimate_range_selectivity(db, table, col, lo, hi)
