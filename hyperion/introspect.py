@@ -320,9 +320,11 @@ def _plan_rows(stmt: dict, db: "Database", out: list[dict],
         return
 
     if op == "JOIN":
+        from .join_strategies import choose_strategy, NESTED_LOOP_THRESHOLD
         ltbl     = stmt.get("left_table", "")
         rtbl     = stmt.get("right_table", "")
         join_type = stmt.get("join_type", "INNER")
+        on_left  = stmt.get("on_left")
         on_right = stmt.get("on_right")
 
         left_detail = _table_scan_detail(db, ltbl)
@@ -330,23 +332,48 @@ def _plan_rows(stmt: dict, db: "Database", out: list[dict],
 
         right_id = counter[0]; counter[0] += 1
         right_col = on_right.split(".")[-1] if on_right else None
-        if right_col and rtbl in db._catalog.tables:
+        use_inlj = (join_type == "INNER" and right_col is not None
+                    and _find_index_for_col(db, rtbl, right_col) is not None)
+        if use_inlj:
             idx = _find_index_for_col(db, rtbl, right_col)
-            if idx:
-                right_detail = (f"SEARCH TABLE {rtbl} USING INDEX {idx} "
-                                f"({on_right or right_col}=?)")
-            else:
-                right_detail = f"SCAN TABLE {rtbl}"
+            right_detail = (f"SEARCH TABLE {rtbl} USING INDEX {idx} "
+                            f"({on_right or right_col}=?) [INLJ]")
+        elif right_col and rtbl in db._catalog.tables:
+            left_has_idx  = (on_left is not None
+                             and _find_index_for_col(db, ltbl,
+                                                     on_left.split(".")[-1]) is not None)
+            right_has_idx = _find_index_for_col(db, rtbl, right_col) is not None
+            ltbl_count    = _estimate_row_count(db, ltbl)
+            rtbl_count    = _estimate_row_count(db, rtbl)
+            strategy = choose_strategy(ltbl_count, rtbl_count,
+                                       left_has_idx, right_has_idx, join_type)
+            right_detail = f"SCAN TABLE {rtbl} [{strategy}]"
         else:
             right_detail = _table_scan_detail(db, rtbl)
         out.append({"id": right_id, "parent": my_id, "notused": 0,
                     "detail": right_detail})
 
         for ej in stmt.get("extra_joins") or []:
-            ej_id   = counter[0]; counter[0] += 1
-            ej_rtbl = ej.get("right_table", "")
+            ej_id    = counter[0]; counter[0] += 1
+            ej_rtbl  = ej.get("right_table", "")
+            ej_rcol  = (ej.get("on_right") or "").split(".")[-1] or None
+            ej_jtype = ej.get("join_type", "INNER")
+            ej_use_inlj = (ej_jtype == "INNER" and ej_rcol
+                           and _find_index_for_col(db, ej_rtbl, ej_rcol) is not None)
+            if ej_use_inlj:
+                ej_idx = _find_index_for_col(db, ej_rtbl, ej_rcol)
+                ej_detail = (f"SEARCH TABLE {ej_rtbl} USING INDEX {ej_idx} "
+                             f"({ej_rcol}=?) [INLJ]")
+            elif ej_rcol and ej_rtbl in db._catalog.tables:
+                ej_right_has_idx = _find_index_for_col(db, ej_rtbl, ej_rcol) is not None
+                ej_count = _estimate_row_count(db, ej_rtbl)
+                ej_strategy = choose_strategy(NESTED_LOOP_THRESHOLD + 1, ej_count,
+                                              False, ej_right_has_idx, ej_jtype)
+                ej_detail = f"SCAN TABLE {ej_rtbl} [{ej_strategy}]"
+            else:
+                ej_detail = _table_scan_detail(db, ej_rtbl)
             out.append({"id": ej_id, "parent": my_id, "notused": 0,
-                        "detail": _table_scan_detail(db, ej_rtbl)})
+                        "detail": ej_detail})
         return
 
     if op == "SET_OP":
@@ -361,6 +388,15 @@ def _plan_rows(stmt: dict, db: "Database", out: list[dict],
     # Fallback
     out.append({"id": my_id, "parent": parent, "notused": 0,
                 "detail": f"EXECUTE {op}"})
+
+
+def _estimate_row_count(db: "Database", tbl: str) -> int:
+    """Return row count from ANALYZE stats, or threshold+1 if not yet analyzed."""
+    from .join_strategies import NESTED_LOOP_THRESHOLD
+    row_count = db._catalog.stats.get(tbl, {}).get("row_count", -1)
+    if row_count >= 0:
+        return row_count
+    return NESTED_LOOP_THRESHOLD + 1
 
 
 def _table_scan_detail(db: "Database", tbl: str) -> str:

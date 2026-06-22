@@ -478,7 +478,7 @@
 - [x] `SHOW INDEX SUGGESTIONS` — analyse access statistics and current schema to recommend missing indexes; output lists candidate columns, estimated selectivity, and projected query speedup
 - [x] `SHOW QUERY STATS` — per-table query frequency and column filter counts
 - [x] `SHOW PROFILES` / `PROFILE ON|OFF` — per-query execution timing; `SHOW PROFILE FOR QUERY n` shows breakdown for a specific query
-- [ ] Hash JOIN and Merge JOIN strategies — planner selects `NESTED_LOOP` for small tables, `HASH_JOIN` for large unsorted inputs, `MERGE_JOIN` when both sides are index-ordered; current engine only does nested loop
+- [x] Hash JOIN and Merge JOIN strategies — planner selects `NESTED_LOOP` for small tables, `HASH_JOIN` for large unsorted inputs, `MERGE_JOIN` when both sides are index-ordered; current engine only does nested loop
 - [ ] Query result cache — LRU cache of recent `SELECT` results with a configurable TTL; cache key is the normalised SQL + params; invalidated on any write to a referenced table; `SHOW CACHE STATUS`, `SET CACHE ON|OFF`
 - [ ] Parallel query execution — split table scans and aggregations across multiple CPU threads on the same machine; `SET MAX_PARALLEL_WORKERS n` controls thread count; `SET PARALLEL_THRESHOLD n` sets minimum row count before parallelism kicks in; `/*+ PARALLEL(N) */` query hint forces a specific degree; `SHOW PARALLEL STATUS`; planner chooses parallel path automatically for large scans
 

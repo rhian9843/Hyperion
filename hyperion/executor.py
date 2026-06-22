@@ -627,34 +627,140 @@ def _exec_extra_join(rows: list[dict], join_info: dict,
                 merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
                 result.append(merged)
         else:
-            on_matched = False
-            lcol = on_left.split(".")[-1] if on_left else None
-            for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
-                merged = dict(lr)
-                merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
-                if on_clause is not None:
+            break  # fall through to strategy-based join below
+
+    if not use_inlj and (on_left or on_clause):
+        # Cross-join is already handled above; reach here only for ON-based joins
+        lcol_bare = on_left.split(".")[-1] if on_left else None
+        ra = right_alias
+
+        # _exec_extra_join works on accumulated left rows that may use various
+        # key schemes (qualified "t.col", bare "col", etc.).  Resolve left key.
+        def _get_lval(lr: dict, col: str) -> Any:
+            v = lr.get(on_left)
+            if v is None and on_left:
+                v = lr.get(col)
+            return v
+
+        # For complex ON clauses (no simple equality), use nested loop
+        if on_clause is not None and lcol_bare is None:
+            for lr in rows:
+                on_matched = False
+                for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                    merged = dict(lr)
+                    merged.update({f"{ra}.{k}": v for k, v in rr.items()})
                     if not on_clause.evaluate(merged, db):
                         continue
-                else:
-                    lval = lr.get(on_left) or lr.get(lcol)  # type: ignore[arg-type]
-                    rval = rr.get(rcol)
-                    if lval != rval:
-                        continue
-                on_matched = True
-                matched_right.add(j)
-                result.append(merged)
-            if not on_matched and join_type in ("LEFT", "FULL"):
-                merged = dict(lr)
-                merged.update(right_null)
-                result.append(merged)
+                    on_matched = True
+                    matched_right.add(j)
+                    result.append(merged)
+                if not on_matched and join_type in ("LEFT", "FULL"):
+                    merged = dict(lr)
+                    merged.update(right_null)
+                    result.append(merged)
+        else:
+            # Simple equi-join: choose NESTED_LOOP / HASH_JOIN / MERGE_JOIN
+            from .join_strategies import (choose_strategy, hash_join,
+                                          merge_join_inner)
+            from .query import find_eq_index
+            left_has_idx  = False   # rows are an accumulated result, no single table index
+            right_has_idx = (rcol is not None
+                             and find_eq_index(db, right_table, rcol) is not None)
+            strategy = choose_strategy(
+                len(rows), len(right_rows),  # type: ignore[possibly-undefined]
+                left_has_idx, right_has_idx, join_type)
 
-    if not use_inlj and join_type in ("RIGHT", "FULL"):
-        left_null = {k: None for k in (rows[0] if rows else {})}
-        for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
-            if j not in matched_right:
-                merged = dict(left_null)
-                merged.update({f"{right_alias}.{k}": v for k, v in rr.items()})
-                result.append(merged)
+            left_null = {k: None for k in (rows[0] if rows else {})}
+
+            def _ej_emit(merged: dict) -> dict:
+                return merged
+
+            if strategy == "HASH_JOIN":
+                # Build phase: index right rows by join-column value
+                hash_map: dict = {}
+                for ri, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                    key = rr.get(rcol)
+                    hash_map.setdefault(key, []).append((ri, rr))
+                result = []
+                matched_r: set[int] = set()
+                for lr in rows:
+                    lval = _get_lval(lr, lcol_bare)
+                    bucket = hash_map.get(lval, [])
+                    if bucket:
+                        for ri, rr in bucket:
+                            matched_r.add(ri)
+                            merged = dict(lr)
+                            merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                            result.append(merged)
+                    elif join_type in ("LEFT", "LEFT OUTER", "FULL", "FULL OUTER"):
+                        merged = dict(lr)
+                        merged.update(right_null)
+                        result.append(merged)
+                if join_type in ("RIGHT", "RIGHT OUTER", "FULL", "FULL OUTER"):
+                    for ri, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                        if ri not in matched_r:
+                            merged = dict(left_null)
+                            merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                            result.append(merged)
+
+            elif strategy == "MERGE_JOIN":
+                from .join_strategies import _sort_key
+                left_idx  = sorted(range(len(rows)),
+                                   key=lambda i: _sort_key(_get_lval(rows[i], lcol_bare)))
+                right_idx = sorted(range(len(right_rows)),  # type: ignore[possibly-undefined]
+                                   key=lambda i: _sort_key(right_rows[i].get(rcol)))  # type: ignore
+                result = []
+                li, ri = 0, 0
+                while li < len(left_idx) and ri < len(right_idx):
+                    lv = _sort_key(_get_lval(rows[left_idx[li]], lcol_bare))
+                    rv = _sort_key(right_rows[right_idx[ri]].get(rcol))  # type: ignore
+                    if lv < rv: li += 1; continue
+                    if lv > rv: ri += 1; continue
+                    ri_end = ri + 1
+                    while (ri_end < len(right_idx)
+                           and _sort_key(right_rows[right_idx[ri_end]].get(rcol)) == lv):  # type: ignore
+                        ri_end += 1
+                    while (li < len(left_idx)
+                           and _sort_key(_get_lval(rows[left_idx[li]], lcol_bare)) == lv):
+                        lr = rows[left_idx[li]]
+                        for rj in range(ri, ri_end):
+                            rr = right_rows[right_idx[rj]]  # type: ignore
+                            merged = dict(lr)
+                            merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                            result.append(merged)
+                        li += 1
+                    ri = ri_end
+
+            else:
+                # NESTED_LOOP
+                for lr in rows:
+                    on_matched = False
+                    for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                        lval = _get_lval(lr, lcol_bare)
+                        rval = rr.get(rcol)
+                        if lval != rval:
+                            continue
+                        on_matched = True
+                        matched_right.add(j)
+                        merged = dict(lr)
+                        merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                        result.append(merged)
+                    if not on_matched and join_type in ("LEFT", "FULL"):
+                        merged = dict(lr)
+                        merged.update(right_null)
+                        result.append(merged)
+                if join_type in ("RIGHT", "FULL"):
+                    left_null = {k: None for k in (rows[0] if rows else {})}
+                    for j, rr in enumerate(right_rows):  # type: ignore[possibly-undefined]
+                        if j not in matched_right:
+                            merged = dict(left_null)
+                            merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                            result.append(merged)
+
+    elif not use_inlj:
+        # CROSS JOIN — already handled at top of loop; nothing more to do
+        pass
+
     return result
 
 

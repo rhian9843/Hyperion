@@ -540,33 +540,55 @@ class QueryMixin:
                     if row is not None:
                         results.append(row)
         else:
-            matched_right: set[int] = set()
-            for lr in left_rows:
-                on_matched = False
-                for j, rr in enumerate(right_rows):
-                    if not _on_match(lr, rr):
-                        continue
-                    on_matched = True
-                    matched_right.add(j)
-                    row = _emit(_merge(lr, rr))
-                    if row is not None:
-                        results.append(row)
-                if not on_matched and join_type in ("LEFT", "FULL"):
-                    merged = {f"{la}.{k}": v for k, v in lr.items()}
-                    merged.update(right_null)
-                    row = _emit(merged)
-                    if row is not None:
-                        results.append(row)
+            # Choose join strategy: NESTED_LOOP / HASH_JOIN / MERGE_JOIN
+            # Complex ON (no simple equality columns) → always nested loop
+            if lcol is not None and rcol is not None:
+                from .join_strategies import (choose_strategy, hash_join,
+                                              merge_join_inner,
+                                              NESTED_LOOP_THRESHOLD)
+                left_has_idx  = find_eq_index(self, left_table,  lcol) is not None
+                right_has_idx = find_eq_index(self, right_table, rcol) is not None
+                strategy = choose_strategy(
+                    len(left_rows), len(right_rows),
+                    left_has_idx, right_has_idx, join_type)
+            else:
+                strategy = "NESTED_LOOP"
 
-            if join_type in ("RIGHT", "FULL"):
-                for j, rr in enumerate(right_rows):
-                    if j in matched_right:
-                        continue
-                    merged = dict(left_null)
-                    merged.update({f"{ra}.{k}": v for k, v in rr.items()})
-                    row = _emit(merged)
-                    if row is not None:
-                        results.append(row)
+            if strategy == "HASH_JOIN":
+                results = hash_join(left_rows, right_rows, lcol, rcol,
+                                    join_type, la, ra, _emit, right_null, left_null)
+            elif strategy == "MERGE_JOIN":
+                results = merge_join_inner(left_rows, right_rows, lcol, rcol,
+                                           la, ra, _emit)
+            else:
+                # NESTED_LOOP (small tables or complex ON condition)
+                matched_right: set[int] = set()
+                for lr in left_rows:
+                    on_matched = False
+                    for j, rr in enumerate(right_rows):
+                        if not _on_match(lr, rr):
+                            continue
+                        on_matched = True
+                        matched_right.add(j)
+                        row = _emit(_merge(lr, rr))
+                        if row is not None:
+                            results.append(row)
+                    if not on_matched and join_type in ("LEFT", "FULL"):
+                        merged = {f"{la}.{k}": v for k, v in lr.items()}
+                        merged.update(right_null)
+                        row = _emit(merged)
+                        if row is not None:
+                            results.append(row)
+
+                if join_type in ("RIGHT", "FULL"):
+                    for j, rr in enumerate(right_rows):
+                        if j in matched_right:
+                            continue
+                        merged = dict(left_null)
+                        merged.update({f"{ra}.{k}": v for k, v in rr.items()})
+                        row = _emit(merged)
+                        if row is not None:
+                            results.append(row)
 
         return _apply_order_limit(results, order_by, limit)
 
