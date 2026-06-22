@@ -264,6 +264,142 @@ class TestEstimateRowCountWithWhere:
         db.close()
 
 
+# ── Extended selectivity operators (!=, LIKE, IS NULL, IS NOT NULL) ──────────
+
+class TestExtendedSelectivityOperators:
+
+    def _db(self, tmp_path):
+        """10 rows: val 1..10, 3 NULLs in nullable col, cat 6×A / 3×B / 1×C."""
+        db = fresh_db(tmp_path)
+        db.execute(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER, nullable INTEGER, cat TEXT)"
+        )
+        for i in range(1, 11):
+            cat = "A" if i <= 6 else ("B" if i <= 9 else "C")
+            # rows 8, 9, 10 have NULL in nullable
+            nullable = None if i >= 8 else i
+            db.execute(
+                "INSERT INTO t VALUES (?, ?, ?, ?)", (i, i, nullable, cat)
+            )
+        db.execute("ANALYZE")
+        return db
+
+    # ── != / <> ─────────────────────────────────────────────────────────────
+
+    def test_ne_operator_complement_of_eq(self, tmp_path):
+        db = self._db(tmp_path)
+        eq_sel = estimate_selectivity(db, "t", "cat", "=", "A")
+        ne_sel = estimate_selectivity(db, "t", "cat", "!=", "A")
+        assert abs(ne_sel - (1.0 - eq_sel)) < 1e-9
+        db.close()
+
+    def test_ne_alt_operator(self, tmp_path):
+        db = self._db(tmp_path)
+        sel_ne  = estimate_selectivity(db, "t", "cat", "!=", "A")
+        sel_ne2 = estimate_selectivity(db, "t", "cat", "<>", "A")
+        assert sel_ne == pytest.approx(sel_ne2)
+        db.close()
+
+    def test_ne_clipped_to_one(self, tmp_path):
+        """ne of a very rare value should be close to 1."""
+        db = self._db(tmp_path)
+        sel = estimate_selectivity(db, "t", "cat", "!=", "C")
+        assert sel <= 1.0
+        assert sel > 0.85
+        db.close()
+
+    def test_ne_no_stats_returns_default(self, tmp_path):
+        db = fresh_db(tmp_path)
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        sel = estimate_selectivity(db, "t", "val", "!=", 1)
+        assert sel == pytest.approx(0.33)
+        db.close()
+
+    # ── LIKE ────────────────────────────────────────────────────────────────
+
+    def test_like_returns_fixed_heuristic(self, tmp_path):
+        db = self._db(tmp_path)
+        sel = estimate_selectivity(db, "t", "cat", "LIKE", "A%")
+        assert sel == pytest.approx(0.05)
+        db.close()
+
+    def test_like_independent_of_value(self, tmp_path):
+        """LIKE selectivity is a fixed heuristic regardless of pattern."""
+        db = self._db(tmp_path)
+        sel1 = estimate_selectivity(db, "t", "cat", "LIKE", "%A%")
+        sel2 = estimate_selectivity(db, "t", "cat", "LIKE", "B")
+        assert sel1 == sel2 == pytest.approx(0.05)
+        db.close()
+
+    def test_like_no_stats_returns_default(self, tmp_path):
+        db = fresh_db(tmp_path)
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        sel = estimate_selectivity(db, "t", "val", "LIKE", "foo%")
+        assert sel == pytest.approx(0.33)
+        db.close()
+
+    # ── IS NULL ─────────────────────────────────────────────────────────────
+
+    def test_is_null_uses_null_count(self, tmp_path):
+        db = self._db(tmp_path)
+        sel = estimate_selectivity(db, "t", "nullable", "IS NULL", None)
+        # 3 NULLs out of 10 rows
+        assert abs(sel - 0.3) < 0.01
+        db.close()
+
+    def test_is_null_no_nulls_returns_zero(self, tmp_path):
+        db = self._db(tmp_path)
+        # val column has no NULLs
+        sel = estimate_selectivity(db, "t", "val", "IS NULL", None)
+        assert sel == pytest.approx(0.0)
+        db.close()
+
+    def test_is_null_no_stats_returns_default(self, tmp_path):
+        db = fresh_db(tmp_path)
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        sel = estimate_selectivity(db, "t", "val", "IS NULL", None)
+        assert sel == pytest.approx(0.33)
+        db.close()
+
+    # ── IS NOT NULL ─────────────────────────────────────────────────────────
+
+    def test_is_not_null_complement_of_is_null(self, tmp_path):
+        db = self._db(tmp_path)
+        null_sel     = estimate_selectivity(db, "t", "nullable", "IS NULL",     None)
+        not_null_sel = estimate_selectivity(db, "t", "nullable", "IS NOT NULL", None)
+        assert abs(null_sel + not_null_sel - 1.0) < 1e-9
+        db.close()
+
+    def test_is_not_null_no_nulls_returns_one(self, tmp_path):
+        db = self._db(tmp_path)
+        sel = estimate_selectivity(db, "t", "val", "IS NOT NULL", None)
+        assert sel == pytest.approx(1.0)
+        db.close()
+
+    def test_is_not_null_no_stats_returns_default(self, tmp_path):
+        db = fresh_db(tmp_path)
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER)")
+        sel = estimate_selectivity(db, "t", "val", "IS NOT NULL", None)
+        assert sel == pytest.approx(0.33)
+        db.close()
+
+    # ── integration: estimate_row_count_with_where ───────────────────────────
+
+    def test_ne_in_where_reduces_row_count(self, tmp_path):
+        db = self._db(tmp_path)
+        est = estimate_row_count_with_where(db, "t", [("cat", "!=", "A")])
+        # A is 60% of rows; ne → 40% → ~4 rows from 10
+        assert 2 <= est <= 6
+        db.close()
+
+    def test_is_null_in_where(self, tmp_path):
+        db = self._db(tmp_path)
+        est = estimate_row_count_with_where(db, "t", [("nullable", "IS NULL", None)])
+        # 3/10 → ~3 rows
+        assert 1 <= est <= 5
+        db.close()
+
+
 # ── _col_stats helper ─────────────────────────────────────────────────────────
 
 class TestColStats:

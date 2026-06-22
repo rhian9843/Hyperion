@@ -159,6 +159,21 @@ def estimate_selectivity(db, table: str, col: str, op: str, val) -> float:
                 return mcv_count / row_count
         return 1.0 / ndv
 
+    if op in ("!=", "<>"):
+        eq_sel = estimate_selectivity(db, table, col, "=", val)
+        return max(0.0, min(1.0, 1.0 - eq_sel))
+
+    if op == "LIKE":
+        return 0.05
+
+    if op == "IS NULL":
+        null_count = stats.get("null_count", 0)
+        return null_count / row_count
+
+    if op == "IS NOT NULL":
+        null_count = stats.get("null_count", 0)
+        return max(0.0, min(1.0, 1.0 - null_count / row_count))
+
     if op in ("<", "<=", ">", ">="):
         histogram = stats.get("histogram", [])
         if histogram:
