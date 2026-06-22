@@ -163,6 +163,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._txn_start_time: float | None = None  # monotonic time when BEGIN was called
         self._user_funcs: dict = {}  # name.upper() → (n_args, callable)
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
+        from .profiler import QueryProfiler
+        self._profiler = QueryProfiler()
         self._changelog     = None   # lazily-created changelog view
         self._sub_workers: dict = {}    # sub_name → SubscriptionWorker
         # Physical replication state — stored in <db>.phys_state JSON (not catalog)

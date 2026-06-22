@@ -288,6 +288,7 @@ class Cursor:
                 cache.move_to_end(sql)         # promote to most-recently-used
             stmt_ast = cache[sql]
         stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
+        stmt = dict(stmt, _raw_sql=sql)
         op   = stmt.get("op", "")
 
         # SELECT FOR UPDATE: acquire an exclusive write lock that persists for the
@@ -339,6 +340,7 @@ class Cursor:
                 cache.move_to_end(sql)
             stmt_ast = cache[sql]
         stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
+        stmt = dict(stmt, _raw_sql=sql)
         return self._execute_stmt(stmt, stmt.get("op", ""), timeout_ms, max_rows)
 
     def _execute_stmt(self, stmt: dict, op: str,
@@ -357,6 +359,9 @@ class Cursor:
 
         effective_max_rows = max_rows if max_rows is not None else self._db.max_rows
 
+        _prof = self._db._profiler
+        _sql  = stmt.get("_raw_sql", op)  # raw SQL stored by _execute_inner
+        _prof.start_query(_sql)
         try:
             # SELECT ops bypass executor.execute, so authorizer must be checked here
             if op in _SELECT_OPS and self._db._authorizer is not None:
@@ -365,6 +370,7 @@ class Cursor:
                     self.description = None; self.rowcount = -1
                     return self
 
+            _prof.add_step("execute")
             if op in _SELECT_OPS:
                 self._set_select_result(
                     _iter_rows_for_stmt(stmt, self._db), stmt, effective_max_rows
@@ -401,6 +407,7 @@ class Cursor:
                     else:
                         self.lastrowid = None
         finally:
+            _prof.end_query()
             self._db._query_deadline = None
 
         return self

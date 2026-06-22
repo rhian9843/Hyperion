@@ -2258,6 +2258,12 @@ def _parse_tokens(t: list[str]) -> dict:
             if val not in ("ON", "OFF"):
                 raise ParseError("Expected ON or OFF after SET REWRITER")
             return {"op": "SET_REWRITER", "enabled": val == "ON"}
+        # SET PROFILE ON|OFF
+        if len(t) >= 3 and t[1].upper() == "PROFILE":
+            val = t[2].upper()
+            if val not in ("ON", "OFF"):
+                raise ParseError("Expected ON or OFF after SET PROFILE")
+            return {"op": "SET_PROFILE", "enabled": val == "ON"}
         # SET TRANSACTION ISOLATION LEVEL <level>
         # SET SESSION TRANSACTION ISOLATION LEVEL <level>  (MySQL compat)
         i = 1
@@ -2328,6 +2334,16 @@ def _parse_tokens(t: list[str]) -> dict:
         if (len(t) > 2 and t[1].upper() == "INDEX"
                 and t[2].upper() == "SUGGESTIONS"):
             return {"op": "SHOW_INDEX_SUGGESTIONS"}
+        if len(t) > 1 and t[1].upper() == "PROFILES":
+            return {"op": "SHOW_PROFILES"}
+        # SHOW PROFILE FOR QUERY n
+        if (len(t) > 4 and t[1].upper() == "PROFILE"
+                and t[2].upper() == "FOR" and t[3].upper() == "QUERY"):
+            try:
+                qid = int(t[4])
+            except ValueError:
+                raise ParseError("Expected integer query ID after SHOW PROFILE FOR QUERY")
+            return {"op": "SHOW_PROFILE", "query_id": qid}
         raise ParseError(f"Unknown SHOW variant: '{' '.join(t[1:])}'")
     if kw == "START":
         if len(t) > 1 and t[1].upper() == "SLAVE":

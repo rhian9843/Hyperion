@@ -2077,6 +2077,38 @@ def _exec_show_index_suggestions(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, cols)
 
 
+def _exec_set_profile(stmt: dict, db: Database) -> str:
+    if stmt["enabled"]:
+        db._profiler.enable()
+        return "Query profiling enabled."
+    else:
+        db._profiler.disable()
+        return "Query profiling disabled."
+
+
+def _exec_show_profiles(stmt: dict, db: Database) -> RowResult:
+    rows = []
+    for p in db._profiler.get_profiles():
+        sql_disp = p.sql if len(p.sql) <= 80 else p.sql[:77] + "..."
+        rows.append({
+            "id":       p.id,
+            "sql":      sql_disp,
+            "total_ms": p.total_ms,
+        })
+    return RowResult(rows, ["id", "sql", "total_ms"])
+
+
+def _exec_show_profile(stmt: dict, db: Database) -> RowResult:
+    qid   = stmt["query_id"]
+    entry = db._profiler.get_profile(qid)
+    if entry is None:
+        raise ValueError(f"No profile with ID {qid}")
+    rows = [{"status": s.status, "duration_ms": s.duration_ms}
+            for s in entry.steps]
+    rows.append({"status": "total", "duration_ms": entry.total_ms})
+    return RowResult(rows, ["status", "duration_ms"])
+
+
 def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
     from .pager import Pager, MemoryPager
     pager = db._pager
@@ -2204,6 +2236,9 @@ _DISPATCH: dict[str, Any] = {
     "SHOW_MAT_VIEWS":                 _exec_show_mat_views,
     "SHOW_QUERY_STATS":               _exec_show_query_stats,
     "SHOW_INDEX_SUGGESTIONS":         _exec_show_index_suggestions,
+    "SET_PROFILE":                    _exec_set_profile,
+    "SHOW_PROFILES":                  _exec_show_profiles,
+    "SHOW_PROFILE":                   _exec_show_profile,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,
