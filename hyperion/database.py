@@ -165,6 +165,8 @@ class Database(DDLMixin, DMLMixin, QueryMixin, ConstraintsMixin):
         self._user_aggs:  dict = {}  # name.upper() → (n_args, aggregate_class)
         from .profiler import QueryProfiler
         self._profiler = QueryProfiler()
+        from .query_cache import QueryCache
+        self._query_cache = QueryCache()
         self._changelog     = None   # lazily-created changelog view
         self._sub_workers: dict = {}    # sub_name → SubscriptionWorker
         # Physical replication state — stored in <db>.phys_state JSON (not catalog)

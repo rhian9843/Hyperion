@@ -2264,6 +2264,12 @@ def _parse_tokens(t: list[str]) -> dict:
             if val not in ("ON", "OFF"):
                 raise ParseError("Expected ON or OFF after SET PROFILE")
             return {"op": "SET_PROFILE", "enabled": val == "ON"}
+        # SET CACHE ON|OFF
+        if len(t) >= 3 and t[1].upper() == "CACHE":
+            val = t[2].upper()
+            if val not in ("ON", "OFF"):
+                raise ParseError("Expected ON or OFF after SET CACHE")
+            return {"op": "SET_CACHE", "enabled": val == "ON"}
         # SET TRANSACTION ISOLATION LEVEL <level>
         # SET SESSION TRANSACTION ISOLATION LEVEL <level>  (MySQL compat)
         i = 1
@@ -2336,6 +2342,10 @@ def _parse_tokens(t: list[str]) -> dict:
             return {"op": "SHOW_INDEX_SUGGESTIONS"}
         if len(t) > 1 and t[1].upper() == "PROFILES":
             return {"op": "SHOW_PROFILES"}
+        # SHOW CACHE STATUS
+        if (len(t) > 2 and t[1].upper() == "CACHE"
+                and t[2].upper() == "STATUS"):
+            return {"op": "SHOW_CACHE_STATUS"}
         # SHOW PROFILE FOR QUERY n
         if (len(t) > 4 and t[1].upper() == "PROFILE"
                 and t[2].upper() == "FOR" and t[3].upper() == "QUERY"):

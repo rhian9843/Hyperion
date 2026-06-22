@@ -2215,6 +2215,21 @@ def _exec_show_profile(stmt: dict, db: Database) -> RowResult:
     return RowResult(rows, ["status", "duration_ms"])
 
 
+def _exec_set_cache(stmt: dict, db: Database) -> str:
+    if stmt["enabled"]:
+        db._query_cache.enable()
+        return "Query result cache enabled."
+    else:
+        db._query_cache.disable()
+        return "Query result cache disabled."
+
+
+def _exec_show_cache_status(stmt: dict, db: Database) -> RowResult:
+    s = db._query_cache.status()
+    rows = [{"setting": k, "value": str(v)} for k, v in s.items()]
+    return RowResult(rows, ["setting", "value"])
+
+
 def _exec_show_recovery_status(stmt: dict, db: Database) -> RowResult:
     from .pager import Pager, MemoryPager
     pager = db._pager
@@ -2345,6 +2360,8 @@ _DISPATCH: dict[str, Any] = {
     "SET_PROFILE":                    _exec_set_profile,
     "SHOW_PROFILES":                  _exec_show_profiles,
     "SHOW_PROFILE":                   _exec_show_profile,
+    "SET_CACHE":                      _exec_set_cache,
+    "SHOW_CACHE_STATUS":              _exec_show_cache_status,
     "INSERT":                   _exec_insert,
     "INSERT_SELECT":            _exec_insert_select,
     "SELECT":                   _exec_select,

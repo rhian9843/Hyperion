@@ -288,7 +288,10 @@ class Cursor:
                 cache.move_to_end(sql)         # promote to most-recently-used
             stmt_ast = cache[sql]
         stmt = _bind_ast_params(stmt_ast, params) if params is not None else stmt_ast
-        stmt = dict(stmt, _raw_sql=sql)
+        extras: dict = {"_raw_sql": sql}
+        if params is not None:
+            extras["_params"] = params
+        stmt = dict(stmt, **extras)
         op   = stmt.get("op", "")
 
         # SELECT FOR UPDATE: acquire an exclusive write lock that persists for the
@@ -372,9 +375,17 @@ class Cursor:
 
             _prof.add_step("execute")
             if op in _SELECT_OPS:
-                self._set_select_result(
-                    _iter_rows_for_stmt(stmt, self._db), stmt, effective_max_rows
-                )
+                from .query_cache import QueryCache, make_cache_key, extract_tables
+                _qc      = self._db._query_cache
+                _ck      = make_cache_key(stmt.get("_raw_sql", ""), stmt.get("_params"))
+                _cached  = _qc.get(_ck) if _qc.enabled else None
+                if _cached is not None:
+                    self._set_select_result(iter(_cached), stmt, effective_max_rows)
+                else:
+                    _rows = list(_iter_rows_for_stmt(stmt, self._db))
+                    if _qc.enabled:
+                        _qc.put(_ck, _rows, extract_tables(stmt))
+                    self._set_select_result(iter(_rows), stmt, effective_max_rows)
             elif op == "EXPLAIN":
                 if stmt.get("analyze"):
                     from .executor import _exec_explain_analyze as _ea
@@ -390,6 +401,10 @@ class Cursor:
             else:
                 from .executor import RowResult as _RowResult
                 result = _exec(stmt, self._db)
+                # Invalidate cache for any table written to
+                _tbl = stmt.get("table")
+                if _tbl:
+                    self._db._query_cache.invalidate(_tbl)
                 if isinstance(result, _RowResult):
                     self._set_select_result(iter(result.rows))
                     if result.rowcount >= 0:
